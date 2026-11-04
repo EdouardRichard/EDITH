@@ -21,6 +21,7 @@ import com.sheen.rokid.phone.session.confirmation.SummaryDisplayer
 import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.NoInterceptionGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.VisionGate
@@ -572,8 +573,13 @@ class HostCompositionRoot internal constructor(
      *
      * `speechOn` is the user's intent and can stay on while no player exists (the engine is missing); the capability
      * and every speech request are gated on the holder, not on this flow.
+     *
+     * 0.52 design §4.2: the returned [SettingsSaveResult] is what makes a persistence refusal visible. The live switch
+     * and the player still move before the blob write (the user's tap must not be lost), but the settings page now
+     * renders the mapped refusal instead of it ending in a log line. Every call source can ignore the value; only the
+     * page shows it.
      */
-    @Synchronized internal fun setSpeechEnabled(enabled: Boolean) {
+    @Synchronized internal fun setSpeechEnabled(enabled: Boolean): SettingsSaveResult {
         speechOn.value = enabled
         val state = if (enabled) "on" else "off"
         if (enabled) {
@@ -609,15 +615,20 @@ class HostCompositionRoot internal constructor(
         val target = smartSettingsStore
         if (target == null) {
             P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_STORE_UNAVAILABLE")
-            return
+            return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_STORE_UNAVAILABLE)
         }
         val stored = runCatching { target.loadForWrite() }.getOrNull()
         if (stored == null) {
             P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_UNREADABLE")
-            return
+            return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SETTINGS_UNREADABLE)
         }
-        runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }
-            .onFailure { P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED") }
+        return runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }.fold(
+            onSuccess = { SettingsSaveResult(saved = true) },
+            onFailure = {
+                P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED")
+                SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SAVE_FAILED)
+            },
+        )
     }
 
     /** One opacity save's outcome: [saved] is the blob's verdict, [error] a stable code for the settings copy. */

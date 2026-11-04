@@ -6,15 +6,21 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
+import com.sheen.rokid.phone.overlay.phoneOnlyStartFailureText
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.SessionUiState
@@ -35,6 +41,10 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     val detached by root.detachGate.enabled.collectAsStateWithLifecycle()
     val appearance by root.phoneOnlyAppearance.collectAsStateWithLifecycle()
     val speechEnabled by root.speechEnabled.collectAsStateWithLifecycle()
+    // The service publishes what it actually did (0.5.1 C12/C14); the page never infers 「运行中」 from the overlay
+    // permission. `startFailure` is mapped to the short Chinese reason before it reaches the host-free page.
+    val phoneOnlyRunning by PhoneOnlyOverlayService.isRunning.collectAsStateWithLifecycle()
+    val phoneOnlyStartFailure by PhoneOnlyOverlayService.startFailure.collectAsStateWithLifecycle()
     // The catalog read is a single snapshot per shell composition. Task 13 replaces it with the catalog view model's
     // observable state; until then nothing in this task can mutate the catalog while the settings tab is on screen.
     val catalog = remember { runCatching { root.modelCatalogRepository?.catalog() }.getOrNull() }
@@ -48,6 +58,18 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
         } ?: false
     }
     val context = LocalContext.current
+    // 0.52 design §3.4: returning from a system settings screen can change both the overlay grant and the service's
+    // real state. MainActivity.onResume already syncs, but the settings page must not depend on another page having
+    // done it: this observer re-reads the grant through the same policy and the published flows then repaint the page.
+    // Calling sync while the permission is unchanged is a no-op (`KeepRunning`/`Stop`), so the extra call is safe.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, root) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) PhoneOnlyOverlayService.sync(context, root)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val missingPermissions = listOf(
         root.foregroundAppSource?.isGranted == false,
         root.notificationCategorySource?.isConnected == false,
@@ -82,6 +104,21 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
                 help = rememberHelpState(),
                 requestPop = requestPop,
                 registerBackGuard = registerBackGuard,
+            )
+        },
+        runtimeAppearance = {
+            RuntimeAppearanceScreen(
+                detached = detached,
+                onDetach = { enabled -> root.detachGate.set(enabled) },
+                ballOpacity = appearance.ballOpacityPercent,
+                bubbleOpacity = appearance.bubbleOpacityPercent,
+                onPreviewOpacity = { ball, bubble -> root.previewPhoneOnlyOpacity(ball, bubble) },
+                onCommitOpacity = { ball, bubble -> root.setPhoneOnlyOpacity(ball, bubble) },
+                speechEnabled = speechEnabled,
+                onSpeech = { enabled -> root.setSpeechEnabled(enabled) },
+                phoneOnlyRunning = phoneOnlyRunning,
+                startFailure = phoneOnlyStartFailure?.let(::phoneOnlyStartFailureText),
+                help = rememberHelpState(),
             )
         },
     )
@@ -127,6 +164,10 @@ private fun saveThroughHost(root: HostCompositionRoot, settings: SmartSettings):
  * header arrow and the dialog's dismiss/back path both run `pageBackGuard ?: requestPop`, so a page can intercept the
  * one shared exit with its 「放弃修改？」 confirmation and then call `requestPop` itself. The stack is a state list so
  * pop does not depend on a stale captured `List` instance.
+ *
+ * [runtimeAppearance] is the same seam Task 10 adds for 运行与外观: the page needs no back guard, so the slot is a plain
+ * composable that replaces Task 7's placeholder when the host supplies it. The null default keeps every existing
+ * call site (including T7/T9 tests and the route stack tests) source-compatible.
  */
 @Composable
 internal fun SettingsShellContent(
@@ -134,6 +175,7 @@ internal fun SettingsShellContent(
     auditLines: () -> List<String> = { emptyList() },
     homeScrollState: ScrollState = rememberScrollState(),
     assistantBehavior: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
+    runtimeAppearance: (@Composable () -> Unit)? = null,
 ) {
     val stack = remember { mutableStateListOf<SettingsRoute>() }
     var pageBackGuard by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -156,8 +198,8 @@ internal fun SettingsShellContent(
         // One guarded exit for the arrow and for the dialog's own system-back dismissal. The page registers the
         // guard; a page without one (About/placeholders) closes directly.
         onBack = { pageBackGuard?.invoke() ?: closePage() },
-        // A form page must not wrap its text fields in the detail page's text-selection container.
-        selectionEnabled = route != SettingsRoute.AssistantBehavior,
+        // A form page must not wrap its controls in the detail page's text-selection container.
+        selectionEnabled = route != SettingsRoute.AssistantBehavior && route != SettingsRoute.RuntimeAppearance,
     ) {
         when (route) {
             SettingsRoute.About -> AboutScreen(
@@ -169,6 +211,9 @@ internal fun SettingsShellContent(
                 } else {
                     assistantBehavior({ closePage() }) { guard -> pageBackGuard = guard }
                 }
+            }
+            SettingsRoute.RuntimeAppearance -> {
+                if (runtimeAppearance == null) PlaceholderPage(route) else runtimeAppearance()
             }
             else -> PlaceholderPage(route)
         }

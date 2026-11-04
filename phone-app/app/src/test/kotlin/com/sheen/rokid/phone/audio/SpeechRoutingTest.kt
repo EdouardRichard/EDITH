@@ -9,6 +9,7 @@ import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
@@ -185,6 +186,27 @@ class SpeechRoutingTest {
             assertTrue("the live switch still moves", root.speechEnabled.value)
             assertTrue(router.isAvailable())
             assertEquals("an unreadable blob must not be overwritten with defaults", 0, blobs.writes.get())
+        } finally {
+            root.close()
+        }
+    }
+
+    @Test
+    fun `setSpeechEnabled reports the persistence result to the page`() {
+        val blobs = RecordingBlobs()
+        val root = composition(SpeechPlayerRouter(), blobs) { FakePlayer() }
+        try {
+            val saved = root.setSpeechEnabled(true)
+            assertTrue("a written blob is a saved result", saved.saved)
+            assertNull(saved.errorCode)
+
+            blobs.failReadId = SmartSettingsStore.BLOB_ID
+            val unreadable = root.setSpeechEnabled(false)
+            assertFalse("an unreadable blob is a visible refusal", unreadable.saved)
+            assertEquals(
+                SettingsSaveResult.ERROR_SETTINGS_UNREADABLE,
+                unreadable.errorCode,
+            )
         } finally {
             root.close()
         }
