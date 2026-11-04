@@ -173,14 +173,19 @@ class ModelCatalogMergeTest {
         }
     }
 
-    @Test fun `blank and duplicate gateway ids cannot duplicate a model`() {
+    @Test fun `blank duplicate and control-character gateway ids are skipped`() {
         val refresh = applied(listOf(
             GatewayModel(""),
+            GatewayModel("m\n1", contextWindowTokens = 65_536),
             GatewayModel("m-1", contextWindowTokens = 32_768),
             GatewayModel("m-1", contextWindowTokens = 16_384),
         ))
         val models = refresh.catalog.providers.single().models
         assertEquals(listOf("m-1"), models.map { it.id })
+        assertEquals(32_768, models.single().contextWindowTokens) // first valid occurrence wins
         assertEquals(1, refresh.counts.added)
+        assertEquals(0, refresh.counts.updated)
+        assertEquals(0, refresh.counts.unchanged)
+        assertEquals(0, refresh.counts.missing)
     }
 }

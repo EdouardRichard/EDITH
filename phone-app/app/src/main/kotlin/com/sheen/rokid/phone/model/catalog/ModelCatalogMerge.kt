@@ -34,7 +34,8 @@ object ModelCatalogMerge {
         val provider = catalog.providers.firstOrNull { it.id == providerId }
             ?: throw ContractError.ConfigurationRejected("提供商不存在")
 
-        val offered = gateway.filter { it.id.isNotBlank() }.distinctBy { it.id }
+        // Gateway ids are network input: skip any row the catalog itself could not store (blank or control characters).
+        val offered = gateway.filter { CatalogValidation.modelIdError(it.id) == null }.distinctBy { it.id }
         val offeredById = offered.associateBy { it.id }
         val existingById = provider.models.associateBy { it.id }
 
