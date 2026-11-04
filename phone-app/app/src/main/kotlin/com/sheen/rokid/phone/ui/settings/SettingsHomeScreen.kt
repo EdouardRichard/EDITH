@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.ui.settings
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,17 +23,22 @@ import androidx.compose.ui.unit.dp
  * [auditLines] is the loader the audit page will use (Task 12). The home receives it only so the laziness contract is
  * pinned by a test: composing the home must not touch the audit log, because the home is not the audit page. The screen
  * therefore never invokes it.
+ *
+ * [scrollState] is a parameter rather than screen-owned state because the home must keep its position while a secondary
+ * page is open (design §4.4): the shell holds the one [ScrollState] across page pushes, and the default keeps a
+ * standalone composition self-contained. The tab switch still resets the home because the whole shell leaves composition.
  */
 @Composable
 internal fun SettingsHomeScreen(
     model: SettingsHomeModel,
     onOpen: (SettingsRoute) -> Unit,
     auditLines: () -> List<String> = { emptyList() },
+    scrollState: ScrollState = rememberScrollState(),
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(scrollState)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {

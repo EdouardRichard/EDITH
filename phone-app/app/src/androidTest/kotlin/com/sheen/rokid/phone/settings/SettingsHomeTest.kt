@@ -1,14 +1,25 @@
 package com.sheen.rokid.phone.settings
 
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasStateDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.unit.dp
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.ForegroundTestActivity
 import com.sheen.rokid.phone.ui.settings.AboutScreen
@@ -16,6 +27,7 @@ import com.sheen.rokid.phone.ui.settings.ModelStatus
 import com.sheen.rokid.phone.ui.settings.SettingsHomeModel
 import com.sheen.rokid.phone.ui.settings.SettingsHomeScreen
 import com.sheen.rokid.phone.ui.settings.SettingsRoute
+import com.sheen.rokid.phone.ui.settings.SettingsShellContent
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -24,9 +36,10 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * 0.52 design §3.1/§3.2: the settings home is navigation plus summaries only - seven entries in four groups, a
+ * 0.52 design §3.1/§3.2/§4.4: the settings home is navigation plus summaries only - seven entries in four groups, a
  * clickable row per entry, an error-coloured model summary when nothing is configured, an audit row that never reads
- * the audit log on the home, and an About page that names the build and reopens the model service.
+ * the audit log on the home, an About page that names the build and reopens the model service, and a shell that keeps
+ * the home composed (and scrolled) under a secondary page.
  */
 class SettingsHomeTest {
 
@@ -142,5 +155,42 @@ class SettingsHomeTest {
         compose.onNodeWithText("模型服务").performClick()
 
         assertTrue("the About page's model-service entry must open the page", opened)
+    }
+
+    // 二级页返回首页时保留滚动位置（design §4.4）
+    @Test
+    fun returningFromASecondaryPageKeepsTheHomeScrollPosition() {
+        val scrollState = ScrollState(0)
+        setContent {
+            // Smaller than the seven-row home, so the home really scrolls inside the test host.
+            Box(Modifier.fillMaxWidth().height(300.dp)) {
+                SettingsShellContent(
+                    homeModel = homeModel(),
+                    homeScrollState = scrollState,
+                )
+            }
+        }
+
+        // Slow swipe: past touch slop but too slow to fling, so the offset stays in the range the row below needs.
+        compose.onNode(hasScrollAction()).performTouchInput {
+            swipeUp(startY = height * 0.8f, endY = height * 0.8f - 40.dp.toPx(), durationMillis = 1_000)
+        }
+        compose.waitForIdle()
+        val scrolled = scrollState.value
+        assertTrue("the home must scroll inside the 300dp host, offset was $scrolled", scrolled > 0)
+
+        compose.onNodeWithText("模型服务").performClick()
+
+        // The page is a dialog over the still-composed home: both roots are alive here, and the home has not lost
+        // the scroll state that lives in the shell.
+        compose.onNodeWithContentDescription("返回").assertExists()
+        compose.onNodeWithText("后续任务接入").assertExists("the model-service page must be the open detail page")
+        compose.onNodeWithText("设置").assertExists("the home must stay composed under a secondary page")
+
+        compose.onNodeWithContentDescription("返回").performClick()
+
+        compose.onNodeWithContentDescription("返回").assertDoesNotExist()
+        compose.onNode(hasScrollAction()).assertIsDisplayed()
+        assertEquals("returning must keep the home scroll offset", scrolled, scrollState.value)
     }
 }
