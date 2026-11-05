@@ -388,9 +388,14 @@ private const val HUMAN_CONFIRMATION_ALLOWANCE_NANOS = 120_000L * 1_000_000L
 private const val TOOL_POLL_STEP_NANOS = 10_000_000L
 private const val DEFAULT_TOOL_TIMEOUT_MILLIS = 30_000L
 
-/** Plan wording (D3 §1.6). Matched case-insensitively for the Latin markers; Chinese markers are literal. */
+/**
+ * Plan wording (D3 §1.6). Matched case-insensitively for the Latin markers; Chinese markers are literal.
+ *
+ * 0.5.4 Task 1: the single character `再` is gone. Anywhere-substring matching made it fire inside ordinary sentences
+ * ("下单前再跟你确认" is not a plan), so the "again / do it once more" sense is carried by multi-character phrases only.
+ */
 private val PLAN_MARKERS = listOf(
-    "接下来", "下一步", "我将", "我会", "稍后", "先", "然后", "再",
+    "接下来", "下一步", "我将", "我会", "稍后", "先", "然后", "再次", "再试",
     "i will", "i'll", "next", "let me", "first",
 )
 
@@ -399,6 +404,16 @@ private val PLAN_COMPLETION_MARKERS = listOf(
     "已完成", "已经完成", "完成如下", "总结如下", "无法继续", "没有权限", "无权限", "抱歉",
     "无法", "不能", "已处理", "已为你", "以下是",
     "done", "unable", "cannot", "no permission", "summary",
+)
+
+/**
+ * 0.5.4 Task 1 (design §6.1.2): wording that makes the sentence a report, a promise to check something later, or a
+ * question — never a plan this turn should execute. These are checked after [PLAN_COMPLETION_MARKERS] and suppress the
+ * nudge even when a plan marker is also present ("下单前再跟你确认" is a promise to check later, "我先看一眼是否…" is a
+ * question).
+ */
+private val NON_PLAN_MARKERS = listOf(
+    "不再", "再见", "然后再", "已经", "完成", "请确认", "是否", "吗", "？",
 )
 
 /** The audit summary is read from the model's own arguments string, which is kotlinx-lenient by construction. */
@@ -1513,9 +1528,10 @@ class AgentLoop(
      * Whether [text] is a **plan** that should be nudged into execution instead of accepted as the answer.
      *
      * Every condition of R58 must hold: the route allows nudging, this run has already executed a tool successfully,
-     * the text is short enough, it carries a plan marker and no completion marker, and the run is not at its deadline /
-     * step / observation budget. A pure Q&A turn (no successful tool) is never nudged; neither is a text that reports
-     * an outcome. The "identical text after a nudge" rule lives at the call site, where the nudge count is known.
+     * the text is short enough, it carries a plan marker, no completion marker and no [NON_PLAN_MARKERS] wording, and
+     * the run is not at its deadline / step / observation budget. A pure Q&A turn (no successful tool) is never nudged;
+     * neither is a text that reports an outcome or asks the wearer a question. The "identical text after a nudge" rule
+     * lives at the call site, where the nudge count is known.
      */
     private fun shouldPlanNudge(
         text: String,
@@ -1531,6 +1547,8 @@ class AgentLoop(
         if (spentObservations >= maxObservations) return false
         val lower = text.lowercase()
         if (PLAN_COMPLETION_MARKERS.any { text.contains(it) || lower.contains(it) }) return false
+        // 0.5.4 Task 1 (design §6.1.2): a report/question/promise-to-check-later is not this turn's plan.
+        if (NON_PLAN_MARKERS.any { text.contains(it) }) return false
         return planMarkers.any { marker -> text.contains(marker) || lower.contains(marker) }
     }
 

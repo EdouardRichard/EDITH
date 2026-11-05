@@ -100,7 +100,9 @@ class LoopGuardsWiringTest {
                     listener(smartToolCall("c1", "device", """{"action":"status"}""", requestId = request.requestId))
                     listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
                 }
-                1 -> streamText(request, listener, "接下来我会先观察当前屏幕，然后再点按确认。")
+                1 ->
+                    // 0.5.4 Task 1: no "然后再" — the tightened plan nudge rejects that phrase; the nudge itself is the subject.
+                    streamText(request, listener, "接下来我会先观察当前屏幕，然后点按确认。")
                 else -> streamText(request, listener, "已经点好了。")
             }
         }

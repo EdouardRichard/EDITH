@@ -40,7 +40,9 @@ import kotlin.test.assertTrue
  */
 class AgentLoopGuardTest {
 
-    private val planText = "接下来我会先观察当前屏幕，然后再点按确认。"
+    // 0.5.4 Task 1: this fixture no longer contains "然后再" — the tightened plan nudge rejects that phrase
+    // (design §6.1.2), and these tests are about the nudge cap and the identical-text rule, not that wording.
+    private val planText = "接下来我会先观察当前屏幕，然后点按确认。"
 
     private fun request(
         allowPlanNudge: Boolean = false,
@@ -560,6 +562,69 @@ class AgentLoopGuardTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(2, gateway.requests.size)
+    }
+
+    // ------------------------------------------------ plan nudge tightening (0.5.4 Task 1)
+
+    /**
+     * Runs one seeding tool call and then [text], and asserts the loop accepted [text] without a plan nudge.
+     *
+     * The third reply is scripted on purpose: a regression that nudges still completes cleanly and fails on the request
+     * count, instead of dying on an exhausted fixture.
+     */
+    private fun assertNoPlanNudge(text: String) {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = text),
+                reply(text = "好。"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(2, gateway.requests.size, "must not nudge: $text")
+        assertEquals(text, run.finalText)
+        assertEquals(0, run.planNudgeCap)
+    }
+
+    @Test
+    fun `a completion sentence with the single character zai is never nudged`() {
+        listOf("不再重复了", "再见", "下单前再跟你确认", "然后再打开").forEach(::assertNoPlanNudge)
+    }
+
+    @Test
+    fun `a question sentence is never nudged`() {
+        listOf("需要你确认地址和商品", "请问从哪家买").forEach(::assertNoPlanNudge)
+    }
+
+    @Test
+    fun `a real future plan sentence is still nudged`() {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = "我先打开美团，再搜索小象超市"),
+                reply(text = "好。"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("好。", run.finalText)
+        assertEquals(3, gateway.requests.size, "a real future plan must be nudged exactly once")
+        assertTrue(
+            gateway.requests[2].history.any { it is ModelHistoryItem.Text && it.text.contains("Observe first") },
+            "the nudge instruction must reach the model: ${gateway.requests[2].history}",
+        )
+    }
+
+    @Test
+    fun `a completion marker still suppresses the nudge`() {
+        assertNoPlanNudge("接下来我会先检查，抱歉无法继续。")
     }
 
     // ---------------------------------------------------------------- tool timeout (R60)

@@ -234,7 +234,8 @@ class MetricLogTest {
     @Test
     fun `every emitted plan nudge is counted`() {
         val lines = mutableListOf<String>()
-        val plan = "接下来我会先观察当前屏幕，然后再点按确认。"
+        // 0.5.4 Task 1: no "然后再" — the tightened plan nudge rejects that phrase; this test is about the nudge count.
+        val plan = "接下来我会先观察当前屏幕，然后点按确认。"
         val replies = listOf(
             GatewayReply(listOf(call("c1", "lookup")), "checking", ModelEnd.COMPLETED, null, null),
             GatewayReply(emptyList(), "$plan 一", ModelEnd.COMPLETED, null, null),
