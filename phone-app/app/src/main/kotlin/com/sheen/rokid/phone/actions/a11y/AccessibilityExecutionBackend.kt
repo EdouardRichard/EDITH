@@ -251,13 +251,15 @@ class AccessibilityExecutionBackend(
 
     private fun executeTap(argsJson: String): ActionResult {
         val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
-        // 0.5.4 Task 8 (§6.2.2): the count-only action line starts with the targeting mode this class really has -
-        // index. Task 11's coordinate taps extend the same token; the index itself never rides the line.
-        P3Log.line("P3_ACT via=index")
         val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
+        // 0.5.4 Task 8 (§6.2.2), fix round: the count-only action line starts with the targeting mode this class really
+        // has - index - and it names a **dispatched** action only. Placed after every validation and immediately before
+        // the dispatch, so a refusal is never counted as an act (Task 11's coordinate taps extend the same token; the
+        // index itself never rides the line).
+        P3Log.line("P3_ACT via=index")
         val accepted = ui.clickByIndex(snapshot.snapshotId, index)
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
@@ -268,12 +270,13 @@ class AccessibilityExecutionBackend(
 
     private fun executeLongPress(argsJson: String): ActionResult {
         val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
-        // 0.5.4 Task 8: same index token as `tap`; the action kind is already named by the tool result.
-        P3Log.line("P3_ACT via=index")
         val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
+        // 0.5.4 Task 8, same index token as `tap` and the same dispatch position: the action kind is already named by
+        // the tool result, and a refused long press has no device line.
+        P3Log.line("P3_ACT via=index")
         val accepted = ui.longPressByIndex(snapshot.snapshotId, index)
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
@@ -309,8 +312,6 @@ class AccessibilityExecutionBackend(
             ?: return refused(ARGUMENTS_INVALID)
         val index = (args["index"] as? JsonPrimitive)?.intOrNull ?: return refused(ARGUMENTS_INVALID)
         val text = (args["text"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return refused(ARGUMENTS_INVALID)
-        // 0.5.4 Task 8: `input_text` is index-targeted too, so it reports the same via token; the typed text never does.
-        P3Log.line("P3_ACT via=index")
         val trimmed = text.trim()
         if (trimmed.isEmpty() || trimmed.length > MAX_TEXT_CHARS) return refused(ARGUMENTS_INVALID)
         if (trimmed.any { it == '\n' || it == '\r' }) return refused(ARGUMENTS_INVALID)
@@ -319,6 +320,9 @@ class AccessibilityExecutionBackend(
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
+        // 0.5.4 Task 8, same dispatch position as `tap`: `input_text` is index-targeted, so it reports the same via
+        // token only when the write is actually dispatched; the typed text never rides it.
+        P3Log.line("P3_ACT via=index")
         val accepted = ui.setTextByIndex(snapshot.snapshotId, index, trimmed)
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")

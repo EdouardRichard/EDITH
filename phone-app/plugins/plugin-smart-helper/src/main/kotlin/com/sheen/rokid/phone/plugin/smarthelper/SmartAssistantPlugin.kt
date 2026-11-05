@@ -2183,8 +2183,9 @@ class SmartAssistantPlugin(
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
         // Since 0.5.4 Task 5 this holds in phone-only mode too. The point is not that both turns would answer the same
         // sentence: a typed/BALL turn is `!continuation`, so `openTurn` clears the queue (`queuedUtterance = null`) and
-        // the sentence would be **silently dropped** inside the exit's ≤1 s window. Keeping the queue live here lets the
-        // continue-off exit consume it; there is no dead-queue exception left to ignore.
+        // the sentence would be dropped inside the exit's ≤1 s window; since 0.5.4 Task 8 that clear is named
+        // (`queue_drop reason=new_wake`), but it is still a loss the wearer did not ask for. Keeping the queue live here
+        // lets the continue-off exit consume it; there is no dead-queue exception left to ignore.
         if (queuedUtterance != null) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
@@ -2985,7 +2986,12 @@ class SmartAssistantPlugin(
         if (!continuation) {
             if (startsCooldown) scene.noteTurn(nowNanos)
             // A new wake (or Help) starts a new conversation; a sentence queued for the previous answer's
-            // continuation must not be replayed into it.
+            // continuation must not be replayed into it. 0.5.4 Task 8 fix round: that clear is a real loss, so it is
+            // named **before** the slot is emptied. Counts only; the route is the queued sentence's own, which is the
+            // only route the slot carries.
+            queuedUtterance?.let { dropped ->
+                P3Log.line("P3_CONV queue_drop route=${dropped.route.name} reason=new_wake")
+            }
             queuedUtterance = null
         }
         val replaced = turn?.also { it.closed = true }

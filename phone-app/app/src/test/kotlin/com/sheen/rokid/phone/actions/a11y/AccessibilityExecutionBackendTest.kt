@@ -208,6 +208,34 @@ class AccessibilityExecutionBackendTest {
         )
     }
 
+    @Test fun `a refused index action emits no act line`() {
+        // 0.5.4 Task 8 fix round (review Important 1): `P3_ACT` reports a **dispatched** index action, not an attempt.
+        // A refusal returns before `ui.*ByIndex` is ever called, so counting it would make a device log overstate acts
+        // and attribute a device line to an action that never touched the device.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        val acts = withP3Sink { captured ->
+            // No snapshot established: all three index actions are refused before any UI call.
+            b.execute("tap", """{"index":0}""")
+            b.execute("long_press", """{"index":0}""")
+            b.execute("input_text", """{"index":0,"text":"hello"}""")
+            // A real snapshot but an out-of-range index.
+            b.execute("read_screen", "{}")
+            b.execute("tap", """{"index":9}""")
+            b.execute("long_press", """{"index":9}""")
+            b.execute("input_text", """{"index":9,"text":"hello"}""")
+            // A real snapshot and index but invalid text.
+            b.execute("input_text", """{"index":0,"text":""}""")
+            b.execute("input_text", """{"index":0,"text":"two\nlines"}""")
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertTrue("a refused action was never dispatched and must emit no act line: $acts", acts.isEmpty())
+        assertTrue("a refused action must not reach the UI: ${ui.clickByIndexCalls}", ui.clickByIndexCalls.isEmpty())
+        assertTrue("a refused action must not reach the UI: ${ui.setTextByIndexCalls}", ui.setTextByIndexCalls.isEmpty())
+    }
+
     @Test fun `the click result alone is not the verdict`() {
         // `clickByIndex` answered `false` (the node was not clickable): whatever the screen does afterwards, this is a
         // failure, and the code says why.

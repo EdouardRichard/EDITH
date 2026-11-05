@@ -695,7 +695,7 @@ class ModelClientGatewayTest {
 
         val line = lines.single { it.startsWith("P3_MODEL_REQ") }
         assertEquals(
-            "P3_MODEL_REQ ttfbMs=120 firstTokenMs=350 streamMs=900 reasoningChars=1 outcome=COMPLETED",
+            "P3_MODEL_REQ ttfbMs=120 firstTokenMs=350 streamMs=900 reasoningChars=1 outcome=COMPLETED stage=-",
             line,
         )
         assertFalse(line.contains("想") || line.contains("答"), "no model text may ride the request line: $line")
@@ -709,14 +709,16 @@ class ModelClientGatewayTest {
         gateway(client, metricLine = { lines += it }).turn(turn())
 
         assertEquals(
-            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=COMPLETED",
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=COMPLETED stage=-",
             lines.single { it.startsWith("P3_MODEL_REQ") },
         )
     }
 
-    @Test fun `a timed out request keeps its stage code inside outcome`() {
-        // 0.5.4 Task 6: FIRST_TOKEN_TIMEOUT / STREAM_IDLE_TIMEOUT / REQUEST_DEADLINE all end as DEADLINE. The
-        // per-request line must keep the stage, or a log cannot attribute the failure to one request.
+    @Test fun `a timed out request reports its stage in its own token`() {
+        // 0.5.4 Task 8: FIRST_TOKEN_TIMEOUT / STREAM_IDLE_TIMEOUT / REQUEST_DEADLINE all end as DEADLINE. The
+        // per-request line must keep the stage, or a log cannot attribute the failure to one request. Fix round
+        // (review Important 3): the stage is its own additive token, never a suffix of `outcome`, so `outcome=` is a
+        // bare verdict a grep can trust.
         val lines = mutableListOf<String>()
         val client = scripted(
             ModelStreamEvent.Terminal(
@@ -730,7 +732,41 @@ class ModelClientGatewayTest {
         assertEquals(ModelEnd.DEADLINE, reply.terminal)
         assertEquals(
             "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=90000 reasoningChars=0 " +
-                "outcome=DEADLINE:FIRST_TOKEN_TIMEOUT",
+                "outcome=DEADLINE stage=FIRST_TOKEN_TIMEOUT",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `a stage code equal to the verdict is not repeated`() {
+        // 0.5.4 Task 8 fix round (review Important 3): the pre-fix grammar could emit `outcome=DEADLINE:DEADLINE`. The
+        // verdict already carries that fact, so the additive token must dedupe to `-` rather than double it.
+        val lines = mutableListOf<String>()
+        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.DEADLINE, null, "DEADLINE"))
+
+        gateway(client, metricLine = { lines += it }).turn(turn(deadlineNanos = 120_000_000_000L))
+
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=DEADLINE stage=-",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `an incomplete turn keeps its nested relabel code in the stage token`() {
+        // The INCOMPLETE relabel prefixes the provider's own code (`TOOL_CALL_DELIVERY_INCOMPLETE:<code>`), so the
+        // stage value itself contains a colon. Under the whitespace-delimited token grammar that is one value, and the
+        // verdict stays a clean bare `outcome=INCOMPLETE`.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.ToolCallDelta("turn-7", "item-1", "tap", """{"index":0}"""),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, "PROVIDER_STAGE_X"),
+        )
+
+        val reply = gateway(client, metricLine = { lines += it }).turn(turn())
+
+        assertEquals(ModelEnd.INCOMPLETE, reply.terminal)
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 " +
+                "outcome=INCOMPLETE stage=TOOL_CALL_DELIVERY_INCOMPLETE:PROVIDER_STAGE_X",
             lines.single { it.startsWith("P3_MODEL_REQ") },
         )
     }

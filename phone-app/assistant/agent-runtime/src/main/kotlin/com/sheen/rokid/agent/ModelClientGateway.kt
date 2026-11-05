@@ -350,17 +350,25 @@ class ModelClientGateway(
      *
      * Latency comes from the client's own [com.sheen.rokid.plugin.ModelRequestTiming] (it owns the request's three
      * stages), so an unreported stage is `-`, never a fabricated `0`. `reasoningChars` counts the chain of thought only,
-     * never answer text. `outcome` is the terminal verdict, with the transport's stable stage code appended when it sent
-     * one (`DEADLINE:FIRST_TOKEN_TIMEOUT`): that is what lets a log attribute a failure to one request and one stage.
-     * Emitted for every request that reached the transport, including each deterministic overflow re-send.
+     * never answer text.
+     *
+     * **Grammar** (fix round, review Important 3): `outcome=<END> stage=<CODE|->`. `outcome` is always a bare
+     * [ModelEnd] token, so `outcome=DEADLINE` is a searchable verdict; the transport's stable stage code is the
+     * **separate** additive `stage` token. A code that merely repeats the verdict is deduped to `-` (the pre-fix form
+     * could emit `DEADLINE:DEADLINE`), and a nested relabel code such as
+     * `TOOL_CALL_DELIVERY_INCOMPLETE:<provider-code>` is one whitespace-delimited `stage` value, never a second
+     * `outcome` colon field. Emitted for every request that reached the transport, including each deterministic
+     * overflow re-send.
      */
     private fun emitModelRequestMetric(reply: GatewayReply) {
         val timing = reply.timing
         val verdict = reply.terminal?.name ?: ModelEnd.FAILED.name
-        val outcome = reply.safeCode?.let { "$verdict:$it" } ?: verdict
+        // A stage code that repeats the verdict adds nothing, so it is not printed twice; `-` is the same unavailable
+        // state the latency fields use.
+        val stage = reply.safeCode?.takeIf { it != verdict } ?: "-"
         val line = "P3_MODEL_REQ ttfbMs=${timing?.ttfbMillis ?: "-"} " +
             "firstTokenMs=${timing?.firstTokenMillis ?: "-"} streamMs=${timing?.streamMillis ?: "-"} " +
-            "reasoningChars=${reply.reasoning?.length ?: 0} outcome=$outcome"
+            "reasoningChars=${reply.reasoning?.length ?: 0} outcome=$verdict stage=$stage"
         // Observability is never a verdict: a throwing sink must not turn a delivered reply into a failed turn.
         runCatching { metricLine(line) }
     }

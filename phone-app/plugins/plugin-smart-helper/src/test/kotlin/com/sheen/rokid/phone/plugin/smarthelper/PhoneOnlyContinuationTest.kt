@@ -526,4 +526,48 @@ class PhoneOnlyContinuationTest {
             "the queue evidence carries counts only, never the wearer's words: $lines",
         )
     }
+
+    /**
+     * 0.5.4 Task 8 fix round (review Important 2): a new wake (or `Help`) starts a new conversation, so it clears a
+     * sentence queued for the previous answer's continuation. That clear is a real loss and must be attributable:
+     * without a line, a device log cannot tell "the wearer never said anything else" from "their sentence was discarded
+     * by a second wake". The line names the **queued sentence's** route, which is the only route the slot owns.
+     */
+    @Test
+    fun `a new wake names the queued sentence it clears`() {
+        val (rig, _) = rig(continueDialogue = true, continueAfterAnswer = false, phoneOnly = true)
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "第一轮回答。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第一句", turnId = "asr-1")))
+        rig.tick()
+        assertEquals("第一轮回答。", rig.output.hints.single().text, "the first answer is on screen")
+
+        // The idle gap before the display ACK: the stored switch queues the wearer's next sentence.
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
+
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            // A second wake is a new conversation. Past the 3 s scene cooldown it replaces the finished round.
+            rig.clock.advance(3_000_000_000L)
+            rig.plugin.handle(rig.wakeEvent())
+        } finally {
+            P3Log.sink = previous
+        }
+
+        assertTrue(
+            lines.any { it.startsWith("P3_WAKE turn=") },
+            "the second wake must be admitted, or the clear path never runs: $lines",
+        )
+        assertTrue(
+            lines.any { it == "P3_CONV queue_drop route=WAKE reason=new_wake" },
+            "a new wake clears a queued sentence, so that loss must be named: $lines",
+        )
+        assertTrue(
+            lines.none { it.contains("第二句") },
+            "the queue evidence carries counts only, never the wearer's words: $lines",
+        )
+    }
 }
