@@ -1183,6 +1183,17 @@ class HostCompositionRoot internal constructor(
         )
     }
 
+    /**
+     * Debug-only: grants the probe gate the confirmation that the production UI would otherwise collect.
+     *
+     * This is the same [profileConsent] callback [modelCatalogViewModel] hands the model-service page, so the
+     * shell-driven debug profile creator can drive the **production** tester end to end without a confirmation dialog.
+     * The production UI still owns the user confirmation, and no production code calls this method.
+     */
+    internal fun debugGrantProbeConsent(consent: ProbeConsent?) {
+        profileConsent(consent)
+    }
+
     /** True while a live plugin session would have to be stopped before a model selection is written. */
     private fun sessionBlocksModelSwitch(): Boolean = !closed && activatedPlugin != null
 

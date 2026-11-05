@@ -1,9 +1,12 @@
 package com.sheen.rokid.phone.debug
 import com.sheen.rokid.phone.app.EdithApplication
+import com.sheen.rokid.phone.model.ProbeConsent
 import com.sheen.rokid.phone.model.catalog.ModelEntry
 import com.sheen.rokid.phone.model.catalog.ModelOrigin
 import com.sheen.rokid.phone.model.catalog.ModelProfileProjection
 import com.sheen.rokid.phone.model.catalog.Provider
+import com.sheen.rokid.phone.model.domain
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
 
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -106,19 +109,32 @@ class DebugProfileCreator : BroadcastReceiver() {
                 root.profileTester?.let { tester ->
                     var result = "pending"
                     val profileId = ModelProfileProjection.profileId(saved.id, modelId)
-                    val handle = tester.testText(profileId) { event ->
-                        when (event) {
-                            is ModelStreamEvent.Terminal -> {
-                                result = "terminal:${event.end}"
-                                android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe: $result")
-                            }
-                            else -> {}
-                        }
+                    // The production tester sits behind the probe gate, whose confirmation the settings page collects.
+                    // This shell-driven instrument has no dialog, so it grants the confirmation the UI would collect
+                    // for the exact profile revision/domain it just saved, and revokes it as soon as the probe is done.
+                    val profile = requireNotNull(CatalogProfileRepository(catalog).get(profileId)) {
+                        "saved profile is not projected: $profileId"
                     }
-                    // Wait up to 30s for the probe to complete
-                    Thread.sleep(30_000)
-                    handle.cancel()
-                    android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe result: $result")
+                    try {
+                        root.debugGrantProbeConsent(
+                            ProbeConsent(profile.id, profile.revision, domain(profile.baseUrl), image = false),
+                        )
+                        val handle = tester.testText(profileId) { event ->
+                            when (event) {
+                                is ModelStreamEvent.Terminal -> {
+                                    result = "terminal:${event.end}"
+                                    android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe: $result")
+                                }
+                                else -> {}
+                            }
+                        }
+                        // Wait up to 30s for the probe to complete
+                        Thread.sleep(30_000)
+                        handle.cancel()
+                        android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe result: $result")
+                    } finally {
+                        root.debugGrantProbeConsent(null)
+                    }
                 }
             }
         } catch (e: Exception) {
