@@ -14,7 +14,8 @@ import java.security.MessageDigest
  * Every field is length-prefixed and every list is count-prefixed, and a history item is tagged with its wire type, so
  * two different prefixes cannot collide merely by splitting text across a field boundary (`"ab"+"c"` vs `"a"+"bc"`).
  * [ModelHistoryItem.ToolCall] contributes its call id and arguments; [ModelHistoryItem.ToolOutput] its call id and
- * output. Images are referenced metadata, not part of the text prefix, and are deliberately not folded in.
+ * output. An assistant text's reasoning (0.53) is folded in too: it is replayed in the request, so it is part of the
+ * prefix identity. Images are referenced metadata, not part of the text prefix, and are deliberately not folded in.
  */
 object PrefixHash {
 
@@ -36,6 +37,10 @@ object PrefixHash {
                         out.writeByte(TAG_TEXT)
                         out.writeText(item.role.name)
                         out.writeText(item.text)
+                        // 0.53: reasoning changes the wire request (the DeepSeek adapters replay it beside the
+                        // assistant text), so two prefixes that differ only there are not the same prefix. Length
+                        // framing keeps the field boundary unambiguous, exactly like every other component.
+                        out.writeText(item.reasoning.orEmpty())
                     }
                     is ModelHistoryItem.ToolCall -> {
                         out.writeByte(TAG_TOOL_CALL)

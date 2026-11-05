@@ -90,6 +90,20 @@ class PrefixHashTest {
         assertNotEquals(hash(tools = splitAfterFirstChar), hash(tools = splitAfterSecondChar))
     }
 
+    @Test fun `the hash changes when only the reasoning changes`() {
+        // 0.53: reasoning is replayed on the wire, so it is part of the cacheable prefix identity. A turn whose answer
+        // text is byte-identical but whose reasoning differs is a different request.
+        val plain = assistant("答")
+        val thinking = plain.copy(reasoning = "想")
+
+        assertNotEquals(hash(history = listOf(user("问"), plain)), hash(history = listOf(user("问"), thinking)))
+        assertEquals(
+            hash(history = listOf(user("问"), thinking)),
+            hash(history = listOf(user("问"), plain.copy(reasoning = "想"))),
+            "the same reasoning must produce the same hash",
+        )
+    }
+
     @Test fun `a different dynamic tail does not change the prefix hash because the caller excludes it`() {
         val systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = "sys"))
 

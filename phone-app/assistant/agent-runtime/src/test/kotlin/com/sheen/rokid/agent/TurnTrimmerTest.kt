@@ -139,6 +139,44 @@ class TurnTrimmerTest {
         assertEquals(SegmentOrigin.USER_INPUT, r.kept.conversationFlow.last().origin)
     }
 
+    @Test fun `the trimmer prices reasoning and merges it with the assistant text`() {
+        // 0.53: reasoning is part of what the adapter puts on the wire, so it is part of the message's price and it
+        // merges (with its own text) when recovery ① brings two assistant texts together.
+        val without = Segment(SegmentOrigin.TRANSCRIPT, true, "答", SegmentRole.ASSISTANT)
+        val withReasoning = without.copy(reasoning = "想".repeat(40))
+        assertTrue(
+            defaultSegmentMeasure(withReasoning) > defaultSegmentMeasure(without),
+            "reasoning must be priced: ${defaultSegmentMeasure(withReasoning)} vs ${defaultSegmentMeasure(without)}",
+        )
+
+        // 口径复算（token 单位）：sys 33、"u1" 33、"答" 33、"now" 33、固定 32 ⇒ 164（无 reasoning）。
+        // 加 40 个「想」后助手段 = 73 ⇒ 204；limit 180 ⇒ 有 reasoning 时掉一整回合，没有时不掉。
+        val base = frame(userTurn("u1"), without, user("now"))
+        assertEquals(0, TurnTrimmer().trim(base, limitTokens = 180).droppedTurns)
+        assertEquals(1, TurnTrimmer().trim(frame(userTurn("u1"), withReasoning, user("now")), limitTokens = 180).droppedTurns)
+
+        // Merge: two assistant texts separated only by a dropped older tool round become one message; the reasoning
+        // rides with its own half, joined the same way the text is.
+        fun round(output: String) =
+            """[{"type":"call","callId":"c1","name":"lookup","argsJson":"{}"},""" +
+                """{"type":"output","callId":"c1","output":"$output"}]"""
+        val mergeFrame = frame(
+            userTurn("u1"),
+            assistant("先查").copy(reasoning = "想1"),
+            Segment(SegmentOrigin.TOOL_ROUND, true, round("old")),
+            assistant("再查").copy(reasoning = "想2"),
+            Segment(SegmentOrigin.TOOL_ROUND, true, round("new")),
+            assistant("答案").copy(reasoning = "想3"),
+            user("now"),
+        )
+        val merged = TurnTrimmer().trim(mergeFrame, limitTokens = 1_000_000, mode = TrimMode.AGGRESSIVE)
+            .kept.conversationFlow
+            .filter { it.origin == SegmentOrigin.TRANSCRIPT && it.role == SegmentRole.ASSISTANT }
+
+        assertEquals(listOf("先查\n\n再查", "答案"), merged.map { it.text })
+        assertEquals(listOf("想1\n想2", "想3"), merged.map { it.reasoning })
+    }
+
     @Test fun `the system slot is never trimmed`() {
         val f = frame(userTurn("u1"), assistant("a1"), user("now"))
         val r = TurnTrimmer().trim(f, limitTokens = 1)
