@@ -118,6 +118,37 @@ class ThinkingRequestTest {
         }
     }
 
+    @Test fun `thinking off on a deepseek profile sends disabled and none and keeps the cap`() {
+        for (withTools in listOf(false, true)) {
+            val chosen = if (withTools) tools else emptyList()
+            for ((path, body) in bodies(profile(enabled = false).copy(model = "deepseek-flash"), chosen, cap = 512)) {
+                val thinking = body["thinking"] as? JsonObject
+                assertEquals(
+                    "disabled",
+                    thinking?.get("type")?.jsonPrimitive?.content,
+                    "$path/tools=$withTools must disable thinking explicitly",
+                )
+                assertEquals(
+                    "none",
+                    body["reasoning_effort"]?.jsonPrimitive?.content,
+                    "$path/tools=$withTools must turn the effort off",
+                )
+                assertEquals(
+                    if (path == "frame") 6_000 else 512,
+                    body.getValue("max_tokens").jsonPrimitive.int,
+                    "$path must keep the existing cap",
+                )
+            }
+        }
+    }
+
+    @Test fun `thinking off on a capability profile disables even when the model name is not deepseek`() {
+        val profile = profile(enabled = false, thinkingSupported = true).copy(model = "custom-model")
+        val body = bodies(profile).getValue("frame")
+        assertEquals("disabled", (body["thinking"] as? JsonObject)?.get("type")?.jsonPrimitive?.content)
+        assertEquals("none", body["reasoning_effort"]?.jsonPrimitive?.content)
+    }
+
     @Test fun `history reasoning is replayed as reasoning_content only when the request carries tools`() {
         val history = listOf(
             ModelHistoryItem.Text(MessageRole.USER, "old question"),

@@ -119,6 +119,27 @@ class ResponsesThinkingTest {
         }
     }
 
+    @Test fun `thinking off on a deepseek profile sends effort none and keeps the output cap`() {
+        for (withTools in listOf(false, true)) {
+            for ((path, body) in bodies(
+                profile(enabled = false).copy(model = "deepseek-flash"),
+                if (withTools) tools else emptyList(),
+                cap = 512,
+            )) {
+                assertEquals(
+                    "none",
+                    (body["reasoning"] as? JsonObject)?.get("effort")?.jsonPrimitive?.content,
+                    "$path/tools=$withTools must disable thinking explicitly",
+                )
+                assertEquals(
+                    if (path == "frame") 6_000 else 512,
+                    body.getValue("max_output_tokens").jsonPrimitive.int,
+                    "$path must keep the existing cap",
+                )
+            }
+        }
+    }
+
     @Test fun `a reasoning item precedes its assistant message only when the request carries tools`() {
         val profile = profile(enabled = false)
         val withTools = encoded(profile, historyWithReasoning().copy(tools = tools)).inputItems()

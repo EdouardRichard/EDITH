@@ -369,9 +369,9 @@ class ThinkingToolRoundE2ETest {
     @Test fun `a thinking-off chat profile still captures server reasoning and replays it with the next tool request`() {
         MockWebServer().use { server ->
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
-            // The switch is off, so no thinking field is requested — but DeepSeek defaults thinking on and still
-            // streams reasoning_content. It must be captured and replayed on the tool-bearing continuation, or the
-            // official rule turns round 2 into an HTTP 400.
+            // The switch is off and is now sent explicitly as disabled/none — but the server still streams
+            // reasoning_content. It must be captured and replayed on the tool-bearing continuation, or the official
+            // rule turns round 2 into an HTTP 400.
             server.enqueue(chatRoundOne())
             server.enqueue(chatRoundTwo())
             Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingEnabled = false, model = "deepseek-flash")
@@ -384,8 +384,17 @@ class ThinkingToolRoundE2ETest {
 
                     val (first, second) = rig.bodies()
                     for ((path, body) in listOf("first" to first, "second" to second)) {
-                        assertFalse("thinking" in body, "$path must not send a thinking field with the switch off")
-                        assertFalse("reasoning_effort" in body, "$path must not send reasoning_effort with the switch off")
+                        assertEquals(
+                            "disabled",
+                            body["thinking"]?.jsonObject?.get("type")?.jsonPrimitive?.content,
+                            "$path must send an explicit disabled with the switch off",
+                        )
+                        assertEquals(
+                            "none",
+                            body["reasoning_effort"]?.jsonPrimitive?.content,
+                            "$path must send reasoning_effort=none with the switch off",
+                        )
+                        assertEquals(6_000, body.getValue("max_tokens").jsonPrimitive.int, "$path keeps the existing cap")
                     }
                     val assistant = second.messages().single {
                         it.roleOf() == "assistant" && "tool_calls" in it
@@ -434,12 +443,12 @@ class ThinkingToolRoundE2ETest {
         }
     }
 
-    @Test fun `a thinking-off responses profile replays server-returned reasoning without sending a thinking field`() {
+    @Test fun `a thinking-off responses profile replays server-returned reasoning and sends an explicit off`() {
         MockWebServer().use { server ->
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
-            // The switch was off, yet the server reasoned anyway (DeepSeek defaults thinking on). The reasoning must be
-            // captured and replayed as an input item on the tool-bearing continuation, while the request itself stays a
-            // switch-off request: no `reasoning` field and a normal `max_output_tokens`.
+            // The switch was off and is now sent as `reasoning.effort=none`; the server still reasoned, so the reasoning
+            // must be captured and replayed as an input item on the tool-bearing continuation, with the normal
+            // `max_output_tokens`.
             server.enqueue(responsesRoundOne())
             server.enqueue(responsesRoundTwo())
             Rig(server, "DEEPSEEK_RESPONSES", thinkingEnabled = false, model = "deepseek-flash")
@@ -452,7 +461,11 @@ class ThinkingToolRoundE2ETest {
 
                     val (first, second) = rig.bodies()
                     for ((path, body) in listOf("first" to first, "second" to second)) {
-                        assertFalse("reasoning" in body, "$path must not request thinking with the switch off")
+                        assertEquals(
+                            "none",
+                            body["reasoning"]?.jsonObject?.get("effort")?.jsonPrimitive?.content,
+                            "$path must send an explicit off with the switch off",
+                        )
                         assertEquals(6_000, body.getValue("max_output_tokens").jsonPrimitive.int, "$path keeps the generic cap")
                     }
                     val input = second.inputItems()
@@ -468,7 +481,7 @@ class ThinkingToolRoundE2ETest {
         }
     }
 
-    @Test fun `a thinking-off chat profile with a silent server sends the generic pre-0_53 bodies`() {
+    @Test fun `a thinking-off chat profile with a silent server sends the explicit disable bodies`() {
         MockWebServer().use { server ->
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
             // Nothing was requested and nothing was returned: both bodies must be the generic OpenAI shape, with the
@@ -483,11 +496,14 @@ class ThinkingToolRoundE2ETest {
                     assertEquals(2, server.requestCount)
 
                     val (first, second) = rig.bodies()
-                    val genericKeys = setOf(
-                        "model", "stream", "stream_options", "modalities", "max_tokens", "tools", "tool_choice", "messages",
+                    val disabledKeys = setOf(
+                        "model", "stream", "stream_options", "modalities", "max_tokens", "thinking", "reasoning_effort",
+                        "tools", "tool_choice", "messages",
                     )
                     for ((path, body) in listOf("first" to first, "second" to second)) {
-                        assertEquals(genericKeys, body.keys, "$path must be the pre-0.5.3 generic body")
+                        assertEquals(disabledKeys, body.keys, "$path must carry the explicit disable")
+                        assertEquals("disabled", body.getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content, "$path")
+                        assertEquals("none", body.getValue("reasoning_effort").jsonPrimitive.content, "$path")
                         assertEquals(6_000, body.getValue("max_tokens").jsonPrimitive.int, "$path keeps the generic cap")
                         assertTrue(
                             body.messages().none { "reasoning_content" in it },

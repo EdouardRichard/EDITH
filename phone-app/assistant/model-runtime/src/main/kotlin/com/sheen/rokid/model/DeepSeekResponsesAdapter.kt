@@ -42,8 +42,14 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // 0.53 design (revised) §T3/§T5: the user switch is the only behaviour switch. With it on, the official
             // `reasoning.effort` goes out on every request (tools included) and `max_output_tokens` is **omitted** so
             // the provider's documented 64K/128K default applies. With it off, no thinking field at all is sent.
-            if (!profile.thinkingEnabled) put("max_output_tokens", profile.maxOutputTokens)
-            if (profile.thinkingEnabled) {
+            if (!profile.thinkingEnabled) {
+                put("max_output_tokens", profile.maxOutputTokens)
+                // 0.5.4: an explicit off is required where the provider's default is thinking on; omitting the field
+                // left DeepSeek reasoning, so the off switch was a no-op there.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("reasoning", buildJsonObject { put("effort", "none") })
+                }
+            } else {
                 put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
@@ -125,9 +131,12 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // switch on no `max_output_tokens` is sent at all, so the official 64K/128K default applies.
             if (!profile.thinkingEnabled) {
                 put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
-            }
-            // Both overloads write the same mapping — no family/capability gate.
-            if (profile.thinkingEnabled) {
+                // Both overloads write the same mapping; an explicit off is required where the provider defaults to
+                // thinking on.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("reasoning", buildJsonObject { put("effort", "none") })
+                }
+            } else {
                 put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {

@@ -53,8 +53,15 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             // on, the official DeepSeek fields go out on every request — tools included — and `max_tokens` is
             // **omitted** so the provider's documented 64K/128K default applies. With it off, no thinking field is
             // sent at all: the general OpenAI body, exactly the pre-0.5.2 shape, keeps the existing cap.
-            if (!profile.thinkingEnabled) put("max_tokens", profile.maxOutputTokens)
-            if (profile.thinkingEnabled) {
+            if (!profile.thinkingEnabled) {
+                put("max_tokens", profile.maxOutputTokens)
+                // 0.5.4: an explicit off is required where the provider's default is thinking on; omitting the field
+                // left DeepSeek reasoning, so the off switch was a no-op there.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("thinking", buildJsonObject { put("type", "disabled") })
+                    put("reasoning_effort", "none")
+                }
+            } else {
                 put("thinking", buildJsonObject { put("type", "enabled") })
                 put("reasoning_effort", reasoningEffort(profile))
             }
@@ -204,9 +211,13 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             // switch on no `max_tokens` is sent at all, so the provider's official 64K/128K default applies.
             if (!profile.thinkingEnabled) {
                 put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
-            }
-            // The same mapping as the legacy overload — the live path must not drift — and no family/capability gate.
-            if (profile.thinkingEnabled) {
+                // The same mapping as the legacy overload — the live path must not drift; an explicit off is required
+                // where the provider defaults to thinking on.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("thinking", buildJsonObject { put("type", "disabled") })
+                    put("reasoning_effort", "none")
+                }
+            } else {
                 put("thinking", buildJsonObject { put("type", "enabled") })
                 put("reasoning_effort", reasoningEffort(profile))
             }
