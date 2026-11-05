@@ -42,6 +42,17 @@ object CatalogValidation {
         else -> null
     }
 
+    /**
+     * A manual row's display name must satisfy the [ModelEntry] invariant (non-blank, no ISO control characters).
+     * Gateway-provided names are filtered by `ModelCatalogMerge.sanitizedDisplayName` instead; a value the user
+     * typed is reported as a field error rather than silently rewritten.
+     */
+    fun displayNameError(displayName: String): String? = when {
+        displayName.isBlank() -> "显示名不能为空"
+        displayName.any { it.isISOControl() } -> "显示名不能包含控制字符"
+        else -> null
+    }
+
     fun budgetError(contextWindowTokens: Int, maxOutputTokens: Int): String? = when {
         contextWindowTokens <= 0 || maxOutputTokens <= 0 -> "上下文窗口和最大输出必须大于 0"
         maxOutputTokens >= contextWindowTokens -> "最大输出必须小于上下文窗口"

@@ -17,6 +17,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.phone.model.domain
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -268,25 +269,28 @@ internal class ModelCatalogViewModel(
             _state.update { it.copy(error = ModelCatalogUi.ADD_PROVIDER_FIRST) }
             return@launch
         }
-        val errors = ModelCatalogUi.manualModelErrors(draft, provider)
+        // Normalize once: the id validated below is the id stored below, so a trailing space cannot form a duplicate.
+        val normalized = ModelCatalogUi.normalizeManualDraft(draft)
+        val errors = ModelCatalogUi.manualModelErrors(normalized, provider)
         if (errors.isNotEmpty()) {
             _state.update { it.copy(error = errors.first()) }
             return@launch
         }
-        val window = requireNotNull(ModelCatalogUi.parseKTokens(draft.contextWindowK))
-        val output = requireNotNull(ModelCatalogUi.parseKTokens(draft.maxOutputK))
-        val id = draft.id.trim()
-        val entry = ModelEntry(
-            id = id,
-            displayName = draft.displayName.trim().ifBlank { id },
-            contextWindowTokens = window,
-            maxOutputTokens = output,
-            inputs = draft.inputs + InputModality.TEXT,
-            outputs = setOf(OutputModality.TEXT),
-            origin = ModelOrigin.MANUAL,
-        )
+        val window = requireNotNull(ModelCatalogUi.parseKTokens(normalized.contextWindowK))
+        val output = requireNotNull(ModelCatalogUi.parseKTokens(normalized.maxOutputK))
         _state.update { it.copy(saving = true, error = null, notice = null) }
         try {
+            // Built inside the try: even a validation gap must surface as the mapped save error, never as an uncaught
+            // ModelEntry invariant exception escaping the coroutine.
+            val entry = ModelEntry(
+                id = normalized.id,
+                displayName = normalized.displayName.ifBlank { normalized.id },
+                contextWindowTokens = window,
+                maxOutputTokens = output,
+                inputs = normalized.inputs + InputModality.TEXT,
+                outputs = setOf(OutputModality.TEXT),
+                origin = ModelOrigin.MANUAL,
+            )
             repository.saveModels(
                 providerId = provider.id,
                 models = provider.models + entry,
@@ -305,7 +309,7 @@ internal class ModelCatalogViewModel(
     fun deleteModel(modelId: String) = launch {
         val provider = repository.catalog().activeProvider()
         val model = provider?.models?.firstOrNull { it.id == modelId }
-        if (model == null) {
+        if (provider == null || model == null) {
             _state.update { it.copy(error = ModelCatalogUi.MODEL_MISSING) }
             return@launch
         }
@@ -313,20 +317,27 @@ internal class ModelCatalogViewModel(
             it.copy(
                 error = null,
                 notice = null,
-                confirmation = CatalogConfirmation.DeleteModel(modelId, model.displayName),
+                confirmation = CatalogConfirmation.DeleteModel(provider.id, modelId, model.displayName),
             )
         }
     }
 
-    /** Saves an edited row (Task 14's detail page) through [ModelCatalogRepository.saveModels]. */
-    fun updateModel(entry: ModelEntry, changed: ModelEntry) = launch {
+    /**
+     * Saves an edited row (Task 14's detail page) through [ModelCatalogRepository.saveModels]. [providerId] is required:
+     * a model id is only unique inside its provider, so resolving it across the catalog could edit another provider.
+     */
+    fun updateModel(providerId: String, entry: ModelEntry, changed: ModelEntry) = launch {
         if (changed.id != entry.id) {
             _state.update { it.copy(error = ModelCatalogUi.MODEL_ID_IMMUTABLE) }
             return@launch
         }
         val catalog = repository.catalog()
-        val provider = catalog.providers.firstOrNull { candidate -> candidate.models.any { it.id == entry.id } }
+        val provider = catalog.providers.firstOrNull { it.id == providerId }
         if (provider == null) {
+            _state.update { it.copy(error = ModelCatalogUi.PROVIDER_MISSING) }
+            return@launch
+        }
+        if (provider.models.none { it.id == entry.id }) {
             _state.update { it.copy(error = ModelCatalogUi.MODEL_MISSING) }
             return@launch
         }
@@ -470,7 +481,7 @@ internal class ModelCatalogViewModel(
             is CatalogConfirmation.SwitchProvider -> performSwitch(pending.providerId)
             is CatalogConfirmation.DeleteProvider ->
                 performDeleteProvider(pending, newActiveId ?: pending.newActiveId)
-            is CatalogConfirmation.DeleteModel -> performDeleteModel(pending.modelId)
+            is CatalogConfirmation.DeleteModel -> performDeleteModel(pending)
         }
     }
 
@@ -509,13 +520,48 @@ internal class ModelCatalogViewModel(
     // internals
     // ---------------------------------------------------------------------------------------------------------
 
+    /**
+     * The single action wrapper. Every action reads the catalog before its own `try`; when that read throws (a corrupt
+     * or unreadable encrypted blob) the failure must become page state instead of escaping the coroutine. Cancellation
+     * is rethrown so [leave] still cancels in-flight work.
+     */
     private fun launch(block: suspend () -> Unit) {
         if (!entered) return
         scope.launch {
             mutex.withLock {
                 if (!isActive) return@withLock
-                block()
+                try {
+                    block()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    applyActionFailure(error)
+                }
             }
+        }
+    }
+
+    /** An unhandled catalog read refusal is the corrupt state; anything else stays a visible mapped error. */
+    private fun applyActionFailure(error: Throwable) {
+        if (error is ContractError.ConfigurationRejected) {
+            markCorrupt()
+        } else {
+            _state.update { it.copy(error = ModelCatalogUi.saveError(error), loading = false, saving = false) }
+        }
+    }
+
+    private fun markCorrupt() {
+        _state.update {
+            it.copy(
+                catalog = null,
+                activeProvider = null,
+                selectedModel = null,
+                corrupt = true,
+                warning = null,
+                loading = false,
+                saving = false,
+                confirmation = null,
+            )
         }
     }
 
@@ -523,17 +569,7 @@ internal class ModelCatalogViewModel(
         try {
             applyCatalog(repository.catalog())
         } catch (_: Throwable) {
-            _state.update {
-                it.copy(
-                    catalog = null,
-                    activeProvider = null,
-                    selectedModel = null,
-                    corrupt = true,
-                    warning = null,
-                    loading = false,
-                    saving = false,
-                )
-            }
+            markCorrupt()
         }
     }
 
@@ -629,17 +665,25 @@ internal class ModelCatalogViewModel(
         }
     }
 
-    private suspend fun performDeleteModel(modelId: String) {
+    private suspend fun performDeleteModel(pending: CatalogConfirmation.DeleteModel) {
         val catalog = repository.catalog()
-        val provider = catalog.providers.firstOrNull { candidate -> candidate.models.any { it.id == modelId } }
-        val model = provider?.models?.firstOrNull { it.id == modelId }
-        if (provider == null || model == null) {
+        // Model ids are provider-scoped: delete through the active provider recorded in the confirmation, never by
+        // searching every provider for a matching id.
+        val provider = catalog.activeProvider()
+        if (provider == null || provider.id != pending.providerId) {
+            // The active provider changed while the dialog was open; re-read instead of deleting from another provider.
             _state.update { it.copy(confirmation = null) }
             reload()
             return
         }
-        val wasSelected = catalog.activeProviderId == provider.id && catalog.selectedModelId == modelId
-        val remaining = provider.models.filterNot { it.id == modelId }
+        val model = provider.models.firstOrNull { it.id == pending.modelId }
+        if (model == null) {
+            _state.update { it.copy(confirmation = null) }
+            reload()
+            return
+        }
+        val wasSelected = catalog.selectedModelId == pending.modelId
+        val remaining = provider.models.filterNot { it.id == pending.modelId }
         // Design §5.9: a deleted selected model falls back to the provider's first image-capable row, else nothing.
         val fallback = if (wasSelected) remaining.firstOrNull { InputModality.IMAGE in it.inputs }?.id else null
         _state.update { it.copy(saving = true, error = null, notice = null) }

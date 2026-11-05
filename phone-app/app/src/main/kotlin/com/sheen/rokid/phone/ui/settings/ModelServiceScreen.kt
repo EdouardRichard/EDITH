@@ -443,7 +443,9 @@ private fun AddManualModelDialog(
                     inputs = if (image) setOf(InputModality.TEXT, InputModality.IMAGE) else setOf(InputModality.TEXT),
                 )
                 val problems = ModelCatalogUi.manualModelErrors(draft, existing)
-                if (problems.isEmpty()) onSubmit(draft) else errors = problems
+                // Submit the same normalized values that were validated, so the dialog and the view model agree on the
+                // id and display name (a trailing-space id must not produce a hidden duplicate).
+                if (problems.isEmpty()) onSubmit(ModelCatalogUi.normalizeManualDraft(draft)) else errors = problems
             }) { Text("新增") }
         },
         dismissButton = {

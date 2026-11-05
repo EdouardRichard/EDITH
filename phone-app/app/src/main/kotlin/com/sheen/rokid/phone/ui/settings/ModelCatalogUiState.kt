@@ -67,7 +67,13 @@ internal sealed interface CatalogConfirmation {
     data class SwitchProvider(val providerId: String, val providerName: String) : CatalogConfirmation
     data class DeleteProvider(val providerId: String, val providerName: String, val newActiveId: String?) :
         CatalogConfirmation
-    data class DeleteModel(val modelId: String, val displayName: String) : CatalogConfirmation
+
+    /**
+     * [providerId] scopes the delete: a model id is only unique inside its provider, so the confirmation must remember
+     * which provider the user was looking at instead of resolving the id across the whole catalog.
+     */
+    data class DeleteModel(val providerId: String, val modelId: String, val displayName: String) :
+        CatalogConfirmation
 }
 
 /**
@@ -106,7 +112,8 @@ internal data class ModelCatalogActions(
     val deleteProvider: (String) -> Unit = {},
     val setActiveProvider: (String) -> Unit = {},
     val addManualModel: (ManualModelDraft) -> Unit = {},
-    val updateModel: (ModelEntry, ModelEntry) -> Unit = { _, _ -> },
+    /** [providerId] comes from the page that opened the editor, so a shared model id edits the addressed provider. */
+    val updateModel: (String, ModelEntry, ModelEntry) -> Unit = { _, _, _ -> },
     val deleteModel: (String) -> Unit = {},
     val selectModel: (String) -> Unit = {},
     val restoreDefaults: (String) -> Unit = {},
@@ -323,16 +330,26 @@ internal object ModelCatalogUi {
     fun providerBaseUrlError(baseUrl: String, allowLocalHttp: Boolean): String? =
         CatalogValidation.baseUrlError(baseUrl, allowLocalHttp)
 
+    /**
+     * The manual form's one normalization boundary: the id and display name are trimmed here, so validation, the
+     * duplicate check and the stored [ModelEntry] all see the same value. A trailing-space id such as `"m-1 "` can
+     * therefore never slip a second `m-1` past the duplicate check.
+     */
+    fun normalizeManualDraft(draft: ManualModelDraft): ManualModelDraft =
+        draft.copy(id = draft.id.trim(), displayName = draft.displayName.trim())
+
     /** The manual model form's field errors, in field order; empty when the row can be built. */
     fun manualModelErrors(draft: ManualModelDraft, existing: Provider?): List<String> = buildList {
-        CatalogValidation.modelIdError(draft.id)?.let(::add)
-        if (draft.displayName.isBlank()) add("显示名不能为空")
-        val window = parseKTokens(draft.contextWindowK)
-        val output = parseKTokens(draft.maxOutputK)
+        // Validate the trimmed values, never the raw field text: those are the values the view model stores.
+        val normalized = normalizeManualDraft(draft)
+        CatalogValidation.modelIdError(normalized.id)?.let(::add)
+        CatalogValidation.displayNameError(normalized.displayName)?.let(::add)
+        val window = parseKTokens(normalized.contextWindowK)
+        val output = parseKTokens(normalized.maxOutputK)
         if (window == null) add("上下文窗口需为大于 0 的 K tokens 整数")
         if (output == null) add("最大输出需为大于 0 的 K tokens 整数")
         if (window != null && output != null) CatalogValidation.budgetError(window, output)?.let(::add)
-        if (existing?.models?.any { it.id == draft.id } == true) add("模型 ID 已存在")
+        if (existing?.models?.any { it.id == normalized.id } == true) add("模型 ID 已存在")
     }
 
     /** The fields an edit is allowed to protect from the next gateway refresh (Task 14 reuses this list). */

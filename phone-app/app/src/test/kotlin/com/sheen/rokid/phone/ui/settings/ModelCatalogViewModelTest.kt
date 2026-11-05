@@ -507,6 +507,57 @@ class ModelCatalogViewModelTest {
         assertNull(model.state.value.selectedModel)
     }
 
+    @Test
+    fun `deleting a model uses the active provider when two providers share its id`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        save(repository, provider("p-2", "Two", entry("m-1")))
+        repository.setActiveProvider("p-2")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.deleteModel("m-1")
+        model.confirmPending()
+
+        assertEquals(
+            "the model is deleted from the active provider",
+            emptyList<String>(),
+            repository.catalog().providers.first { it.id == "p-2" }.models.map { it.id },
+        )
+        assertEquals(
+            "the inactive provider with the same model id is untouched",
+            listOf("m-1"),
+            repository.catalog().providers.first { it.id == "p-1" }.models.map { it.id },
+        )
+    }
+
+    @Test
+    fun `updating a model uses the addressed provider when two providers share its id`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        save(repository, provider("p-2", "Two", entry("m-1")))
+        repository.setActiveProvider("p-2")
+        val model = viewModel(repository)
+        model.enter()
+        val original = requireNotNull(repository.catalog().activeProvider())
+            .models
+            .single { it.id == "m-1" }
+
+        model.updateModel("p-2", original, original.copy(displayName = "Renamed"))
+
+        assertNull(model.state.value.error)
+        assertEquals(
+            "the addressed provider's row is the one that changed",
+            "Renamed",
+            repository.catalog().providers.first { it.id == "p-2" }.models.single { it.id == "m-1" }.displayName,
+        )
+        assertEquals(
+            "the other provider's same-id row is untouched",
+            "Model m-1",
+            repository.catalog().providers.first { it.id == "p-1" }.models.single { it.id == "m-1" }.displayName,
+        )
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // model selection / manual rows
     // ---------------------------------------------------------------------------------------------------------
@@ -570,6 +621,53 @@ class ModelCatalogViewModelTest {
     }
 
     @Test
+    fun `a manual model id is trimmed before the duplicate check`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.addManualModel(manual(id = "m-1 "))
+
+        assertEquals(
+            "a trailing space must not slip a second m-1 past the duplicate check",
+            "模型 ID 已存在",
+            model.state.value.error,
+        )
+        assertEquals(1, repository.catalog().activeProvider()?.models?.size)
+
+        model.addManualModel(manual(id = "  m-trim  ", displayName = "Trimmed"))
+
+        assertNull(model.state.value.error)
+        assertEquals(
+            "the stored id is the normalized one",
+            listOf("m-1", "m-trim"),
+            repository.catalog().activeProvider()?.models?.map { it.id },
+        )
+    }
+
+    @Test
+    fun `a manual model display name with a control character is refused`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        val model = viewModel(repository)
+        model.enter()
+
+        listOf("Bad\tName", "Bad\nName").forEach { pasted ->
+            model.addManualModel(manual(id = "m-control", displayName = pasted))
+
+            assertEquals(
+                "a pasted tab or newline must become a field error, never a ModelEntry invariant crash",
+                "显示名不能包含控制字符",
+                model.state.value.error,
+            )
+            assertEquals("nothing was written", 1, repository.catalog().activeProvider()?.models?.size)
+        }
+    }
+
+    @Test
     fun `a missing selected model keeps the choice and warns`() {
         val repository = repository()
         save(repository, provider("p-1", "One", entry("m-1")))
@@ -603,6 +701,36 @@ class ModelCatalogViewModelTest {
         assertEquals(listOf("catalog", "reset", "catalog"), repository.calls)
         assertFalse(model.state.value.corrupt)
         assertNotNull(model.state.value.catalog)
+    }
+
+    @Test
+    fun `an unreadable catalog during an action shows the corrupt state instead of crashing`() {
+        val delegate = repository()
+        save(delegate, provider("p-1", "One", entry("m-1")))
+        delegate.setActiveProvider("p-1")
+        val repository = object : ModelCatalogRepository by delegate {
+            var failReads = false
+
+            override fun catalog(): ModelCatalog {
+                if (failReads) throw ContractError.ConfigurationRejected("Storage unavailable; reconfigure")
+                return delegate.catalog()
+            }
+        }
+        val model = viewModel(repository)
+        model.enter()
+        assertFalse(model.state.value.corrupt)
+        assertNotNull(model.state.value.catalog)
+        repository.failReads = true
+
+        model.selectModel("m-1")
+
+        assertTrue(
+            "an unreadable catalog read must become the modeled corrupt state, not an uncaught coroutine crash",
+            model.state.value.corrupt,
+        )
+        assertNull("the stale snapshot is not kept as if it were the catalog", model.state.value.catalog)
+        assertNull(model.state.value.activeProvider)
+        assertNull(model.state.value.selectedModel)
     }
 
     // ---------------------------------------------------------------------------------------------------------
