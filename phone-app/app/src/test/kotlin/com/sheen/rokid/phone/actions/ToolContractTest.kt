@@ -261,7 +261,7 @@ class ToolContractTest {
          * invent a failure shape the tool does not produce. A tool with more than one reachable failure names each.
          */
         val FAILURE_BEHAVIOUR: Map<String, List<String>> = linkedMapOf(
-            "read_screen" to listOf("ACTION_CHANNEL_UNAVAILABLE"),
+            "read_screen" to listOf("ACTION_CHANNEL_UNAVAILABLE", "ARGUMENTS_INVALID"),
             "tap" to listOf("NODE_NOT_CLICKABLE"),
             "long_press" to listOf("NODE_NOT_CLICKABLE"),
             "scroll" to listOf("NO_SCREEN_CHANGE"),

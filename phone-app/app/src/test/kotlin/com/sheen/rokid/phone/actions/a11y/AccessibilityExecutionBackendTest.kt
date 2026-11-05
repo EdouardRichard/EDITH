@@ -35,10 +35,16 @@ class AccessibilityExecutionBackendTest {
                 left = 0, top = 0, right = 100, bottom = 50, hintText = null,
             ),
         ),
+        /**
+         * What every `snapshot` call after the first one answers. Used to prove that a continuation page does not
+         * re-read the screen: if it did, it would splice in a tree the model never saw (0.5.4 T9 fix round).
+         */
+        private val laterNodes: List<RawSnapshotNode>? = null,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
         val setTextByIndexCalls = mutableListOf<Triple<String, Int, String>>()
         var fingerprints = 0
+        var snapshotCalls = 0
         private var currentSnapshot: ScreenSnapshot? = null
 
         override fun clickText(text: String): Boolean = clickable
@@ -49,8 +55,10 @@ class AccessibilityExecutionBackendTest {
         }
 
         override fun snapshot(filter: ScreenFilter): ScreenSnapshot {
+            snapshotCalls++
+            val tree = if (snapshotCalls == 1) nodes else laterNodes ?: nodes
             val source = object : SnapshotNodeSource {
-                override fun walkNodes(filter: ScreenFilter): List<RawSnapshotNode> = nodes
+                override fun walkNodes(filter: ScreenFilter): List<RawSnapshotNode> = tree
                 override fun maxNodeLimit(): Int = MAX_NODES
             }
             val snap = SnapshotBuilder.build(source, filter)
@@ -97,9 +105,9 @@ class AccessibilityExecutionBackendTest {
         AccessibilityExecutionBackend(ui = ui, connected = { connected })
 
     /** A run of plain text nodes with distinct rectangles, for the pagination tests. */
-    private fun textNodes(count: Int): List<RawSnapshotNode> = (0 until count).map { i ->
+    private fun textNodes(count: Int, prefix: String = "Item"): List<RawSnapshotNode> = (0 until count).map { i ->
         RawSnapshotNode(
-            text = "Item $i", contentDescription = null, className = null,
+            text = "$prefix $i", contentDescription = null, className = null,
             clickable = true, editable = false, scrollable = false, checked = false,
             left = 0, top = i * 10, right = 100, bottom = i * 10 + 10, hintText = null,
         )
@@ -190,6 +198,64 @@ class AccessibilityExecutionBackendTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("ARGUMENTS_INVALID", result.detail)
+    }
+
+    @Test fun `read screen refuses a non-numeric offset`() {
+        // Same refusal as a negative offset: a malformed page start is a caller error, not a page-0 request, and it is
+        // rejected before the screen is read at all (0.5.4 T9 fix round; documented in the descriptor prose).
+        val ui = FakeUi()
+
+        val result = backend(ui).execute("read_screen", """{"offset":"x"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("ARGUMENTS_INVALID", result.detail)
+        assertEquals("a malformed offset must be refused before any UI read", 0, ui.snapshotCalls)
+    }
+
+    @Test fun `offset pages reuse the snapshot page zero was read from`() {
+        // 0.5.4 T9 fix round (review Important 1): spec §6.3.1 says pagination is "within the same snapshot". A second
+        // `ui.snapshot` here would answer a different tree, so a re-reading implementation would render a screen the
+        // model never saw on page 0. The fake is deliberately changing: page 1 must answer from tree A and must not
+        // call `ui.snapshot` again.
+        val screenA = textNodes(150, prefix = "A")
+        val screenB = textNodes(150, prefix = "B")
+        val ui = FakeUi(nodes = screenA, laterNodes = screenB)
+        val b = backend(ui)
+
+        val firstPage = b.execute("read_screen", """{"filter":"all"}""").detail
+        assertTrue("page 0 shows the first read: $firstPage", """[0] "A 0"""" in firstPage)
+        assertEquals("page 0 reads the screen once", 1, ui.snapshotCalls)
+
+        val nextPage = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+
+        assertTrue("offset 100 keeps paging the snapshot page 0 came from: $nextPage", """[100] "A 100"""" in nextPage)
+        assertFalse("offset 100 must not splice in a newer screen: $nextPage", "B 100" in nextPage)
+        assertEquals("an offset page must not re-read the screen", 1, ui.snapshotCalls)
+    }
+
+    @Test fun `an offset page with no matching snapshot reads fresh`() {
+        // Documented fallback: `offset > 0` can only continue a snapshot that exists in this turn for the same filter.
+        // A cold page, a filter change and a new turn have nothing to page, so each reads the screen once - and that
+        // read becomes the snapshot the following page reuses.
+        val screenA = textNodes(150, prefix = "A")
+        val screenB = textNodes(150, prefix = "B")
+        val ui = FakeUi(nodes = screenA, laterNodes = screenB)
+        val b = backend(ui)
+
+        val cold = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+        assertTrue("a cold offset page reads the screen: $cold", """[100] "A 100"""" in cold)
+        assertEquals("a cold offset page reads once", 1, ui.snapshotCalls)
+
+        // A different filter is a different node set: paging the old snapshot would mix two queries.
+        val changedFilter = b.execute("read_screen", """{"filter":"interactive","offset":100}""").detail
+        assertTrue("a filter change reads fresh: $changedFilter", """[100] "B 100"""" in changedFilter)
+        assertEquals("a filter change reads the screen again", 2, ui.snapshotCalls)
+
+        // A new turn owns a new snapshot: the old one is gone even for an offset page.
+        b.beginTurn()
+        val newTurn = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+        assertTrue("a new turn re-reads the screen: $newTurn", """[100] "B 100"""" in newTurn)
+        assertEquals("a new turn re-reads the screen", 3, ui.snapshotCalls)
     }
 
     @Test fun `tap is a success only when the screen actually changed`() {

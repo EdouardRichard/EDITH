@@ -40,7 +40,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = READ_SCREEN,
         title = "读取当前屏幕内容",
-        description = "读取当前屏幕，返回按索引编号的元素列表（文本、contentDescription 回退 desc、bounds=[l,t][r,b] 与 center=(x,y)，以及 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大；offset 从第 offset 个元素开始返回下一页（默认 0，每页最多 100 条），索引始终是全局的，offset 只切页、不改变 tap 用的 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
+        description = "读取当前屏幕，返回按索引编号的元素列表（文本、contentDescription 回退 desc、bounds=[l,t][r,b] 与 center=(x,y)，以及 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大；offset 从第 offset 个元素开始返回下一页（默认 0，每页最多 100 条，必须是 >=0 的整数，负数或非数字返回 ARGUMENTS_INVALID 且不读屏），索引始终是全局的，offset 只切页、不改变 tap 用的 index；同一回合内 offset>0 的后续页复用首次读取的那份快照（翻页看到的是同一屏），filter 改变或本回合还没有快照时才重新读取。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"filter":{"type":"string","enum":["all","interactive","text"],"default":"interactive"},"offset":{"type":"integer","minimum":0,"default":0}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -175,6 +175,15 @@ class AccessibilityExecutionBackend(
     private var currentSnapshot: ScreenSnapshot? = null
 
     /**
+     * The filter [currentSnapshot] was read with (0.5.4 T9 fix round).
+     *
+     * Spec §6.3.1 says pagination is "within the same snapshot", so an `offset > 0` page may only continue a snapshot
+     * read with the same filter. Tracked next to the snapshot and cleared with it, so a stale filter can never pair
+     * with a newer snapshot.
+     */
+    private var currentSnapshotFilter: ScreenFilter? = null
+
+    /**
      * edith-0.3 Phase 4A close fix: ends the turn that owns [currentSnapshot].
      *
      * The five descriptors promise that an index comes from "本回合上一次 read_screen". The snapshot used to be
@@ -185,6 +194,7 @@ class AccessibilityExecutionBackend(
      */
     internal fun beginTurn() {
         currentSnapshot = null
+        currentSnapshotFilter = null
     }
 
     override fun execute(name: String, argsJson: String): ActionResult {
@@ -204,10 +214,30 @@ class AccessibilityExecutionBackend(
     private fun executeReadScreen(argsJson: String): ActionResult {
         val offset = parseOffset(argsJson) ?: return refused(ARGUMENTS_INVALID)
         val filter = parseFilter(argsJson)
-        val snapshot = runCatching { ui.snapshot(filter) }.getOrElse { return refused(ACTION_CHANNEL_UNAVAILABLE) }
-        currentSnapshot = snapshot
-        val serialized = serializeSnapshot(snapshot, offset)
-        return done(serialized)
+        val snapshot = pageSnapshot(filter, offset) ?: return refused(ACTION_CHANNEL_UNAVAILABLE)
+        return done(serializeSnapshot(snapshot, offset))
+    }
+
+    /**
+     * Returns the snapshot an `offset` page belongs to (spec §6.3.1: pagination is "within the same snapshot").
+     *
+     * `offset > 0` is a continuation of an earlier page, so it **must** describe the screen that earlier page described.
+     * When a snapshot from this turn exists and was read with the same [filter], it is reused and `ui.snapshot` is not
+     * called again - re-reading could splice a screen the model never saw into page 1 (the fake that hides this is why
+     * the 0.5.4 fix round added a changing fake).
+     *
+     * A fresh read is the documented fallback, used only when there is nothing to continue: `offset == 0` (a new read
+     * always starts a new snapshot), no snapshot in this turn, or a different filter (a different node set, so paging
+     * the old snapshot would mix two queries). In that fallback the fresh read becomes the snapshot the next page reuses
+     * and the screen is read exactly once.
+     */
+    private fun pageSnapshot(filter: ScreenFilter, offset: Int): ScreenSnapshot? {
+        val stored = currentSnapshot
+        if (offset > 0 && stored != null && currentSnapshotFilter == filter) return stored
+        val fresh = runCatching { ui.snapshot(filter) }.getOrElse { return null }
+        currentSnapshot = fresh
+        currentSnapshotFilter = filter
+        return fresh
     }
 
     private fun parseFilter(argsJson: String): ScreenFilter {
@@ -321,8 +351,9 @@ class AccessibilityExecutionBackend(
         val direction = parseDirection(argsJson) ?: return refused(ARGUMENTS_INVALID)
         val accepted = ui.scroll(direction)
         if (!accepted) return refused(NO_SCREEN_CHANGE)
-        // Scroll invalidates the current snapshot
+        // Scroll invalidates the current snapshot, and the filter it was read with goes with it.
         currentSnapshot = null
+        currentSnapshotFilter = null
         return done("scrolled ${direction.name.lowercase()}")
     }
 
