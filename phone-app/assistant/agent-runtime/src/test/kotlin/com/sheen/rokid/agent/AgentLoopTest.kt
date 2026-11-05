@@ -1162,6 +1162,65 @@ class AgentLoopTest {
         assertEquals(1, gateway.requests.size)
     }
 
+    /**
+     * A gateway that burns the request deadline it was given and reports it the way the transport does: `DEADLINE`
+     * from `ModelClientGateway` or `REQUEST_DEADLINE` from `ControlledModelClient`. Only the loop knows whether that
+     * deadline was the turn budget or a smaller per-request cap, so the mapping is decided there, not here.
+     */
+    private class DeadlineExhaustingGateway(
+        private val clock: FakeClock,
+        private val safeCode: String,
+    ) : ModelGateway {
+        val requests = mutableListOf<GatewayTurn>()
+
+        override fun turn(request: GatewayTurn): GatewayReply {
+            requests += request
+            clock.nowNanos = request.deadlineNanos + 1
+            return reply(terminal = ModelEnd.DEADLINE, safeCode = safeCode)
+        }
+    }
+
+    @Test fun `a request that runs out the whole turn budget is TURN_BUDGET, not REQUEST_DEADLINE`() {
+        // Review I-1 (Task 7): the per-request cap is larger than what is left of the budget, so the deadline handed to
+        // the gateway IS the turn deadline. The transport can only report its own REQUEST_DEADLINE; the loop must name
+        // the run's own budget so the main exhaustion path is not read as a request timeout.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "REQUEST_DEADLINE")
+
+        val run = newLoop(gateway, clock = clock)
+            .run(request(deadlineNanos = 300_000_000_000L, requestTimeoutNanos = 600_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "回合预算耗尽必须与单次请求超时区分")
+        assertEquals(1, gateway.requests.size)
+    }
+
+    @Test fun `a request that runs out its own smaller cap keeps REQUEST_DEADLINE`() {
+        // The companion guard: a request cap below the remaining budget is a genuine request timeout and must not be
+        // relabelled. The gateway stops one nanosecond past that cap, still well inside the turn budget.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "REQUEST_DEADLINE")
+
+        val run = newLoop(gateway, clock = clock)
+            .run(request(deadlineNanos = 300_000_000_000L, requestTimeoutNanos = 100_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("REQUEST_DEADLINE", run.safeCode, "单次请求上限先到，不能改写成回合预算")
+        assertTrue(clock.nowNanos < 300_000_000_000L, "the turn budget itself was not reached")
+    }
+
+    @Test fun `the gateway's own DEADLINE on a turn-bound request is TURN_BUDGET`() {
+        // requestTimeoutNanos = 0 keeps the old shape: the turn deadline is also the request cap. `ModelClientGateway`
+        // reports that expiry as DEADLINE; it is still this run's budget running out.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "DEADLINE")
+
+        val run = newLoop(gateway, clock = clock).run(request(deadlineNanos = 300_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "零上限时请求期限就是回合期限，超时即回合预算")
+    }
+
     @Test fun `cancel during a step ends the run as cancelled at the next check`() {
         val executor = executorOf("lookup")
         lateinit var agent: AgentLoop

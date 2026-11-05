@@ -36,8 +36,10 @@ enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCEL
  * that owns a model profile — the loop never reads one itself. [deadlineNanos] is a wall-clock boundary on the same
  * [MonotonicClock] the loop is given, not a capability budget; it bounds **machine** time only, because time spent
  * waiting on a confirmation is shifted out of it (D49). Expiry ends the run as [AgentOutcome.DEADLINE] with the loop's
- * own `TURN_BUDGET` safe code, distinct from a provider's request-timeout code. [requestTimeoutNanos] bounds **one model
- * request** instead, so a caller may keep them separate.
+ * own `TURN_BUDGET` safe code, and that includes a model request whose effective deadline was this turn deadline: the
+ * transport only reports that its own cap expired (`DEADLINE` / `REQUEST_DEADLINE`), the loop names the budget.
+ * [requestTimeoutNanos] bounds **one model request** instead, so a caller may keep them separate; when that cap is
+ * smaller than what is left of the budget, its expiry keeps the provider's code rather than becoming `TURN_BUDGET`.
  */
 data class AgentRequest(
     val turnId: String,
@@ -232,8 +234,11 @@ data class AgentMetrics(
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
  * `STEP_LIMIT` / `TURN_BUDGET`) and is `null` when nothing meaningful applies. `TURN_BUDGET` means this run spent its
- * whole `AgentRequest.deadlineNanos` (a `DEADLINE` outcome), which is how it stays distinguishable from the per-request
- * `REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT` codes the provider reports. [finalText] is set
+ * whole `AgentRequest.deadlineNanos` (a `DEADLINE` outcome) - counted at one of the loop's own checks **or** by a model
+ * request whose effective cap was that deadline. Only an expiry of a genuinely smaller
+ * `AgentRequest.requestTimeoutNanos` keeps the provider's `REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` /
+ * `STREAM_IDLE_TIMEOUT` code; that turn-bound vs request-bound reading is what keeps the two distinguishable.
+ * [finalText] is set
  * only for [AgentOutcome.COMPLETED] (the model's answer); [AgentOutcome.AWAITING_USER] leaves it `null` — that outcome
  * has no model answer, and the awaiting
  * tool's text is its own notification emit, not a final answer — and every failure outcome leaves it `null` too.
@@ -340,6 +345,11 @@ private const val STEP_LIMIT = "STEP_LIMIT"
  * expiry is not a provider/request timeout: `REQUEST_DEADLINE`, `FIRST_TOKEN_TIMEOUT` and `STREAM_IDLE_TIMEOUT` come
  * from `ControlledModelClient`/`ModelClientGateway` and travel as that provider's `safeCode`. Giving the loop's own
  * budget its own code keeps the two distinguishable in `P3_TURN` without inventing a seventh outcome.
+ *
+ * Review I-1: the transport cannot tell the two apart either, so the loop maps a `ModelEnd.DEADLINE` reply to this code
+ * only when that call's effective deadline was the turn deadline (including the `requestTimeoutNanos == 0` default) and
+ * the clock has reached it. A smaller per-request cap - and any `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT` it
+ * produced - forwards the provider's code unchanged.
  */
 private const val TURN_BUDGET = "TURN_BUDGET"
 private const val EMPTY_TURN_TEXT = "(empty turn)"
@@ -760,6 +770,14 @@ class AgentLoop(
             openingTurn = false
             metricCalls++
             val modelStartedNanos = clock.nowNanos()
+            // Review I-1 (0.5.4 Task 7): keep this call's effective request deadline local. It is the turn deadline
+            // whenever the caller supplies no per-request cap, or when that cap reaches past what is left of the
+            // budget - and a reply that expired on it is then this run spending its whole budget, not a request cap.
+            val requestDeadlineNanos = if (request.requestTimeoutNanos > 0L) {
+                minOf(turnDeadlineNanos, clock.nowNanos() + request.requestTimeoutNanos)
+            } else {
+                turnDeadlineNanos
+            }
             val reply = gateway.turn(
                 GatewayTurn(
                     request.turnId,
@@ -769,11 +787,7 @@ class AgentLoop(
                     tools,
                     // D49: the turn's budget and one request's cap are different numbers. A caller that supplies no cap
                     // keeps the old shape exactly.
-                    if (request.requestTimeoutNanos > 0L) {
-                        minOf(turnDeadlineNanos, clock.nowNanos() + request.requestTimeoutNanos)
-                    } else {
-                        turnDeadlineNanos
-                    },
+                    requestDeadlineNanos,
                     frame = frameForTurn,
                     // 0.24 S4: one observer for every request of the run; it owns no request state itself.
                     onTextDelta = request.onTextDelta,
@@ -823,10 +837,20 @@ class AgentLoop(
                     AgentOutcome.FAILED, reply.safeCode, null, steps, history, reply.text, spentSteps,
                     reply.reasoning,
                 )
-                ModelEnd.DEADLINE -> return finish(
-                    AgentOutcome.DEADLINE, reply.safeCode, null, steps, history, reply.text, spentSteps,
-                    reply.reasoning,
-                )
+                ModelEnd.DEADLINE -> {
+                    // Review I-1 (0.5.4 Task 7): the transport reports its own `DEADLINE` / `REQUEST_DEADLINE` for any
+                    // request deadline it hits, and it cannot tell the turn budget from a per-request cap. When this
+                    // call's effective deadline was the turn deadline and the clock has reached it, the run really
+                    // spent its whole budget and gets the loop's own code; a smaller request cap (and the stage
+                    // timeouts it produces) keeps the provider's code untouched.
+                    val turnBound =
+                        requestDeadlineNanos == turnDeadlineNanos && clock.nowNanos() >= turnDeadlineNanos
+                    return finish(
+                        AgentOutcome.DEADLINE,
+                        if (turnBound) TURN_BUDGET else reply.safeCode,
+                        null, steps, history, reply.text, spentSteps, reply.reasoning,
+                    )
+                }
                 ModelEnd.CANCELLED -> return finish(
                     AgentOutcome.CANCELLED, reply.safeCode, null, steps, history, reply.text, spentSteps,
                     reply.reasoning,
