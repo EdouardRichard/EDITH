@@ -89,6 +89,7 @@ class UnlockGatedActions(
             "input_text" to Policy(requireAccessibility = true),
             "open_app" to Policy(requireAccessibility = false),
             "open_url" to Policy(requireAccessibility = false),
+            "deep_link" to Policy(requireAccessibility = false),
             "open_settings" to Policy(requireAccessibility = false),
             "set_alarm" to Policy(requireAccessibility = false),
             "system_action" to Policy(requireAccessibility = false),

@@ -42,8 +42,8 @@ interface DeepLinkLauncher {
  * What the platform said about one deep-link launch.
  *
  * [Accepted.handlerPackage] is the package that will handle the URI when the platform could resolve one; it may be
- * `null` only when a launch with no requested package was accepted after an unresolved pre-check, and the tool then
- * verifies the foreground without a per-package wait.
+ * `null` only when a launch with no requested package was accepted after an unresolved pre-check. The tool then has no
+ * package to wait for and requires the foreground to change from its pre-launch value instead.
  */
 sealed interface DeepLinkLaunchResult {
     data class Accepted(val handlerPackage: String?) : DeepLinkLaunchResult
@@ -86,6 +86,10 @@ class ContextDeepLinkLauncher(private val context: Context) : DeepLinkLauncher {
  * wait up to 2 s for the requested package, then require the observed **foreground** and the accessibility **root** to
  * agree before it reports `Done`. Consequences, all of them deliberate:
  * - a package that never comes to front is `STATE_UNCHANGED` (the command was accepted; the state is what it is);
+ * - a no-package launch has no requested package to wait for: a resolved handler must still reach the foreground inside
+ *   the 2 s budget, and without a resolved handler the foreground must differ from the pre-launch read. Foreground and
+ *   root agreeing is necessary but **not** sufficient - a BAL-silent launch leaves the pre-existing screen in front and
+ *   would otherwise be reported as success;
  * - an http(s) link taken by another package is `BROWSER_FALLBACK` with the actual foreground package - the one honest
  *   answer when an App Link is not verified by its app, and never a silent component retry;
  * - an unreadable root (accessibility off or no root) is `UNVERIFIED`, never success, and `applied` stays unknown;
@@ -175,6 +179,9 @@ class DeepLinkTool(
 
     /** Runs the policy-valid request and maps the launcher's answer to the tool's verified result. */
     private fun launchVerified(request: DeepLinkRequest.Valid): ActionResult {
+        // Read the screen *before* dispatching: when the launcher cannot resolve a handler there is no package to wait
+        // for, so a foreground that moved is the only evidence the ACTION_VIEW did anything at all.
+        val foregroundBeforeLaunch = probeForeground()
         val launched = runCatching { launcher.launch(request.uri, request.packageName) }
             .getOrElse {
                 // A port that throws must not become TOOL_THREW; nothing proves the intent reached Android.
@@ -206,7 +213,7 @@ class DeepLinkTool(
                 "the system refused the deep-link launch",
                 recoverable = true,
             )
-            is DeepLinkLaunchResult.Accepted -> verify(request, launched.handlerPackage)
+            is DeepLinkLaunchResult.Accepted -> verify(request, launched.handlerPackage, foregroundBeforeLaunch)
         }
     }
 
@@ -216,15 +223,18 @@ class DeepLinkTool(
      * Root is checked first: without it there is no second witness, so the honest answer is [UNVERIFIED] whatever the
      * foreground reads. Only then is a package launch verified by `foreground == root == requested`, and an http(s)
      * link that landed on a different foreground package is [BROWSER_FALLBACK] rather than a fabricated success.
+     * A no-package launch additionally needs evidence that something moved: the resolved handler must have been reached
+     * by the wait, or - when nothing resolved - the foreground must differ from [foregroundBeforeLaunch].
      */
-    private fun verify(request: DeepLinkRequest.Valid, handlerPackage: String?): ActionResult {
+    private fun verify(
+        request: DeepLinkRequest.Valid,
+        handlerPackage: String?,
+        foregroundBeforeLaunch: String?,
+    ): ActionResult {
         val requestedPackage = request.packageName
         val expected = requestedPackage ?: handlerPackage
-        val reached = if (expected != null) {
+        val reached = expected != null &&
             runCatching { waitForForeground(expected, FOREGROUND_TIMEOUT_MILLIS) }.getOrDefault(false)
-        } else {
-            true
-        }
         val observedForeground = probeForeground()
         val observedRoot = probeRootPackage()
         if (observedRoot == null) {
@@ -237,12 +247,21 @@ class DeepLinkTool(
             )
         }
         if (requestedPackage == null) {
-            return if (observedForeground != null && observedForeground == observedRoot) {
+            // `foreground == root` is necessary but not sufficient: the pre-existing screen (home, keyguard,
+            // another app) satisfies it too. Without a requested package, success also needs the resolved
+            // handler to have come front, or - if nothing resolved - a foreground that moved since before launch.
+            val grounded = observedForeground != null && observedForeground == observedRoot
+            val launchProved = if (handlerPackage != null) {
+                reached
+            } else {
+                foregroundBeforeLaunch != null && foregroundBeforeLaunch != observedForeground
+            }
+            return if (grounded && launchProved) {
                 done(request, handlerPackage)
             } else {
                 failure(
                     code = STATE_UNCHANGED,
-                    message = "the launch command succeeded but no browser is verified in front",
+                    message = "the launch command succeeded but the screen did not change in a verifiable way",
                     data = data(request, handlerPackage, launched = true),
                     applied = null,
                     verified = false,
@@ -257,7 +276,7 @@ class DeepLinkTool(
         ) {
             return failure(
                 code = BROWSER_FALLBACK,
-                message = "the http(s) link opened in $observedForeground instead of $requestedPackage",
+                message = "the http(s) link did not reach $requestedPackage; foreground was $observedForeground",
                 data = data(request, handlerPackage, launched = true).with(
                     "foregroundPackage",
                     observedForeground,

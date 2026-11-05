@@ -86,6 +86,94 @@ class DeepLinkToolTest {
     }
 
     @Test
+    fun `a no-package launch whose resolved handler never reaches the front is STATE_UNCHANGED`() {
+        val rig = Rig(
+            result = DeepLinkLaunchResult.Accepted("com.android.chrome"),
+            foregroundNow = { "com.miui.home" },
+            rootNow = { "com.miui.home" },
+            reachesForeground = false,
+        )
+
+        val result = rig.tool.execute("""{"uri":"https://example.com/a"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertEquals(false, execution.verified)
+        assertEquals(
+            "the resolved handler is still awaited even without a requested package",
+            listOf("com.android.chrome" to 2_000L),
+            rig.waits,
+        )
+    }
+
+    @Test
+    fun `a no-package launch with no resolved handler must not report Done on an unchanged screen`() {
+        var screen = "com.miui.home"
+        val rig = Rig(
+            result = DeepLinkLaunchResult.Accepted(null),
+            foregroundNow = { screen },
+            rootNow = { screen },
+            // A BAL-silent launch: the launcher answers Accepted but the screen never moves.
+        )
+
+        val result = rig.tool.execute("""{"uri":"https://example.com/a"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertEquals(false, execution.verified)
+        assertTrue("there is no handler to wait for", rig.waits.isEmpty())
+    }
+
+    @Test
+    fun `a no-package launch with no resolved handler and no pre-launch foreground is STATE_UNCHANGED`() {
+        var screen: String? = null
+        val rig = Rig(
+            result = DeepLinkLaunchResult.Accepted(null),
+            foregroundNow = { screen },
+            rootNow = { screen },
+            onLaunch = { screen = "com.android.chrome" },
+        )
+
+        val result = rig.tool.execute("""{"uri":"https://example.com/a"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(
+            "without a pre-launch baseline, 'the foreground agrees with the root' proves no change",
+            "STATE_UNCHANGED",
+            execution.code,
+        )
+        assertEquals(false, execution.verified)
+        assertNull(execution.applied)
+    }
+
+    @Test
+    fun `a no-package launch with no resolved handler is Done when the foreground visibly changes`() {
+        var screen = "com.miui.home"
+        val rig = Rig(
+            result = DeepLinkLaunchResult.Accepted(null),
+            foregroundNow = { screen },
+            rootNow = { screen },
+            onLaunch = { screen = "com.android.chrome" },
+        )
+
+        val result = rig.tool.execute("""{"uri":"https://example.com/a"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.verified)
+        assertTrue("nothing to await without a resolved handler", rig.waits.isEmpty())
+    }
+
+    @Test
     fun `a custom scheme launch that never reaches the package is STATE_UNCHANGED`() {
         val rig = Rig(
             result = DeepLinkLaunchResult.Accepted("com.sankuai.meituan"),
@@ -128,6 +216,11 @@ class DeepLinkToolTest {
             "the model must see the package that actually came to front",
             "com.android.chrome",
             body(result)["foregroundPackage"]!!.jsonPrimitive.content,
+        )
+        assertTrue(
+            "the message must state what the foreground was, not claim the link opened there: " +
+                "${execution.message}",
+            execution.message!!.contains("foreground was com.android.chrome"),
         )
     }
 
@@ -328,15 +421,17 @@ class DeepLinkToolTest {
      * One tool over a scripted launcher and screen.
      *
      * [reachesForeground] is the injected 2 s poll's answer; the tool still re-reads `foregroundNow` afterwards, so a
-     * test can model "the poll timed out and the screen is somewhere else" without sleeping.
+     * test can model "the poll timed out and the screen is somewhere else" without sleeping. [onLaunch] runs inside the
+     * launcher, which is how a test models a launch that does (or does not) move the screen.
      */
     private class Rig(
         result: DeepLinkLaunchResult,
         private val foregroundNow: () -> String? = { null },
         private val rootNow: () -> String? = { null },
         private val reachesForeground: Boolean = true,
+        onLaunch: () -> Unit = {},
     ) {
-        val launcher = FakeLauncher(result)
+        val launcher = FakeLauncher(result, onLaunch)
         val waits = mutableListOf<Pair<String, Long>>()
         val tool = DeepLinkTool(
             launcher = launcher,
@@ -349,11 +444,15 @@ class DeepLinkToolTest {
         )
     }
 
-    private class FakeLauncher(private val result: DeepLinkLaunchResult) : DeepLinkLauncher {
+    private class FakeLauncher(
+        private val result: DeepLinkLaunchResult,
+        private val onLaunch: () -> Unit,
+    ) : DeepLinkLauncher {
         val calls = mutableListOf<Pair<String, String?>>()
 
         override fun launch(uri: String, packageName: String?): DeepLinkLaunchResult {
             calls += uri to packageName
+            onLaunch()
             return result
         }
     }
