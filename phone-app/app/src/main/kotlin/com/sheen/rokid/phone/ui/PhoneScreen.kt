@@ -34,6 +34,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -152,7 +153,17 @@ internal fun PhoneScreen(
         Scaffold(
             topBar = {
                 TopAppBar(
-                    title = { Text(pluginTitle(selected, plugins)) },
+                    // 0.52 T17: at 720x1280 / fontScale 1.5 the title used to wrap to two lines and grow the bar.
+                    // A single ellipsized line keeps the bar at 64dp and leaves the short screen to the settings body;
+                    // the plugin name is still the accessibility text, and other plugin names truncate instead of wrap.
+                    title = {
+                        Text(
+                            pluginTitle(selected, plugins),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            softWrap = false,
+                        )
+                    },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
                             Icon(Icons.Default.Menu, contentDescription = "菜单")
