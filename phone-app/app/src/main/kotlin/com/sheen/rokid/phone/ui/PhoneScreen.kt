@@ -232,11 +232,11 @@ internal fun PhoneScreen(
 }
 
 /**
- * 0.52 design §5.3 / ruling R25: the one-shot pre-catalog upgrade notice's copy.
+ * 0.52 design §5.3 / ruling R27: the one-shot pre-catalog upgrade notice's copy.
  *
- * The body is the approved user-visible sentence and stays verbatim; it is the only retired-term exception the settings
- * copy sweep allows. Keeping the strings here lets `SettingsCopyTest` whitelist exactly this body instead of every
- * string.
+ * Per controller ruling R27 the whole prompt — title and body — is the T13-approved verbatim legacy-upgrade notice and
+ * is exempt from the T15 terminology sweep for **both** 「模型配置」 and 「档案」. Both strings stay byte-for-byte
+ * unchanged. Keeping them here lets `SettingsCopyTest` whitelist exactly these two strings instead of every string.
  */
 internal object FirstRunModelUpgradeUi {
     const val TITLE = "模型配置已升级"

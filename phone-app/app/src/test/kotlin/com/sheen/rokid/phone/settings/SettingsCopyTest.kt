@@ -33,8 +33,8 @@ import org.junit.Test
  *
  * The pages render constants, so this JVM test is the cheap place to pin the whole sweep instead of the K40:
  *
- * - no user-visible settings string contains the retired term 「档案」, except the one approved first-run body
- *   (ruling R25, kept verbatim);
+ * - no user-visible settings string contains a retired term (「模型配置」 / 「档案」), except the whole approved
+ *   first-run prompt (ruling R27: title and body stay verbatim);
  * - the retired model forms (模型档案 / 新建档案 / …, 声明输入/输出, 文本实测/实测) are gone;
  * - the replacement vocabulary is present exactly (模型服务 / 模型 ID / 支持的输入 / 输出 /
  *   上下文窗口（最大输入） / 文本测试 / 图片测试);
@@ -76,7 +76,7 @@ class SettingsCopyTest {
      * The list is deliberately made of the same objects the page composables consume: HelpContent's popovers, the
      * home's summaries and labels, every route title, the shared form copy, each page object's fixed strings, and the
      * one app-level first-run notice. A page that bypasses its object is the one drift this list cannot see, which is
-     * why the `rg 档案` sweep is a separate one-time check (Task 15 brief) rather than a test.
+     * why the one-time `git grep` sweep for both retired terms is a separate check (Task 15 brief) rather than a test.
      */
     private fun settingsCopy(): List<String> = buildList {
         helpEntries.forEach { text ->
@@ -451,15 +451,23 @@ class SettingsCopyTest {
     }
 
     @Test
-    fun `no settings copy uses the retired term except the approved first run body`() {
-        val hits = settingsCopy().filter { it.contains("档案") }
+    fun `the retired terms appear only in the approved first run prompt`() {
+        val copy = settingsCopy()
+
+        // R27 exempts the whole first-run prompt, so both of its strings are in the audited surface and are the only
+        // per-string hits. Any other user-visible string containing 「模型配置」/「档案」 fails the equality below.
+        assertTrue("the first-run title is part of the audited surface", copy.contains(R27_FIRST_RUN_TITLE))
+        assertTrue("the first-run body is part of the audited surface", copy.contains(R27_FIRST_RUN_BODY))
+
+        val hits = copy.filter { text -> RETIRED_TERMS.any(text::contains) }
 
         assertEquals(
-            "the only user-visible 「档案」 is the approved first-run body (ruling R25)",
-            listOf(R25_FIRST_RUN_BODY),
+            "the only user-visible retired terms are the whole approved first-run prompt (ruling R27)",
+            listOf(R27_FIRST_RUN_TITLE, R27_FIRST_RUN_BODY),
             hits,
         )
-        assertEquals("R25 pins the approved body verbatim", R25_FIRST_RUN_BODY, FirstRunModelUpgradeUi.BODY)
+        assertEquals("R27 pins the approved title verbatim", R27_FIRST_RUN_TITLE, FirstRunModelUpgradeUi.TITLE)
+        assertEquals("R27 pins the approved body verbatim", R27_FIRST_RUN_BODY, FirstRunModelUpgradeUi.BODY)
     }
 
     @Test
@@ -578,8 +586,12 @@ class SettingsCopyTest {
     }
 
     private companion object {
-        /** Ruling R25: the approved 0.52 upgrade body, verbatim; the only allowed user-visible 「档案」. */
-        const val R25_FIRST_RUN_BODY =
+        /** Ruling R27: the first-run prompt is the verbatim legacy-upgrade notice for both retired terms. */
+        const val R27_FIRST_RUN_TITLE = "模型配置已升级"
+        const val R27_FIRST_RUN_BODY =
             "模型配置方式已升级，需要重新填写服务提供商与 API Key；旧档案不会被读取。"
+
+        /** R27: the whole first-run prompt is exempt; everywhere else 「模型配置」 and 「档案」 are retired. */
+        val RETIRED_TERMS = listOf("模型配置", "档案")
     }
 }
