@@ -48,7 +48,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // the explicit `none` on every protocol (measured: otherwise the deliberation is charged against the
             // output budget and the tool call never arrives).
             if (tools.isNotEmpty() || profile.thinkingSupported) {
-                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
                 put("tool_choice", "auto")
@@ -132,7 +132,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // supported text-only request, the pre-0.5.2 omission for an unsupported text-only one, and `none` for
             // every tool request (see the legacy overload).
             if (tools.isNotEmpty() || profile.thinkingSupported) {
-                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
                 // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
@@ -258,7 +258,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
      * text-only request omits it entirely (its caller's gate). Only called when the model is DeepSeek-family (R21) or
      * the request is a tool request.
      */
-    private fun reasoningEffort(profile: ModelProfile, toolRequest: Boolean): String =
+    private fun reasoningEffort(profile: ModelProfile): String =
         if (!ThinkingOutputBudget.active(profile)) "none"
         else when (profile.thinkingEffort) {
             ThinkingEffort.LOW -> "low"
