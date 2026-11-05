@@ -21,6 +21,9 @@ import com.sheen.rokid.phone.actions.device.OpenTool
 import com.sheen.rokid.phone.actions.device.ScreenProjector
 import com.sheen.rokid.phone.actions.device.ShellTool
 import com.sheen.rokid.phone.actions.device.ToolCatalog
+import com.sheen.rokid.phone.actions.deeplink.DeepLinkLaunchResult
+import com.sheen.rokid.phone.actions.deeplink.DeepLinkLauncher
+import com.sheen.rokid.phone.actions.deeplink.DeepLinkTool
 import com.sheen.rokid.phone.actions.intent.AppCatalog
 import com.sheen.rokid.phone.actions.intent.AppEntry
 import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
@@ -49,7 +52,8 @@ import org.junit.Test
  *
  * What is pinned here, and why each half matters:
  * - the 22 names, in the fixed order the composition builds (`a11y`, intent without `dial`, Shizuku, launch, system,
- *   catalog), because a tool table that changes shape between reads would also change the cached prompt prefix;
+ *   deep link, catalog), because a tool table that changes shape between reads would also change the cached prompt
+ *   prefix;
  * - `dial` has exactly one owner and it is the catalog's L1 `DialTool`; the legacy L2 row inside `IntentActionExecutor`
  *   stays reachable only through that tool, never as its own advertised action (the surface refuses a duplicate name at
  *   construction, so the filter is load-bearing rather than cosmetic);
@@ -63,7 +67,7 @@ class ToolFaceWiringTest {
 
     // ── the expected host face ───────────────────────────────────────────────────────────────────────────────
 
-    /** The 17 atomic descriptors, grouped the way the five backends declare them. */
+    /** The 18 atomic descriptors, grouped the way the six backends declare them. */
     private val atomicNames = listOf(
         // accessibility (atomic perception/operation)
         "read_screen", "tap", "long_press", "scroll", "input_text",
@@ -75,6 +79,8 @@ class ToolFaceWiringTest {
         "list_apps",
         // Shizuku system keys
         "system_action",
+        // 0.5.4 Task 14: the app-process ACTION_VIEW deep-link leg
+        "deep_link",
     )
 
     /** The umbrella catalog's four, in its own descriptor order. */
@@ -131,24 +137,27 @@ class ToolFaceWiringTest {
             AtomicActionExecutor(ShizukuExecutionBackend(shell, NeverAskedState, shizuku)),
             AtomicActionExecutor(LaunchAppExecutor(appCatalog)),
             AtomicActionExecutor(SystemActionExecutor(shell, shizuku)),
+            // 0.5.4 Task 14: the deep-link leg owns no channel and no turn state; the exercised host-face paths here
+            // never call its launcher, so the fake answers NoHandler if a test ever routes a name to it.
+            AtomicActionExecutor(DeepLinkTool(launcher = NeverAskedDeepLinkLauncher)),
         )
         return HostFace(ToolSurface(catalog, atomic), intent, atomicIntent, launcher, shell)
     }
 
-    // ── the 22-name face ─────────────────────────────────────────────────────────────────────────────────────
+    // ── the 22-name host face ───────────────────────────────────────────────────────────────────────────────
 
     @Test
-    fun `the host face advertises the seventeen atomic tools then the catalog's four`() {
+    fun `the host face advertises the eighteen atomic tools then the catalog's four`() {
         val names = hostFace().surface.descriptors().map { it.name }
 
         assertEquals(atomicNames.size, names.count { it in atomicNames })
-        assertEquals(17, atomicNames.size)
+        assertEquals(18, atomicNames.size)
         assertEquals(hostNames, names)
-        assertEquals("21 distinct names, no duplicate", 21, names.toSet().size)
+        assertEquals("22 distinct names, no duplicate", 22, names.toSet().size)
     }
 
     @Test
-    fun `every read advertises the same 21 names`() {
+    fun `every read advertises the same 22 names`() {
         val surface = hostFace().surface
 
         val first = surface.descriptors().map { it.name }
@@ -216,7 +225,7 @@ class ToolFaceWiringTest {
     }
 
     @Test
-    fun `a down Shizuku channel keeps all 21 advertised and runs no command`() {
+    fun `a down Shizuku channel keeps all 22 advertised and runs no command`() {
         var up = false
         val face = hostFace(shizuku = { up })
 
@@ -368,6 +377,12 @@ class ToolFaceWiringTest {
 
     private object EmptyAppCatalog : AppCatalog {
         override fun visibleApps(): List<AppEntry> = emptyList()
+    }
+
+    /** The deep-link leg is never executed by this suite; a routed call would be refused by its own launcher. */
+    private object NeverAskedDeepLinkLauncher : DeepLinkLauncher {
+        override fun launch(uri: String, packageName: String?): DeepLinkLaunchResult =
+            DeepLinkLaunchResult.NoHandler
     }
 
     /** Every UI call is unexpected: the only a11y-down paths that reach the backend must stop at its `connected` gate. */

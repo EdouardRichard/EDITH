@@ -173,6 +173,8 @@ import com.sheen.rokid.phone.actions.device.PrivilegedShellPort
 import com.sheen.rokid.phone.actions.device.ScreenProjector
 import com.sheen.rokid.phone.actions.device.ShellTool
 import com.sheen.rokid.phone.actions.device.ToolCatalog
+import com.sheen.rokid.phone.actions.deeplink.ContextDeepLinkLauncher
+import com.sheen.rokid.phone.actions.deeplink.DeepLinkTool
 import com.sheen.rokid.phone.lock.KeystoreLockPinStore
 import com.sheen.rokid.phone.lock.LockPinStore
 import com.sheen.rokid.phone.lock.LockPinValidator
@@ -4120,11 +4122,12 @@ class HostCompositionRoot internal constructor(
                 capture = { perception.screenshot() },
             )
             // ---- edith-0.3 Phase 4A Task 4 (A4): the 22-host-tool face ------------------------------------------
-            // `toolCatalog` is the umbrella half (the verified, structured path). The five atomic backends beside it are
-            // the fast path the model may choose instead: one leg per channel, each answering its own `available()` at
-            // call time. `ToolSurface` is the **one** `Capability.Actions` provider over both halves - 18 atomic
-            // descriptors plus the catalog's four = 22 - and it refuses a duplicate name at construction, which is why
-            // the intent leg filters `dial`: the catalog's `DialTool` is that name's only advertised owner.
+            // `toolCatalog` is the umbrella half (the verified, structured path). The six atomic backends beside it are
+            // the fast path the model may choose instead: one leg per channel (plus 0.5.4's app-process `deep_link`
+            // leg), each answering its own `available()` at call time. `ToolSurface` is the **one**
+            // `Capability.Actions` provider over both halves - 18 atomic descriptors plus the catalog's four = 22 - and
+            // it refuses a duplicate name at construction, which is why the intent leg filters `dial`: the catalog's
+            // `DialTool` is that name's only advertised owner.
             //
             // Advertising is stable (A3): a channel that is down keeps its tools advertised and its own `execute`
             // answers the refusal, so the schema and the cached prompt prefix cannot change under the model mid-session.
@@ -4193,6 +4196,17 @@ class HostCompositionRoot internal constructor(
                 // Shizuku: back/home/recents/notifications
                 AtomicActionExecutor(
                     SystemActionExecutor(shell = shizukuShell, channelUp = { shizukuShell.ready() }),
+                ),
+                // 0.5.4 Task 14 (spec §6.4): `deep_link` - one ACTION_VIEW intent through the app process itself
+                // (no Shizuku, no new permission/service), verified by the same 2 s foreground + a11y-root pipeline
+                // `open` uses. The intent channel has no unavailable state, so the leg advertises and answers always;
+                // an accessibility-off device gets `UNVERIFIED`, never a fabricated success.
+                AtomicActionExecutor(
+                    DeepLinkTool(
+                        launcher = ContextDeepLinkLauncher(context),
+                        foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
+                        rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                    ),
                 ),
             )
             // The catalog is closed through the surface's `onClose` (after the atomic executors), so the composition's

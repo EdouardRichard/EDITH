@@ -35,12 +35,12 @@ import org.junit.Test
 class ToolContractTest {
 
     @Test
-    fun `the default face is exactly the twenty three described tools`() {
+    fun `the default face is exactly the twenty four described tools`() {
         val face = ToolFaceFixture.face()
 
-        assertEquals("the default face is 23 tools", 23, face.size)
+        assertEquals("the default face is 24 tools", 24, face.size)
         assertEquals(
-            "the model-visible names are the spec's 23, whatever the executors' order",
+            "the model-visible names are the spec's 24, whatever the executors' order",
             ToolFaceFixture.DEFAULT_FACE,
             face.keys,
         )
@@ -214,7 +214,7 @@ class ToolContractTest {
                 clause.contains("用 $tier") && !clause.contains("不要用 $tier")
             }
 
-        /** The exact default face after the 2026-10-22 retirement: 17 atomic + 4 umbrella + the plugin's 2 delivery tools. */
+        /** The exact default face: 18 atomic + 4 umbrella + the plugin's 2 delivery tools. */
         val ATOMIC_TO_UMBRELLA: Map<String, List<String>> = linkedMapOf(
             "read_screen" to listOf("device"),
             "tap" to listOf("device"),
@@ -247,6 +247,7 @@ class ToolContractTest {
             "set_brightness" to listOf("value"),
             "list_apps" to emptyList(),
             "system_action" to listOf("action"),
+            "deep_link" to listOf("uri", "package"),
             "device" to listOf("action"),
             "shell" to listOf("command"),
             "open" to listOf("target"),
@@ -278,6 +279,14 @@ class ToolContractTest {
             "set_brightness" to listOf("STATE_UNCHANGED"),
             "list_apps" to listOf("truncated"),
             "system_action" to listOf("ACTION_CHANNEL_UNAVAILABLE", "COMMAND_FAILED"),
+            "deep_link" to listOf(
+                "PACKAGE_REQUIRED",
+                "SCHEME_NOT_ALLOWED",
+                "NO_HANDLER",
+                "PACKAGE_MISMATCH",
+                "BROWSER_FALLBACK",
+                "UNVERIFIED",
+            ),
             "device" to listOf("STALE_REF"),
             "shell" to listOf("SHELL_NOT_BOUND"),
             "open" to listOf("APP_AMBIGUOUS"),
@@ -289,7 +298,7 @@ class ToolContractTest {
 }
 
 /**
- * The default 23-tool face, assembled from the production executors. Test code only: both the contract and the routing
+ * The default 24-tool face, assembled from the production executors. Test code only: both the contract and the routing
  * suite read this one fixture, so neither can drift into a hand-written stand-in for the composition.
  */
 internal object ToolFaceFixture {
@@ -303,6 +312,8 @@ internal object ToolFaceFixture {
         "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
         // atomic local directory / system keys (`launch_app` retired 2026-10-22, 24 → 23)
         "list_apps", "system_action",
+        // 0.5.4 Task 14: the app-process ACTION_VIEW deep-link leg
+        "deep_link",
         // the umbrella catalog
         "device", "shell", "open", "dial",
         // the plugin's delivery tools
