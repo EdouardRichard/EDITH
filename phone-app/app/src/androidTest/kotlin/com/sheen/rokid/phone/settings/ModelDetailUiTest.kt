@@ -415,7 +415,9 @@ class ModelDetailUiTest {
 
         compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).performClick()
         compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsOn()
-        compose.onNodeWithText(ModelDetailUi.EFFORT_MAX).performClick().assertIsSelected()
+        // The three notices push the effort row below the viewport; a click on an off-screen node is not delivered,
+        // so scroll to it first (the K40 run caught this: "最高" stayed unselected while the semantics were correct).
+        compose.onNodeWithText(ModelDetailUi.EFFORT_MAX).performScrollTo().performClick().assertIsSelected()
 
         // A non-DeepSeek model is not disabled and gets the same notice instead of losing the block.
         current = model(id = "custom-vl", thinkingSupported = false)
