@@ -210,6 +210,11 @@ internal object ModelDetailUi {
     const val THINKING_DEFAULT_BUDGET_HINT =
         "开启后工具回合保留思考，输出预算按官方默认 64K/128K。关闭表示不主动请求深度思考；" +
             "DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。"
+    // 0.53 ruling B consequence: the official output default is reserved out of the window before input, so a small
+    // window cannot fit an enabled round. One sentence only - the owner asked for a notice, not a new validation.
+    const val THINKING_WINDOW_HINT =
+        "若模型的上下文窗口小于「官方默认输出（64K/128K）+ 安全余量（256 tokens）」，开启思考后请求会因预算不足被拒绝；" +
+            "DeepSeek V4.1 Flash 的窗口为 1M。"
 
     const val TEST_TITLE = "连接测试"
     const val TEST_TEXT = "文本测试"
@@ -605,6 +610,11 @@ private fun DetailBody(
     )
     Text(
         ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        ModelDetailUi.THINKING_WINDOW_HINT,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

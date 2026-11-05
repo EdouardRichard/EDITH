@@ -405,11 +405,12 @@ class ModelDetailUiTest {
             )
         }
 
-        // 0.53 ruling A: the block and its switch are always present and operable; both notices are shown.
+        // 0.53 ruling A: the block and its switch are always present and operable; every notice is shown.
         compose.onNodeWithText(ModelDetailUi.THINKING).performScrollTo().assertExists()
         compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsOff().assertIsEnabled()
         compose.onNodeWithText(ModelDetailUi.THINKING_ONLY_DEEPSEEK).assertExists()
         compose.onNodeWithText(ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT).assertExists()
+        compose.onNodeWithText(ModelDetailUi.THINKING_WINDOW_HINT).assertExists()
         compose.onNodeWithText(ModelDetailUi.EFFORT_LOW).assertIsSelected()
 
         compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).performClick()

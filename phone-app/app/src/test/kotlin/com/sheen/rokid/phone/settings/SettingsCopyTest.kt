@@ -383,6 +383,7 @@ class SettingsCopyTest {
                 ModelDetailUi.EFFORT_MAX,
                 ModelDetailUi.THINKING_ONLY_DEEPSEEK,
                 ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
+                ModelDetailUi.THINKING_WINDOW_HINT,
                 ModelDetailUi.TEST_TITLE,
                 ModelDetailUi.TEST_TEXT,
                 ModelDetailUi.TEST_IMAGE,

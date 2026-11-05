@@ -172,6 +172,11 @@ class ModelDetailStateTest {
                 "DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。",
             ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
         )
+        assertEquals(
+            "若模型的上下文窗口小于「官方默认输出（64K/128K）+ 安全余量（256 tokens）」，开启思考后请求会因预算不足被拒绝；" +
+                "DeepSeek V4.1 Flash 的窗口为 1M。",
+            ModelDetailUi.THINKING_WINDOW_HINT,
+        )
     }
 
     // Brief case: `audio is always disabled and labelled for 0.53` (0.53 contains a dot, illegal in a JVM method name).
