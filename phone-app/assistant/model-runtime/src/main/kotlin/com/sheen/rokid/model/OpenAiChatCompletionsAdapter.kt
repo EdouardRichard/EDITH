@@ -49,15 +49,16 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            put("max_tokens", profile.maxOutputTokens)
-            // 0.52 design §5.7 + R21: Chat Completions spells the switch as `thinking.type` plus a top-level
+            put("max_tokens", maxTokens(profile, null))
+            // 0.52 design §5.7 + 0.53 §T3: Chat Completions spells the switch as `thinking.type` plus a top-level
             // `reasoning_effort`; the vendor-only `enable_thinking` and a reasoning token budget are not used. A tool
-            // request always turns thinking off — the measured tool turn needs `none` to keep the output budget for
-            // the call itself. Both fields are DeepSeek-native: an OpenAI-compatible non-DeepSeek endpoint may reject
-            // them, so they are sent only when the projected model declares support (the pre-0.5.2 body otherwise).
+            // request no longer turns thinking off: when the profile has thinking active the switch and the chosen
+            // effort are sent with tools too, and the reasoning history is replayed (0.53). Both fields are
+            // DeepSeek-native: an OpenAI-compatible non-DeepSeek endpoint may reject them, so they are sent only when
+            // the projected model declares support (the pre-0.5.2 body otherwise).
             if (profile.thinkingSupported) {
-                put("thinking", buildJsonObject { put("type", thinkingType(profile, frame.tools.isNotEmpty())) })
-                put("reasoning_effort", reasoningEffort(profile, frame.tools.isNotEmpty()))
+                put("thinking", buildJsonObject { put("type", thinkingType(profile)) })
+                put("reasoning_effort", reasoningEffort(profile))
             }
             if (frame.tools.isNotEmpty()) {
                 put("tools", buildJsonArray { frame.tools.forEach { add(toolDescriptor(it)) } })
@@ -156,23 +157,30 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
     } catch (_: Exception) { null }
 
     /**
-     * 0.52 design §5.7: Chat Completions' switch. Thinking is enabled only when the profile asks for it and the request
-     * carries no tools; a tool request always disables it so the output budget stays with the call.
+     * 0.53 design §T3: thinking is active only when the model is thinking-capable **and** the profile asks for it.
+     * A tool request no longer forces it off; the pre-0.53 forced-off rule was a safety net for the missing reasoning
+     * history, which the 0.53 replay now supplies.
      */
-    private fun thinkingType(profile: ModelProfile, toolRequest: Boolean): String =
-        if (profile.thinkingEnabled && !toolRequest) "enabled" else "disabled"
+    private fun active(profile: ModelProfile) = ThinkingOutputBudget.active(profile)
+
+    /** Chat Completions' switch. Stated explicitly even when off: DeepSeek defaults thinking on. */
+    private fun thinkingType(profile: ModelProfile): String = if (active(profile)) "enabled" else "disabled"
+
+    /** The top-level effort; `none` is the explicit off state DeepSeek documents. */
+    private fun reasoningEffort(profile: ModelProfile): String = if (!active(profile)) "none"
+    else when (profile.thinkingEffort) {
+        ThinkingEffort.LOW -> "low"
+        ThinkingEffort.HIGH -> "high"
+        ThinkingEffort.MAX -> "max"
+    }
 
     /**
-     * 0.52 design §5.7: Chat Completions' top-level effort. A tool request and a disabled profile map to `none`; a
-     * text-only enabled profile maps the three catalog levels onto the wire names.
+     * 0.53 design §T5: an active thinking turn's allowance is raised to [ThinkingOutputBudget.reserve] so the
+     * deliberation cannot consume the whole budget and starve the answer or the tool call.
      */
-    private fun reasoningEffort(profile: ModelProfile, toolRequest: Boolean): String =
-        if (toolRequest || !profile.thinkingEnabled) "none"
-        else when (profile.thinkingEffort) {
-            ThinkingEffort.LOW -> "low"
-            ThinkingEffort.HIGH -> "high"
-            ThinkingEffort.MAX -> "max"
-        }
+    private fun maxTokens(profile: ModelProfile, cap: Int?): Int =
+        if (active(profile)) maxOf(cap ?: profile.maxOutputTokens, ThinkingOutputBudget.reserve(profile))
+        else cap ?: profile.maxOutputTokens
 
     private fun toolDescriptor(spec: ToolSpec) = buildJsonObject {
         put("type", "function")
@@ -210,15 +218,15 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
             // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
-            // when the request declares no cap of its own (every pre-0.3 caller).
-            put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
-            // 0.52 design §5.7 + R21: the same gated mapping as the legacy overload; the live path must not drift.
-            // A non-DeepSeek profile keeps the pre-0.5.2 body: neither native field is sent.
+            // when the request declares no cap of its own (every pre-0.3 caller). 0.53 §T5: an active thinking turn
+            // raises it to the output floor, because thinking is charged against this same allowance.
+            put("max_tokens", maxTokens(profile, budgeted.request.maxOutputTokens))
+            // 0.52 design §5.7 + 0.53 §T3: the same gated mapping as the legacy overload, including the active-tool
+            // turn; the live path must not drift. A non-DeepSeek profile keeps the pre-0.5.2 body: neither native
+            // field is sent.
             if (profile.thinkingSupported) {
-                put("thinking", buildJsonObject {
-                    put("type", thinkingType(profile, budgeted.request.tools.isNotEmpty()))
-                })
-                put("reasoning_effort", reasoningEffort(profile, budgeted.request.tools.isNotEmpty()))
+                put("thinking", buildJsonObject { put("type", thinkingType(profile)) })
+                put("reasoning_effort", reasoningEffort(profile))
             }
             if (budgeted.request.tools.isNotEmpty()) {
                 // 0.52 live-path repair: the budgeted overload dropped the tool table that the legacy frame overload
@@ -234,7 +242,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                     put("content", budgeted.request.instructions)
                 })
                 // History, including the tool round-trip the stateless endpoint needs echoed back.
-                historyToMessages(budgeted.request.history).forEach { add(it) }
+                historyToMessages(budgeted.request.history, profile).forEach { add(it) }
                 // Current turn: text + optional image + optional audio. An empty input is a history-only continuation
                 // (the request that follows a tool round): the tool output stays last and no empty user message is
                 // appended after it.
@@ -268,13 +276,20 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
      * message between assistant(`tool_calls`) and one of its `tool` replies is the pairing Qwen documents as invalid
      * and D9 warns against, so a batch renders as `assistant(tool_calls)` → all `tool` replies → the image messages.
      * A one-output tool round (the common case) is therefore exactly `tool` → user image.
+     *
+     * 0.53 design §T2/§T4: a thinking-capable profile replays each assistant item's `reasoning` as
+     * `reasoning_content` on the very message that carries its text and calls. DeepSeek requires every past assistant
+     * turn's reasoning when the request carries `tools`; because the field rides the assistant message, a message the
+     * caller dropped takes its reasoning with it. A non-DeepSeek profile never writes the field (design §G3).
      */
-    private fun historyToMessages(history: List<ModelHistoryItem>): JsonArray {
+    private fun historyToMessages(history: List<ModelHistoryItem>, profile: ModelProfile): JsonArray {
         val messages = mutableListOf<JsonObject>()
         // User messages carrying a finished tool run's images; emitted once that run of replies is complete.
         val pendingImages = mutableListOf<JsonObject>()
         // An assistant text waits for the calls directly after it; it becomes that message's content.
         var assistantText: String? = null
+        // 0.53: the reasoning of the waiting assistant turn, replayed beside that message only.
+        var assistantReasoning: String? = null
         val calls = mutableListOf<ModelHistoryItem.ToolCall>()
 
         fun flushImages() {
@@ -283,24 +298,33 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             pendingImages.clear()
         }
 
+        fun reasoningContent(): JsonElement? =
+            if (profile.thinkingSupported) assistantReasoning?.let { JsonPrimitive(it) } else null
+
         fun flushCalls() {
             if (calls.isEmpty()) return
+            val reasoning = reasoningContent()
             messages += buildJsonObject {
                 put("role", "assistant")
                 put("content", assistantText?.let { JsonPrimitive(it) } ?: JsonNull)
+                if (reasoning != null) put("reasoning_content", reasoning)
                 put("tool_calls", JsonArray(calls.map(::assistantToolCall)))
             }
             calls.clear()
             assistantText = null
+            assistantReasoning = null
         }
 
         fun flushText() {
             val text = assistantText ?: return
+            val reasoning = reasoningContent()
             messages += buildJsonObject {
                 put("role", "assistant")
                 put("content", text)
+                if (reasoning != null) put("reasoning_content", reasoning)
             }
             assistantText = null
+            assistantReasoning = null
         }
 
         fun queueImages(output: ModelHistoryItem.ToolOutput) {
@@ -329,6 +353,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                         // Two assistant texts in a row: the earlier one is its own turn and goes out now.
                         flushText()
                         assistantText = item.text
+                        assistantReasoning = item.reasoning
                     } else {
                         flushText()
                         messages += buildJsonObject {

@@ -64,6 +64,13 @@ class ChatCompletionsDecoder(private val requestId: String) {
             for (choice in choices) {
                 val obj = choice as? JsonObject ?: continue
                 val delta = obj["delta"] as? JsonObject
+                // 0.53: DeepSeek streams its chain of thought as `delta.reasoning_content` beside `delta.content`.
+                // It is not answer text: it is surfaced as a ReasoningDelta so the client can store it with the
+                // assistant turn and replay it, and it never marks the turn as having delivered text.
+                val reasoning = delta?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
+                if (reasoning != null && reasoning.isNotEmpty()) {
+                    events += ModelStreamEvent.ReasoningDelta(requestId, reasoning)
+                }
                 // Qwen-Omni returns both reasoning_content and content; only emit content as text deltas
                 val content = delta?.get("content")?.jsonPrimitive?.contentOrNull
                 if (content != null && content.isNotEmpty()) {
@@ -75,6 +82,9 @@ class ChatCompletionsDecoder(private val requestId: String) {
                 if (finishReason != null && finishEnd == null) {
                     finishEnd = when (finishReason) {
                         "stop" -> ModelEnd.COMPLETED
+                        // 0.53 §T10: a tool-call turn is a successful model turn. The pre-0.53 unknown branch made
+                        // every Chat tool round fail before the tool could run.
+                        "tool_calls" -> ModelEnd.COMPLETED
                         "length" -> ModelEnd.INCOMPLETE
                         else -> ModelEnd.FAILED
                     }

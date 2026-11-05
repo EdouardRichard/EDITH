@@ -33,6 +33,12 @@ class ChatCompletionsDecoderTest {
     private fun content(text: String) = SseFrame(null,
         """{"choices":[{"delta":{"content":"$text"}}]}""")
 
+    private fun reasoning(text: String) = SseFrame(null,
+        """{"choices":[{"delta":{"reasoning_content":"$text"},"index":0}]}""")
+
+    private fun finishWith(reason: String) = SseFrame(null,
+        """{"choices":[{"delta":{},"finish_reason":"$reason"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}""")
+
     private fun done() = SseFrame(null, "[DONE]")
 
     private fun usageOf(usage: String): ModelUsage? {
@@ -143,5 +149,64 @@ class ChatCompletionsDecoderTest {
         val terminal = terminal(decoder.accept(done()))
         assertEquals(ModelUsage(100, 20, cacheMissInputTokens = 36), terminal.usage)
         assertNull(terminal.usage?.cachedInputTokens, "a counter never reported stays absent")
+    }
+
+    // ------------------------------------------------------------ 0.53 DeepSeek thinking (design §5.2)
+
+    @Test fun `reasoning content streams before the answer without becoming text`() {
+        // The chain of thought is its own event stream: it never becomes answer text and never marks the turn as
+        // "text delivered" (so it cannot satisfy the retry gate or the content-based verdict).
+        val decoder = ChatCompletionsDecoder("q")
+
+        val first = decoder.accept(reasoning("先想"))
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "先想")), first)
+
+        val second = decoder.accept(content("好"))
+        assertEquals(listOf(ModelStreamEvent.TextDelta("q", "好")), second)
+    }
+
+    @Test fun `an empty reasoning chunk emits nothing and a reasoning only turn is decided by its finish reason`() {
+        val decoder = ChatCompletionsDecoder("q")
+
+        assertTrue(decoder.accept(reasoning("")).isEmpty(), "an empty reasoning fragment is not an event")
+        assertEquals(
+            listOf(ModelStreamEvent.ReasoningDelta("q", "想")),
+            decoder.accept(reasoning("想")),
+            "a reasoning-only turn still surfaces its chain of thought",
+        )
+        val terminal = terminal(decoder.accept(finishWith("stop")))
+        assertEquals(ModelEnd.COMPLETED, terminal.end, "the finish reason decides, not the absent answer text")
+    }
+
+    @Test fun `a reasoning only stream with no finish reason ends incomplete`() {
+        val decoder = ChatCompletionsDecoder("q")
+
+        decoder.accept(reasoning("想"))
+
+        val terminal = terminal(decoder.accept(done()))
+        assertEquals(ModelEnd.INCOMPLETE, terminal.end)
+        assertEquals("EOF_INCOMPLETE", terminal.safeCode, "reasoning is not answer content, so it cannot complete a turn")
+    }
+
+    @Test fun `a tool call finish reason is a completed turn`() {
+        // 0.53 §T10: a tool-call turn is a successful model turn. Before this fix `tool_calls` fell into the unknown
+        // branch and failed the whole Chat protocol tool loop.
+        val decoder = ChatCompletionsDecoder("q")
+
+        decoder.accept(reasoning("想"))
+
+        val terminal = terminal(decoder.accept(finishWith("tool_calls")))
+        assertEquals(ModelEnd.COMPLETED, terminal.end)
+        assertNull(terminal.safeCode)
+    }
+
+    @Test fun `the other finish reasons keep their existing verdicts`() {
+        assertEquals(ModelEnd.COMPLETED, terminal(ChatCompletionsDecoder("q").accept(finishWith("stop"))).end)
+        assertEquals(ModelEnd.INCOMPLETE, terminal(ChatCompletionsDecoder("q").accept(finishWith("length"))).end)
+        for (reason in listOf("content_filter", "insufficient_system_resource", "aborted")) {
+            val terminal = terminal(ChatCompletionsDecoder("q").accept(finishWith(reason)))
+            assertEquals(ModelEnd.FAILED, terminal.end, reason)
+            assertEquals("PROVIDER_FAILED", terminal.safeCode, reason)
+        }
     }
 }
