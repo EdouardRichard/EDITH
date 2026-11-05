@@ -136,38 +136,57 @@ class ModelDetailStateTest {
     }
 
     @Test
-    fun `thinking is only offered for the deepseek family and defaults off low`() {
+    fun `the thinking block is always visible but only editable for supported models`() {
         val custom = entry(id = "custom-vl", thinkingSupported = false)
         val customDraft = ModelDetailDraft.from(custom)
-        assertFalse("a non-DeepSeek model does not get the thinking block", ModelDetailUi.thinkingVisible(customDraft))
+        assertTrue("0.53 keeps the block visible for every model", ModelDetailUi.thinkingVisible(customDraft))
+        assertFalse("a non-DeepSeek model cannot edit thinking", ModelDetailUi.thinkingEditable(customDraft))
         assertFalse(customDraft.thinkingSupported)
         assertFalse("thinking defaults off", customDraft.thinkingEnabled)
         assertEquals("the effort defaults to low", ThinkingEffort.LOW, customDraft.thinkingEffort)
-
-        val deepseek = entry(id = "deepseek-flash", thinkingSupported = true)
-        val deepseekDraft = ModelDetailDraft.from(deepseek)
-        assertTrue(ModelDetailUi.thinkingVisible(deepseekDraft))
-        assertTrue(deepseekDraft.thinkingSupported)
-        assertFalse("a DeepSeek model still defaults to thinking off", deepseekDraft.thinkingEnabled)
-        assertEquals(ThinkingEffort.LOW, deepseekDraft.thinkingEffort)
-
-        val enabled = ModelDetailDraft.toEntry(
-            deepseekDraft.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX),
-            deepseek,
-        )
-        assertTrue(enabled.thinkingEnabled)
-        assertTrue(enabled.thinkingSupported)
-        assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
 
         // A model that is not a thinking model can never store an enabled thinking flag.
         val forced = ModelDetailDraft.toEntry(customDraft.copy(thinkingEnabled = true), custom)
         assertFalse(forced.thinkingEnabled)
         assertFalse(forced.thinkingSupported)
 
-        // The advanced marker is the metadata-missing escape hatch and writes thinkingSupported.
+        // The advanced marker stays the metadata-missing escape hatch for a non-DeepSeek model.
         val marked = ModelDetailDraft.toEntry(customDraft.copy(thinkingSupported = true), custom)
         assertTrue(marked.thinkingSupported)
-        assertTrue(ModelDetailUi.thinkingVisible(ModelDetailDraft.from(marked)))
+        assertTrue(ModelDetailUi.thinkingEditable(ModelDetailDraft.from(marked)))
+
+        // 0.53: a DeepSeek-family id derives the capability even when the stored row says unsupported.
+        val deepseek = entry(id = "deepseek-flash", thinkingSupported = false)
+        val derived = ModelDetailDraft.from(deepseek)
+        assertTrue("a derived DeepSeek model is thinking-capable", derived.thinkingSupported)
+        assertTrue(ModelDetailUi.thinkingEditable(derived))
+        assertFalse("a DeepSeek model still defaults to thinking off", derived.thinkingEnabled)
+        assertEquals(ThinkingEffort.LOW, derived.thinkingEffort)
+
+        val persisted = ModelDetailDraft.toEntry(derived, deepseek)
+        assertTrue("saving a derived model persists the capability", persisted.thinkingSupported)
+        assertTrue(
+            "a derived DeepSeek model cannot be un-marked by the advanced switch",
+            ModelDetailDraft.toEntry(derived.copy(thinkingSupported = false), deepseek).thinkingSupported,
+        )
+
+        val enabled = ModelDetailDraft.toEntry(
+            derived.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX),
+            deepseek,
+        )
+        assertTrue(enabled.thinkingEnabled)
+        assertTrue(enabled.thinkingSupported)
+        assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
+    }
+
+    @Test
+    fun `the thinking copy names the DeepSeek-only restriction`() {
+        assertEquals("思考模式仅支持 DeepSeek 模型；当前模型按通用 OpenAI 协议请求。", ModelDetailUi.THINKING_ONLY_DEEPSEEK)
+        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("仅支持 DeepSeek 模型"))
+        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("工具回合保留思考"))
+        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("思考历史随请求回传"))
+        assertTrue(ModelDetailUi.THINKING_MARK_DERIVED_DETAIL.contains("DeepSeek"))
+        assertTrue(ModelDetailUi.THINKING_MARK_DERIVED_DETAIL.contains("不能关闭"))
     }
 
     // Brief case: `audio is always disabled and labelled for 0.53` (0.53 contains a dot, illegal in a JVM method name).

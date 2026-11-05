@@ -187,12 +187,13 @@ object HelpContent {
         impact = "影响：保存后立即生效",
     )
 
-    /** §5.7: the DeepSeek-only block, the default-off rationale, and the 0.52 tool-turn fallback. */
+    /** 0.53 design §5.7/T9: DeepSeek-only, both protocols, the tool-turn replay, and the session-memory privacy line. */
     val MODEL_THINKING = HelpText(
         title = "深度思考",
-        body = "仅 DeepSeek 家族显示；开启更稳但更慢、消耗更多思考 token；默认关闭以保持当前速度；" +
-            "开启后默认「低」，可改为「高 / 最高」。" +
-            "多步工具执行需要回传思考历史；工具回合会自动关闭思考（0.52 暂不支持回传思考历史）。",
+        body = "仅 DeepSeek 家族支持；OpenAI Responses 与 Chat Completions 两条协议都支持。" +
+            "开启后工具回合保留思考，思考历史随请求回传（只存会话内存，不写日志）。" +
+            "开启更稳但更慢、消耗更多思考 token；默认关闭以保持当前速度；" +
+            "开启后默认「低」，可改为「高 / 最高」。",
         impact = "影响：保存后立即生效",
     )
 
@@ -200,7 +201,7 @@ object HelpContent {
     val PROVIDER_PROTOCOL = HelpText(
         title = "协议",
         body = "协议是高级项，默认使用 OpenAI Responses；如果网关只支持 Chat Completions，可改为 OpenAI Chat Completions。" +
-            "两种协议的思考字段映射不同，切换后按所选协议发送。",
+            "两种协议的思考字段映射不同，切换后按所选协议发送；DeepSeek 模型的思考在两条协议下都支持。",
         impact = "影响：保存后立即生效",
     )
 

@@ -167,15 +167,23 @@ class HelpContentTest {
         assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("不支持图片，助手不可用"))
         assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("未验证"))
 
-        assertTrue(
-            "the brief's mandatory tool-turn fallback sentence",
-            HelpContent.MODEL_THINKING.body.contains("工具回合会自动关闭思考（0.52 暂不支持回传思考历史）"),
+        assertFalse(
+            "0.53 removed the 0.52 tool-turn fallback sentence",
+            HelpContent.MODEL_THINKING.body.contains("工具回合会自动关闭思考"),
         )
+        assertTrue("the restriction is DeepSeek-only", HelpContent.MODEL_THINKING.body.contains("仅 DeepSeek 家族"))
+        assertTrue("both protocols are named", HelpContent.MODEL_THINKING.body.contains("Chat Completions"))
+        assertTrue("both protocols are named", HelpContent.MODEL_THINKING.body.contains("Responses"))
+        assertTrue("thinking is replayed with the request", HelpContent.MODEL_THINKING.body.contains("思考历史随请求回传"))
+        assertTrue("thinking stays in session memory", HelpContent.MODEL_THINKING.body.contains("会话内存"))
+        assertTrue("thinking is never logged", HelpContent.MODEL_THINKING.body.contains("不写日志"))
+        assertTrue("the tool turn keeps thinking", HelpContent.MODEL_THINKING.body.contains("工具回合保留思考"))
         assertTrue(HelpContent.MODEL_THINKING.body.contains("开启更稳但更慢、消耗更多思考 token"))
         assertTrue(HelpContent.MODEL_THINKING.body.contains("默认关闭以保持当前速度"))
 
         assertTrue(HelpContent.PROVIDER_PROTOCOL.body.contains("OpenAI Responses"))
         assertTrue(HelpContent.PROVIDER_PROTOCOL.body.contains("高级"))
+        assertTrue("both protocols support DeepSeek thinking", HelpContent.PROVIDER_PROTOCOL.body.contains("思考"))
         assertTrue(HelpContent.PROVIDER_TIMEOUT.body.contains("30000"))
         assertTrue("the gateway fetch timeout is a different, fixed 10 seconds", HelpContent.PROVIDER_TIMEOUT.body.contains("10 秒"))
 

@@ -834,6 +834,32 @@ class ModelCatalogViewModelTest {
     }
 
     @Test
+    fun `a hand-added model derives its thinking capability from the id`() {
+        // 0.53 T8: manual creation must behave like gateway discovery for a DeepSeek-family id.
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.addManualModel(manual(id = "deepseek-v4-pro"))
+
+        assertNull(model.state.value.error)
+        val deepseek = requireNotNull(
+            repository.catalog().activeProvider()?.models?.firstOrNull { it.id == "deepseek-v4-pro" },
+        )
+        assertTrue("a hand-added DeepSeek model is thinking-capable", deepseek.thinkingSupported)
+        assertFalse("the switch itself stays off", deepseek.thinkingEnabled)
+
+        model.addManualModel(manual(id = "custom-vl"))
+
+        val custom = requireNotNull(
+            repository.catalog().activeProvider()?.models?.firstOrNull { it.id == "custom-vl" },
+        )
+        assertFalse("an unrelated manual id is not thinking-capable", custom.thinkingSupported)
+    }
+
+    @Test
     fun `a manual model id is trimmed before the duplicate check`() {
         val repository = repository()
         save(repository, provider("p-1", "One", entry("m-1")))

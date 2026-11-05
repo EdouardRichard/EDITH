@@ -84,8 +84,31 @@ class ModelProfileProjectionTest {
 
     @Test fun `a projected profile propagates the thinking capability of its model`() {
         // R21: the adapter gate consumes this bit, so a non-DeepSeek entry must project as unsupported.
-        assertTrue(ModelProfileProjection.toProfile(provider(), entry(thinkingSupported = true)).thinkingSupported)
+        assertTrue(ModelProfileProjection.toProfile(provider(), entry(id = "custom-vl", thinkingSupported = true)).thinkingSupported)
         assertFalse(ModelProfileProjection.toProfile(provider(), entry(thinkingSupported = false)).thinkingSupported)
+    }
+
+    @Test fun `a deepseek id projects as thinking capable even when the stored flag is false`() {
+        // 0.53 T8: an old catalog row that predates the derivation must become thinking-capable on projection only.
+        assertTrue(
+            ModelProfileProjection.toProfile(provider(), entry(id = "deepseek-flash", thinkingSupported = false))
+                .thinkingSupported,
+        )
+        assertTrue(
+            "the family rule is case-insensitive",
+            ModelProfileProjection.toProfile(provider(), entry(id = "DeepSeek-V4-Pro", thinkingSupported = false))
+                .thinkingSupported,
+        )
+        assertFalse(
+            "a non-DeepSeek id keeps its stored capability",
+            ModelProfileProjection.toProfile(provider(), entry(id = "custom-vl", thinkingSupported = false))
+                .thinkingSupported,
+        )
+        assertTrue(
+            "an explicitly marked non-DeepSeek model stays capable",
+            ModelProfileProjection.toProfile(provider(), entry(id = "custom-vl", thinkingSupported = true))
+                .thinkingSupported,
+        )
     }
 
     @Test fun `a catalog projects only its active provider and selected model`() {

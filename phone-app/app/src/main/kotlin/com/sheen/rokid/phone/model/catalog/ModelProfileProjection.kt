@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.model.catalog
 
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
@@ -57,7 +58,9 @@ object ModelProfileProjection {
             thinkingEnabled = entry.thinkingEnabled,
             thinkingEffort = entry.thinkingEffort,
             // R21: the adapter gate is a projection of the catalog capability, never a name/vendor heuristic.
-            thinkingSupported = entry.thinkingSupported,
+            // 0.53 T8: the single DeepSeek-family rule also derives it, so a row stored before the derivation (or
+            // created by an older instrument) becomes thinking-capable without a storage migration.
+            thinkingSupported = entry.thinkingSupported || ModelFamilies.isDeepSeekFamily(entry.id),
         )
     }
 }

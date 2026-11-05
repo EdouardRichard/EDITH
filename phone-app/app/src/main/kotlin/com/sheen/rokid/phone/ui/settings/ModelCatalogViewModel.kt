@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.ui.settings
 
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.model.ProfileTester
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.phone.BuildConfig
@@ -308,6 +309,9 @@ internal class ModelCatalogViewModel(
                 maxOutputTokens = output,
                 inputs = normalized.inputs + InputModality.TEXT,
                 outputs = setOf(OutputModality.TEXT),
+                // 0.53 T8: manual creation uses the same family rule as gateway discovery, so a hand-added DeepSeek
+                // model is thinking-capable instead of silently behaving unlike the discovered row.
+                thinkingSupported = ModelFamilies.isDeepSeekFamily(normalized.id),
                 origin = ModelOrigin.MANUAL,
             )
             repository.saveModels(

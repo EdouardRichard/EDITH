@@ -37,7 +37,7 @@ internal object AboutUi {
         "模型服务配置与 API Key 只保存在本机加密存储中；屏幕与通知内容只在会话运行时随请求发送到你配置的模型服务。" +
             "本页只展示信息，不收集、不上传任何数据，也没有任何开关。"
 
-    /** `EDITH 0.5.2 · 预览版`: the same line the home's About row shows. */
+    /** `EDITH 0.5.3 · 预览版`: the same line the home's About row shows. */
     fun versionLine(versionName: String): String = "EDITH $versionName · 预览版"
 
     fun buildTypeLine(debug: Boolean): String = "构建类型：${if (debug) "调试版" else "发布版"}"

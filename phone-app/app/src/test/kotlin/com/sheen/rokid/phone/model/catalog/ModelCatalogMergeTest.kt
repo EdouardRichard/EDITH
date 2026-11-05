@@ -192,6 +192,36 @@ class ModelCatalogMergeTest {
         }
     }
 
+    @Test fun `a deepseek id is thinking capable on add refresh and restore`() {
+        // 0.53 T8: the family rule, not only the gateway metadata, decides the capability.
+        val added = applied(listOf(GatewayModel("deepseek-chat"))).catalog.providers.single().models.single()
+        assertTrue("a DeepSeek-family id is derived as thinking-capable", added.thinkingSupported)
+        assertFalse("the switch itself stays off", added.thinkingEnabled)
+
+        val cased = applied(listOf(GatewayModel("DeepSeek-Chat"))).catalog.providers.single().models.single()
+        assertTrue("the family rule is case-insensitive", cased.thinkingSupported)
+
+        val other = applied(listOf(GatewayModel("an-unknown-model"))).catalog.providers.single().models.single()
+        assertFalse("an unrelated id is not thinking-capable", other.thinkingSupported)
+
+        // A legacy row stored as unsupported is repaired by the next refresh.
+        val legacy = catalog(provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)))
+        val refreshed = applied(listOf(GatewayModel("deepseek-chat")), legacy).catalog.providers.single().models.single()
+        assertTrue(refreshed.thinkingSupported)
+
+        // Restore defaults reapplies the same derivation without gateway metadata.
+        val restored = ModelCatalogMerge.restoreDefaults(legacy, "p-1", "deepseek-chat", GatewayModel("deepseek-chat"))
+            .providers.single().models.single()
+        assertTrue(restored.thinkingSupported)
+
+        // An explicitly marked non-DeepSeek model keeps its manual capability through a refresh.
+        val manual = catalog(
+            provider(entry(id = "custom-vl", thinkingSupported = true, origin = ModelOrigin.MANUAL, lastSeenAt = 1)),
+        )
+        val kept = applied(listOf(GatewayModel("custom-vl")), manual).catalog.providers.single().models.single()
+        assertTrue(kept.thinkingSupported)
+    }
+
     @Test fun `blank duplicate and control-character gateway ids are skipped`() {
         val refresh = applied(listOf(
             GatewayModel(""),

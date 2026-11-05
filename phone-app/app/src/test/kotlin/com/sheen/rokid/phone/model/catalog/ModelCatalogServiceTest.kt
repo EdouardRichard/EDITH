@@ -375,8 +375,7 @@ class ModelCatalogServiceTest {
         assertTrue(repo.saveModelsCalls.isEmpty())
     }
 
-    @Test fun `restore defaults without a gateway fetch falls back to the known table`() {
-        val repo = FakeRepository(
+    @Test fun `restore defaults without a gateway fetch falls back to the known table`() {        val repo = FakeRepository(
             catalog(
                 provider(
                     entry(
@@ -407,6 +406,23 @@ class ModelCatalogServiceTest {
         assertEquals("deepseek-v4-pro", save.selectedModelId)
         assertNull(save.lastSyncedAtEpochMillis)
         assertEquals(42L, repo.stored.providers.single().lastSyncedAtEpochMillis)
+    }
+
+    @Test fun `restore defaults derives the thinking capability from the model id`() {
+        // 0.53 T8: a legacy row stored unsupported becomes thinking-capable for a DeepSeek-family id.
+        val repo = FakeRepository(
+            catalog(
+                provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)),
+                selectedModelId = "deepseek-chat",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "deepseek-chat"),
+            ),
+        )
+        val service = ModelCatalogService(repo, FakeSource(ModelListResult.Failure(ModelListError.NETWORK))) { now }
+
+        val restored = checkNotNull(service.restoreDefaults("p-1", "deepseek-chat"))
+
+        assertTrue(restored.thinkingSupported)
+        assertEquals("deepseek-chat", repo.saveModelsCalls.single().selectedModelId)
     }
 
     @Test fun `refresh propagates the gateway truncation flag`() {

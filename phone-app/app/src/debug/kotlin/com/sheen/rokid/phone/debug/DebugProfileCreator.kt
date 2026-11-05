@@ -11,9 +11,11 @@ import com.sheen.rokid.phone.storage.CatalogProfileRepository
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.ThinkingEffort
 import java.io.File
 import java.util.Properties
 
@@ -31,6 +33,11 @@ import java.util.Properties
  * model** rather than a profile. The provider/model ids are logged and the API key is only handed to the catalog
  * repository, which stages it into the Keystore; no log line carries it. `--ez select true` makes the new provider the
  * globally active one, exactly the state the settings UI would produce.
+ *
+ * 0.53: optional `thinkingEnabled` (`true`/`false`, default `false`) and `thinkingEffort` (`LOW`/`HIGH`/`MAX`, default
+ * `LOW`) seed the thinking switch for unattended device verification. The capability is derived with the shared
+ * DeepSeek-family rule, so a non-DeepSeek model is never seeded enabled; the log line states the booleans and the
+ * effort only, never the key.
  */
 class DebugProfileCreator : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -69,6 +76,11 @@ class DebugProfileCreator : BroadcastReceiver() {
             val contextTokens = prop("inputBudgetTokens").toInt()
             val maxOutput = prop("maxOutputTokens").toInt()
             val modelId = prop("model")
+            val thinking = debugThinking(
+                modelId = modelId,
+                enabled = props.getProperty("thinkingEnabled"),
+                effort = props.getProperty("thinkingEffort"),
+            )
             val providerId = "qwen-omni-dev"
             val provider = Provider(
                 id = providerId,
@@ -84,6 +96,9 @@ class DebugProfileCreator : BroadcastReceiver() {
                         maxOutputTokens = maxOutput,
                         inputs = inputs,
                         outputs = setOf(OutputModality.TEXT),
+                        thinkingEnabled = thinking.enabled,
+                        thinkingEffort = thinking.effort,
+                        thinkingSupported = thinking.supported,
                         origin = ModelOrigin.MANUAL,
                     ),
                 ),
@@ -95,7 +110,9 @@ class DebugProfileCreator : BroadcastReceiver() {
             android.util.Log.i(
                 "EdithP5",
                 "DEBUG_CREATE_PROFILE: created provider id=${saved.id} model=$modelId " +
-                    "protocol=$protocolId inputs=$inputs revision=${saved.revision}",
+                    "protocol=$protocolId inputs=$inputs revision=${saved.revision} " +
+                    "thinkingSupported=${thinking.supported} thinkingEnabled=${thinking.enabled} " +
+                    "thinkingEffort=${thinking.effort}",
             )
 
             if (intent.getBooleanExtra(EXTRA_SELECT, false)) {
@@ -149,4 +166,27 @@ class DebugProfileCreator : BroadcastReceiver() {
         /** 0.4 Task 9: also activate the saved provider/model (`--ez select true`). */
         const val EXTRA_SELECT = "select"
     }
+}
+
+/**
+ * 0.53 design §5.7: the thinking seed this instrument derives from the optional properties.
+ *
+ * A DeepSeek-family id is capable; the enabled flag is gated by that capability so the invariant "an unsupported row
+ * never carries enabled thinking" also holds for this debug-only path. An unknown effort throws instead of being
+ * silently mapped to a different one; the receiver's catch reports the failure.
+ */
+internal data class DebugThinking(
+    val supported: Boolean,
+    val enabled: Boolean,
+    val effort: ThinkingEffort,
+)
+
+internal fun debugThinking(modelId: String, enabled: String?, effort: String?): DebugThinking {
+    val supported = ModelFamilies.isDeepSeekFamily(modelId)
+    return DebugThinking(
+        supported = supported,
+        enabled = supported && (enabled?.trim()?.toBoolean() ?: false),
+        effort = effort?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()?.let(ThinkingEffort::valueOf)
+            ?: ThinkingEffort.LOW,
+    )
 }

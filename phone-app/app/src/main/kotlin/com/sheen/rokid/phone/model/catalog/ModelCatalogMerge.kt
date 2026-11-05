@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.model.catalog
 
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ThinkingEffort
@@ -116,7 +117,8 @@ object ModelCatalogMerge {
             inputs = inputs,
             thinkingSupported = previous.thinkingSupported ||
                 gatewayForModel?.thinkingSupported == true ||
-                known?.thinkingSupported == true,
+                known?.thinkingSupported == true ||
+                ModelFamilies.isDeepSeekFamily(modelId),
             overrides = emptySet(),
         )
         val models = provider.models.toMutableList().also { it[modelIndex] = restored }
@@ -147,7 +149,9 @@ object ModelCatalogMerge {
             outputs = setOf(OutputModality.TEXT),
             thinkingEnabled = false,
             thinkingEffort = ThinkingEffort.LOW,
-            thinkingSupported = gateway.thinkingSupported || known?.thinkingSupported == true,
+            thinkingSupported = gateway.thinkingSupported ||
+                known?.thinkingSupported == true ||
+                ModelFamilies.isDeepSeekFamily(gateway.id),
             origin = ModelOrigin.GATEWAY,
             lastSeenAtEpochMillis = nowEpochMillis,
         )
@@ -189,7 +193,9 @@ object ModelCatalogMerge {
             contextWindowTokens = window,
             maxOutputTokens = output,
             inputs = inputs,
-            thinkingSupported = previous.thinkingSupported || gateway.thinkingSupported,
+            thinkingSupported = previous.thinkingSupported ||
+                gateway.thinkingSupported ||
+                ModelFamilies.isDeepSeekFamily(previous.id),
             missing = false,
             lastSeenAtEpochMillis = nowEpochMillis,
         )
