@@ -1118,6 +1118,11 @@ class SmartAssistantPlugin(
         openContinuation = { route, previousTurnId -> openContinuationTurn(route, previousTurnId) },
         isPanelVisible = isPanelVisible,
         cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },
+        // 0.5.4 Task 5: the continue-off exit asks the plugin's single queue slot. The wearer's next sentence, said
+        // while this answer was being produced, is consumed by the continuation the exit opens instead of being dropped
+        // with a close. Read under `gate`; this class never calls the cycle while holding `gate`, so the two locks
+        // keep their established order (cycle -> gate).
+        hasQueuedUtterance = { route -> synchronized(gate) { queuedUtterance?.route == route } },
     )
 
     // ---------------------------------------------------------------- proactive state (P3.2)
@@ -2154,9 +2159,10 @@ class SmartAssistantPlugin(
      * never cancels, replaces or settles any of them. It is independent of the display mode: detached mode is the
      * phone's own panel and the typed path works there exactly as on the glasses.
      *
-     * 0.5.1 fix round (review Important): in phone-only mode the post-answer continuation is off, so a sentence queued
-     * by a late final can never be consumed; it is treated as absent here rather than making the wearer's BALL/typed
-     * sentence busy until a new wake or STOP.
+     * 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: phone-only mode turns the post-answer continuation
+     * off, but the continue-off exit now consumes a queued sentence itself. A live queue is therefore never dead and
+     * always keeps the typed/BALL path busy until it is consumed, closed or dropped - the wearer cannot be stranded by
+     * it, because the exit is at most one second away once an answer settled.
      */
     fun canAcceptTypedMessage(): Boolean = synchronized(gate) { active && canAcceptTypedLocked() }
 
@@ -2164,20 +2170,21 @@ class SmartAssistantPlugin(
     private fun canAcceptTypedLocked(): Boolean {
         if (context == null) return false
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
-        // Unless no continuation can ever consume it (phone-only mode's post-answer seam is off): then keeping the
-        // typed/BALL path busy would strand the wearer until a new wake or STOP.
-        if (queuedUtterance != null && !postAnswerContinuationOff()) return false
+        // Since 0.5.4 Task 5 this holds in phone-only mode too: the continue-off exit opens the continuation that
+        // consumes it, so there is no dead-queue exception left to ignore.
+        if (queuedUtterance != null) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
     }
 
     /**
-     * 0.5.1 fix round (review Important): whether phone-only mode has turned the post-answer continuation off.
+     * 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: whether phone-only mode has turned the post-answer
+     * continuation off.
      *
      * This is the composition's exact split (`settings.continueDialogue && !phoneOnly()`), read through the live
-     * providers. When it is true no answer continuation can open for either route, so a queued utterance is dead: the
-     * typed/BALL admission may ignore it, and a transcript arriving after the answer settled must not cancel the
-     * continue-off close that releases it. Glasses mode is not affected (`phoneOnly()` is false there).
+     * providers. When it is true no answer continuation can open for either route, so a transcript arriving after the
+     * answer settled must not cancel the continue-off exit: that exit either closes the round or (Task 5) opens the
+     * continuation that consumes the queued sentence. Glasses mode is not affected (`phoneOnly()` is false there).
      */
     private fun postAnswerContinuationOff(): Boolean = phoneOnly() && !continueAfterAnswer()
 
@@ -2616,9 +2623,10 @@ class SmartAssistantPlugin(
                 var followupContinuation: Pair<SmartTurn, String>? = null
                 var queuedWakeFinal = false
                 var queuedProactiveFinal = false
-                // 0.5.1 fix round (review Important): the answer was already settled on the continue-off branch and
-                // phone-only mode can open no continuation for this transcript. Such a message must not cancel the 1 s
-                // close (the release path for the dead queue) or regress the panel from ANSWERING back to ASR.
+                // 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: the answer was already settled on the
+                // continue-off branch and phone-only mode can open no *answer* continuation for this transcript. Such a
+                // message must not cancel the 1 s exit (which either closes the round or consumes the queued sentence)
+                // or regress the panel from ANSWERING back to ASR.
                 var settledPhoneOnlyAnswer = false
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
