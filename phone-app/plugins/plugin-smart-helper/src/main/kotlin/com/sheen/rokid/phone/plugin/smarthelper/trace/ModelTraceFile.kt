@@ -21,12 +21,15 @@ object ModelTraceFile {
     /** One process-wide lock: turns may end on more than one thread, and appends must not interleave. */
     private val lock = Any()
 
-    /** Returns the writer the plugin calls once per finished run. */
-    fun writer(filesDir: File): (String) -> Unit = { line ->
-        runCatching {
-            synchronized(lock) {
-                if (!filesDir.exists()) filesDir.mkdirs()
-                File(filesDir, FILE_NAME).appendText(singleLine(line) + "\n", Charsets.UTF_8)
+    /** Returns the writer the plugin calls once per finished run; a null directory degrades to the no-op writer. */
+    fun writer(filesDir: File?): (String) -> Unit {
+        val dir = filesDir ?: return {}
+        return { line ->
+            runCatching {
+                synchronized(lock) {
+                    if (!dir.exists()) dir.mkdirs()
+                    File(dir, FILE_NAME).appendText(singleLine(line) + "\n", Charsets.UTF_8)
+                }
             }
         }
     }

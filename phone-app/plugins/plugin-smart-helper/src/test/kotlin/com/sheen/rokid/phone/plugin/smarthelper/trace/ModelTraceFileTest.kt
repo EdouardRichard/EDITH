@@ -46,6 +46,15 @@ class ModelTraceFileTest {
     }
 
     @Test
+    fun `a null files directory is a safe no-op`() {
+        // Production passes a real Context.filesDir; a JVM/unit-test fake may answer null. Tracing must never fail the
+        // composition that constructs it, so the null directory degrades to the plugin's no-op writer.
+        val write = ModelTraceFile.writer(null)
+
+        write("""{"turnId":"none"}""")
+    }
+
+    @Test
     fun `a files directory that does not exist yet cannot fail the caller`() {
         val dir = File(tempDir(), "nested/files")
         val write = ModelTraceFile.writer(dir)
