@@ -1,0 +1,391 @@
+package com.sheen.rokid.model
+
+import com.sheen.rokid.agent.ActionPolicy
+import com.sheen.rokid.agent.AgentLoop
+import com.sheen.rokid.agent.AgentOutcome
+import com.sheen.rokid.agent.AgentRequest
+import com.sheen.rokid.agent.AgentRun
+import com.sheen.rokid.agent.AuditSink
+import com.sheen.rokid.agent.ModelClientGateway
+import com.sheen.rokid.agent.PolicyDecision
+import com.sheen.rokid.agent.ProgressGuard
+import com.sheen.rokid.agent.ToolDescriptor
+import com.sheen.rokid.agent.ToolRegistry
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.ThinkingEffort
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.MemorySecretResolver
+import kotlinx.serialization.json.*
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import java.time.Clock
+import java.time.Instant
+import java.time.ZoneOffset
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+/**
+ * 0.53 Task 9: the two-round thinking tool loop, end to end over real HTTP.
+ *
+ * Everything on the production path is real here — `AgentLoop` → `ModelClientGateway` → `ControlledModelClient` →
+ * OkHttp → `MockWebServer` — except the provider itself. Round 1 streams reasoning + a tool call; the loop executes a
+ * local tool; round 2 must replay that reasoning (Chat: `reasoning_content` on the assistant message, Responses: a
+ * `reasoning` input item immediately before it) and finish with the final answer. The non-DeepSeek control proves the
+ * whole chain never sends or replays a DeepSeek field.
+ */
+class ThinkingToolRoundE2ETest {
+
+    // ------------------------------------------------------------ round-1/round-2 SSE scripts
+
+    private fun chatRoundOne(reasoning: String = "need lookup") = sse(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\"," +
+            "\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"hangzhou\\\"}\"}}]},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10," +
+            "\"completion_tokens\":4}}\n\n" +
+            "data: [DONE]\n\n",
+    )
+
+    private fun chatRoundTwo(reasoning: String = "done thinking") = sse(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"sunny 25C\"},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20," +
+            "\"completion_tokens\":3}}\n\n" +
+            "data: [DONE]\n\n",
+    )
+
+    private fun responsesRoundOne(reasoning: String = "need lookup") = sse(
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n" +
+            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
+            "\"item_id\":\"rs_1\",\"content_index\":0,\"delta\":\"$reasoning\"}\n\n" +
+            "data: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0," +
+            "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"," +
+            "\"arguments\":\"\"}}\n\n" +
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":3,\"response_id\":\"s\"," +
+            "\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{\\\"q\\\":\\\"hangzhou\\\"}\"}\n\n" +
+            "data: {\"type\":\"response.output_item.done\",\"sequence_number\":4,\"output_index\":0," +
+            "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"," +
+            "\"arguments\":\"{\\\"q\\\":\\\"hangzhou\\\"}\"}}\n\n" +
+            "data: {\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{\"id\":\"s\"," +
+            "\"status\":\"completed\",\"output\":[]}}\n\n",
+    )
+
+    private fun responsesRoundTwo(reasoning: String = "done thinking") = sse(
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n" +
+            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
+            "\"item_id\":\"rs_2\",\"content_index\":0,\"delta\":\"$reasoning\"}\n\n" +
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m_2\"," +
+            "\"content_index\":0,\"delta\":\"sunny 25C\"}\n\n" +
+            "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"s\"," +
+            "\"status\":\"completed\"}}\n\n",
+    )
+
+    private fun sse(body: String) = MockResponse()
+        .addHeader("Content-Type", "text/event-stream; charset=utf-8")
+        .setBody(body)
+
+    // ------------------------------------------------------------ production-path rig
+
+    /** The one tool this run offers; a pure local tool, so the loop executes it synchronously. */
+    private class LookupTool : ActionExecutor {
+        override fun descriptors() = listOf(
+            ActionDescriptor(
+                name = "lookup",
+                title = "Lookup",
+                description = "Look up the synthetic forecast for a city.",
+                parametersJson = """{"type":"object","properties":{"q":{"type":"string"}}}""",
+                risk = RiskLevel.L0,
+                requiresConfirmation = false,
+                idempotent = true,
+                reversible = true,
+                scope = "test",
+            ),
+        )
+
+        override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "sunny 25C")
+
+        override fun cancel() = Unit
+    }
+
+    private object AllowEveryTool : ActionPolicy {
+        override fun decide(descriptor: ToolDescriptor) = PolicyDecision.Allow
+    }
+
+    private object SilentAudit : AuditSink {
+        override fun record(
+            turnId: String,
+            action: String,
+            summary: String,
+            outcome: String,
+            scope: String?,
+            risk: String?,
+            decision: String?,
+            confirmationSource: com.sheen.rokid.agent.ConfirmationSource?,
+        ) = Unit
+    }
+
+    /** One request's worth of production wiring. `baseUrl` points at the MockWebServer, so the transport is real. */
+    private inner class Rig(
+        private val server: MockWebServer,
+        protocolId: String,
+        thinkingSupported: Boolean,
+        thinkingEnabled: Boolean,
+        model: String,
+    ) : AutoCloseable {
+        val resolver = MemorySecretResolver()
+        val repository = MemoryProfileRepository(resolver::revoke)
+        val lines = CopyOnWriteArrayList<String>()
+        private val clock = object : MonotonicClock { override fun nowNanos() = 0L }
+        private val scheduler = object : DeadlineScheduler {
+            override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle =
+                object : CancellationHandle { override fun cancel() {} }
+        }
+        val profile: ModelProfile
+        private val client: ControlledModelClient
+
+        init {
+            val saved = repository.save(
+                ModelProfile(
+                    id = "p",
+                    revision = 1,
+                    name = "DeepSeek thinking",
+                    service = "deepseek",
+                    baseUrl = server.url("/v1").newBuilder().host("127.0.0.1").build().toString(),
+                    protocolId = protocolId,
+                    model = model,
+                    secret = resolver.put("dummy-key".toCharArray()),
+                    usableWindowTokens = 100_000,
+                    inputBudgetTokens = 60_000,
+                    maxOutputTokens = 6_000,
+                    safetyTokens = 1_000,
+                    timeoutMillis = 30_000,
+                    inputs = setOf(InputModality.TEXT),
+                    outputs = setOf(OutputModality.TEXT),
+                    verifications = emptyList(),
+                    thinkingEnabled = thinkingEnabled,
+                    thinkingEffort = ThinkingEffort.LOW,
+                    thinkingSupported = thinkingSupported,
+                ),
+            )
+            // The repository clears prior evidence on save and only records a verification whose revision matches, so
+            // the probe evidence is written after the save — exactly what the production provider verification does.
+            repository.verify(saved.id, verification(revision = saved.revision))
+            profile = requireNotNull(repository.get(saved.id))
+            client = ControlledModelClient(
+                OkHttpClient(),
+                repository,
+                resolver,
+                CapabilityGate(),
+                ContextBudgeter(),
+                clock,
+                scheduler,
+                { RequestConsent(text = true, image = false, audio = false, syntheticProbe = false) },
+                Clock.fixed(Instant.parse("2026-11-05T00:00:00Z"), ZoneOffset.UTC),
+                allowLocalHttp = true,
+            )
+        }
+
+        fun run(): AgentRun {
+            val gateway = ModelClientGateway(
+                client = client,
+                profileLookup = { repository.get(profile.id) },
+                clock = clock,
+                scheduler = scheduler,
+                envelopeFor = { requestId, start, end ->
+                    EventEnvelope(SessionId("s"), Generation(1), requestId, start, end)
+                },
+                metricLine = { lines += it },
+            )
+            val loop = AgentLoop(
+                gateway = gateway,
+                registry = ToolRegistry(listOf(LookupTool())),
+                policy = AllowEveryTool,
+                guard = ProgressGuard(),
+                audit = SilentAudit,
+                clock = clock,
+                metricLine = { lines += it },
+            )
+            return loop.run(
+                AgentRequest(
+                    turnId = "turn-1",
+                    utterance = "查一下杭州天气",
+                    instructions = "You are Edith.",
+                    profileId = profile.id,
+                    deadlineNanos = Long.MAX_VALUE,
+                ),
+            )
+        }
+
+        fun bodies(): List<JsonObject> = listOf(
+            json(assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).body.readUtf8()),
+            json(assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).body.readUtf8()),
+        )
+
+        override fun close() {
+            client.close()
+            resolver.close()
+        }
+    }
+
+    private fun json(text: String) = Json.parseToJsonElement(text).jsonObject
+
+    private fun JsonObject.messages() = getValue("messages").jsonArray.map { it.jsonObject }
+
+    private fun JsonObject.inputItems() = getValue("input").jsonArray.map { it.jsonObject }
+
+    private fun JsonObject.roleOf() = this["role"]?.jsonPrimitive?.content
+
+    private fun JsonObject.typeOf() = this["type"]?.jsonPrimitive?.content
+
+    // ------------------------------------------------------------ tests
+
+    @Test fun `a chat tool round replays the first reasoning and completes`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            server.enqueue(chatRoundOne())
+            server.enqueue(chatRoundTwo())
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingSupported = true, thinkingEnabled = true, model = "deepseek-flash")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertEquals("sunny 25C", run.finalText)
+                    assertEquals("done thinking", run.finalReasoning, "the closing turn's reasoning reaches the run")
+                    assertEquals(2, server.requestCount, "one tool round is exactly two model requests")
+                    assertTrue(
+                        rig.lines.any { it.startsWith("P3_THINKING active=true") },
+                        "the count-only thinking line is emitted: ${rig.lines.filter { it.startsWith("P3_THINKING") }}",
+                    )
+
+                    val (first, second) = rig.bodies()
+                    assertEquals("enabled", first.getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content)
+                    assertEquals("low", first.getValue("reasoning_effort").jsonPrimitive.content)
+                    assertEquals("lookup", first.getValue("tools").jsonArray.single().jsonObject
+                        .getValue("function").jsonObject.getValue("name").jsonPrimitive.content)
+
+                    val assistant = second.messages().single {
+                        it.roleOf() == "assistant" && "tool_calls" in it
+                    }
+                    assertEquals(
+                        "need lookup",
+                        assistant.getValue("reasoning_content").jsonPrimitive.content,
+                        "the first turn's reasoning rides the assistant message that carried the call",
+                    )
+                    assertEquals(
+                        "call_1",
+                        assistant.getValue("tool_calls").jsonArray.single().jsonObject
+                            .getValue("id").jsonPrimitive.content,
+                    )
+                    val toolMessage = second.messages().single { it.roleOf() == "tool" }
+                    assertEquals("call_1", toolMessage.getValue("tool_call_id").jsonPrimitive.content)
+                    // The model-facing tool result is the loop's structured envelope; its `data` is the tool's answer.
+                    assertEquals(
+                        "sunny 25C",
+                        json(toolMessage.getValue("content").jsonPrimitive.content)
+                            .getValue("data").jsonPrimitive.content,
+                    )
+
+                    // The first request must not have carried reasoning it never produced (there was no history).
+                    assertTrue(first.messages().none { "reasoning_content" in it })
+                }
+        }
+    }
+
+    @Test fun `a responses tool round replays the reasoning item before its assistant message`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            server.enqueue(responsesRoundOne())
+            server.enqueue(responsesRoundTwo())
+            Rig(server, "DEEPSEEK_RESPONSES", thinkingSupported = true, thinkingEnabled = true, model = "deepseek-flash")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertEquals("sunny 25C", run.finalText)
+                    assertEquals("done thinking", run.finalReasoning)
+                    assertEquals(2, server.requestCount)
+
+                    val (first, second) = rig.bodies()
+                    assertEquals("low", first.getValue("reasoning").jsonObject.getValue("effort").jsonPrimitive.content)
+                    assertEquals(
+                        ThinkingOutputBudget.reserve(rig.profile),
+                        first.getValue("max_output_tokens").jsonPrimitive.int,
+                        "an active thinking turn sends the raised output allowance",
+                    )
+
+                    val input = second.inputItems()
+                    val reasoningIndex = input.indexOfFirst { it.typeOf() == "reasoning" }
+                    assertTrue(reasoningIndex >= 0, "the second request replays the reasoning item: $input")
+                    val assistantIndex = input.indexOfFirst { it.roleOf() == "assistant" }
+                    assertEquals(reasoningIndex + 1, assistantIndex, "the reasoning item sits immediately before its assistant message")
+                    val content = input[reasoningIndex].getValue("content").jsonArray.single().jsonObject
+                    assertEquals("reasoning_text", content.getValue("type").jsonPrimitive.content)
+                    assertEquals("need lookup", content.getValue("text").jsonPrimitive.content)
+                    assertEquals("call_1", input.single { it.typeOf() == "function_call" }
+                        .getValue("call_id").jsonPrimitive.content)
+                    assertEquals(
+                        "sunny 25C",
+                        json(input.single { it.typeOf() == "function_call_output" }
+                            .getValue("output").jsonPrimitive.content)
+                            .getValue("data").jsonPrimitive.content,
+                    )
+                }
+        }
+    }
+
+    @Test fun `a non deepseek profile never sends thinking fields or replays reasoning`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            // The provider even streams a reasoning field: the client's capability filter must swallow it, so the
+            // second request has nothing to replay and the run carries no finalReasoning.
+            server.enqueue(chatRoundOne())
+            server.enqueue(chatRoundTwo())
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingSupported = false, thinkingEnabled = true, model = "gpt-4o-mini")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertNull(run.finalReasoning, "a non-DeepSeek profile never receives reasoning")
+                    assertEquals(2, server.requestCount)
+                    assertTrue(
+                        rig.lines.any { it.startsWith("P3_THINKING active=false") },
+                        "the line still states the off configuration: ${rig.lines.filter { it.startsWith("P3_THINKING") }}",
+                    )
+
+                    val (first, second) = rig.bodies()
+                    assertFalse("thinking" in first)
+                    assertFalse("reasoning_effort" in first)
+                    assertTrue(first.getValue("tools").jsonArray.size == 1, "the tool table still goes out")
+                    assertTrue(
+                        second.messages().none { "reasoning_content" in it },
+                        "no reasoning_content reaches a non-DeepSeek endpoint: ${second.messages()}",
+                    )
+                    assertTrue(
+                        run.transcript.none { it is com.sheen.rokid.plugin.ModelHistoryItem.Text && it.reasoning != null },
+                        "the loop never stored reasoning for an incapable profile",
+                    )
+                }
+        }
+    }
+}
