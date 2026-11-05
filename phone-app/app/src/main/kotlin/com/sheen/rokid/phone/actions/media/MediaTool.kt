@@ -190,6 +190,8 @@ class MediaTool(private val port: MediaControlPort) : ExecutionBackend {
             put("sessions", buildJsonArray { sessions.forEach { add(sessionJson(it)) } })
         }.toString(),
         stateChanging = false,
+        // title/artist/album are user content: the model sees them in this request only, never in the stored transcript.
+        nonPersistent = true,
         execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
     )
 
@@ -209,6 +211,8 @@ class MediaTool(private val port: MediaControlPort) : ExecutionBackend {
                 put("after", sessionJson(result.after))
             }.toString(),
             stateChanging = true,
+            // before/after carry title/artist/album, so this content is request-scoped like `device.status`.
+            nonPersistent = true,
             execution = ToolExecution(
                 outcome = ToolOutcome.Done,
                 accepted = true,

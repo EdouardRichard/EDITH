@@ -41,7 +41,8 @@ data class MediaSessionInfo(
  *
  * `NoChange` and `SessionGone` are **post-dispatch** answers: the command reached the transport, so the tool reports
  * `accepted = true` for them but must not claim it applied. `Done` exists only with a `before`/`after` pair read from
- * `PlaybackState` inside the verification window.
+ * `PlaybackState` inside the verification window **and a real transition between the two** - a state that already
+ * satisfied the command before it was sent proves nothing and is [NoChange].
  */
 sealed interface MediaControlResult {
     data class Done(val before: MediaSessionInfo, val after: MediaSessionInfo) : MediaControlResult
@@ -49,7 +50,7 @@ sealed interface MediaControlResult {
     /** Notification access was lost between the list and the send. */
     data object NoPermission : MediaControlResult
 
-    /** The session that was listed is no longer present. */
+    /** The session that was listed is no longer present, or its fresh pre-send snapshot was unreadable. */
     data object NoSession : MediaControlResult
 
     /** More than one session matches and the caller did not name a package. */
@@ -195,7 +196,9 @@ internal class AndroidMediaControlPort internal constructor(
             val target = candidates.firstOrNull { candidate ->
                 runCatching { candidate.snapshot()?.current == true }.getOrDefault(false)
             } ?: candidates.first()
-            val before = runCatching { target.snapshot() }.getOrNull() ?: return MediaControlResult.SessionGone
+            // A fresh pre-send snapshot that cannot be read means nothing was dispatched: report the pre-send
+            // NoSession (the tool maps it to `accepted = false`) rather than a post-send SessionGone.
+            val before = runCatching { target.snapshot() }.getOrNull() ?: return MediaControlResult.NoSession
             val bit = MediaAction.requiredBit(action) ?: return MediaControlResult.Unsupported
             if ((before.actions and bit) == 0L) return MediaControlResult.Unsupported
             if (!runCatching { target.send(action, positionMs) }.getOrDefault(false)) {
@@ -217,20 +220,30 @@ internal class AndroidMediaControlPort internal constructor(
         positionMs: Long?,
     ): MediaSessionInfo? {
         val deadline = now() + VERIFY_TIMEOUT_MILLIS
+        // Spec §6.5 polls inside a 0.5-1.5 s window. The first read waits out the floor: a state read at t=0 could
+        // predate the command and must never count as evidence (the transition rule in hasEvidence would otherwise
+        // turn the pre-send state itself into a false "Done").
+        if (!sleepFor(VERIFY_FLOOR_MILLIS)) {
+            return runCatching { handle.snapshot() }.getOrNull()
+        }
         while (true) {
             val snapshot = runCatching { handle.snapshot() }.getOrNull() ?: return null
             if (hasEvidence(action, before, snapshot, positionMs)) return snapshot
             val remaining = deadline - now()
             if (remaining <= 0L) return snapshot
-            try {
-                sleep(minOf(POLL_INTERVAL_MILLIS, remaining))
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return snapshot
-            } catch (_: RuntimeException) {
-                return snapshot
-            }
+            if (!sleepFor(minOf(POLL_INTERVAL_MILLIS, remaining))) return snapshot
         }
+    }
+
+    /** Sleeps one poll step; `false` means the wait was interrupted (or the clock refused it), not that the poll failed. */
+    private fun sleepFor(millis: Long): Boolean = try {
+        sleep(millis)
+        true
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    } catch (_: RuntimeException) {
+        false
     }
 
     private fun releaseAll(handles: List<MediaSessionHandle>) {
@@ -240,6 +253,10 @@ internal class AndroidMediaControlPort internal constructor(
     private companion object {
         /** Spec §6.5's verification window: 0.5-1.5 s. The upper bound is the honest one to spend. */
         const val VERIFY_TIMEOUT_MILLIS = 1_500L
+
+        /** Spec §6.5's lower bound: the first evidence read happens no earlier than half a second after the send. */
+        const val VERIFY_FLOOR_MILLIS = 500L
+
         const val POLL_INTERVAL_MILLIS = 100L
 
         /** A seek is proven when the reported position is within two seconds of the requested one. */
@@ -250,8 +267,19 @@ internal class AndroidMediaControlPort internal constructor(
         const val STATE_STOPPED = "STOPPED"
         const val STATE_BUFFERING = "BUFFERING"
 
+        /** The states a successful play lands in. */
+        val PLAYING_STATES = setOf(STATE_PLAYING, STATE_BUFFERING)
+
+        /** The states a toggle may land in; the transition itself is checked separately. */
+        val TOGGLE_RESULTS = setOf(STATE_PLAYING, STATE_BUFFERING, STATE_PAUSED)
+
         /**
          * Spec §6.5's evidence table, one entry per action. The command is not success; this predicate is.
+         *
+         * Every transport action also requires a **real transition**: a post-send fact that was already true before
+         * the command proves nothing about it. `pause` on a paused session, `play` on a playing one, `stop` on a
+         * stopped one and `seek` to the current position therefore end [MediaControlResult.NoChange], not `Done` -
+         * the honest answer for "the command was sent and the observable state did not change".
          */
         fun hasEvidence(
             action: String,
@@ -259,21 +287,30 @@ internal class AndroidMediaControlPort internal constructor(
             after: MediaSessionInfo,
             positionMs: Long?,
         ): Boolean = when (action) {
-            MediaAction.PLAY -> after.state == STATE_PLAYING || after.state == STATE_BUFFERING
-            MediaAction.PAUSE -> after.state == STATE_PAUSED
-            MediaAction.STOP -> after.state == STATE_STOPPED
-            MediaAction.TOGGLE ->
-                after.state != before.state &&
-                    (after.state == STATE_PLAYING || after.state == STATE_BUFFERING || after.state == STATE_PAUSED)
+            MediaAction.PLAY -> before.state !in PLAYING_STATES && after.state in PLAYING_STATES
+            MediaAction.PAUSE -> before.state != STATE_PAUSED && after.state == STATE_PAUSED
+            MediaAction.STOP -> before.state != STATE_STOPPED && after.state == STATE_STOPPED
+            MediaAction.TOGGLE -> after.state != before.state && after.state in TOGGLE_RESULTS
             // A next/previous may keep the same state on a paused player, so a changed metadata identity is the
-            // second valid witness; a state transition alone is the first.
+            // second valid witness; a state transition alone is the first. Both require the fact to have changed.
             MediaAction.NEXT, MediaAction.PREVIOUS ->
                 after.state != before.state || identityChanged(before, after)
-            MediaAction.SEEK ->
-                positionMs != null && after.positionMs != null &&
-                    abs(after.positionMs - positionMs) <= SEEK_TOLERANCE_MILLIS &&
-                    after.durationMs != null
+            MediaAction.SEEK -> seekEvidence(before, after, positionMs)
             else -> false
+        }
+
+        /**
+         * A seek is proven by a position within ±2 s of the target **and** a move of more than that tolerance from
+         * the pre-send position. Without the move, seeking to where the session already is (or inside the tolerance)
+         * would claim a change the facts do not show.
+         */
+        fun seekEvidence(before: MediaSessionInfo, after: MediaSessionInfo, positionMs: Long?): Boolean {
+            if (positionMs == null) return false
+            if (after.durationMs == null) return false
+            val beforePosition = before.positionMs ?: return false
+            val afterPosition = after.positionMs ?: return false
+            return abs(afterPosition - positionMs) <= SEEK_TOLERANCE_MILLIS &&
+                abs(afterPosition - beforePosition) > SEEK_TOLERANCE_MILLIS
         }
 
         /** The metadata identity available to this port; track/queue id are not part of the public result. */

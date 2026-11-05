@@ -379,7 +379,10 @@ class MediaToolTest {
         val result = rig.tool.execute("""{"action":"play"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("NO_SESSION", requireNotNull(result.execution).code)
+        val execution = requireNotNull(result.execution)
+        assertEquals("NO_SESSION", execution.code)
+        assertEquals("nothing was dispatched, so accepted is false", false, execution.accepted)
+        assertEquals(false, execution.applied)
     }
 
     // ── argument validation ─────────────────────────────────────────────────────────────────────────────────
@@ -451,6 +454,35 @@ class MediaToolTest {
         assertFalse("an album is user content: $line", line.contains("Secret Album"))
     }
 
+    @Test
+    fun `metadata-bearing list and control results are non-persistent`() {
+        val before = session(
+            state = "PAUSED",
+            title = "Top Secret Song",
+            artist = "Secret Artist",
+            album = "Secret Album",
+        )
+        val after = before.copy(state = "PLAYING")
+        val rig = ToolRig(sessions = listOf(before), result = MediaControlResult.Done(before, after))
+
+        val listed = rig.tool.execute("""{"action":"list"}""")
+        val controlled = rig.tool.execute("""{"action":"play","package":"com.example.music"}""")
+
+        assertEquals(
+            "the model still sees the metadata inside this run",
+            "Top Secret Song",
+            body(listed)["sessions"]!!.jsonArray.single().jsonObject["title"]!!.jsonPrimitive.content,
+        )
+        assertTrue(
+            "a listed title/artist/album may only reach this request, never the store/transcript",
+            listed.nonPersistent,
+        )
+        assertTrue(
+            "the before/after pair carries title/artist/album and may only reach this request",
+            controlled.nonPersistent,
+        )
+    }
+
     // ── descriptor ───────────────────────────────────────────────────────────────────────────────────────────
 
     @Test
@@ -497,7 +529,11 @@ class MediaToolTest {
         assertEquals("PAUSED", done.before.state)
         assertEquals("PLAYING", done.after.state)
         assertEquals(listOf("play"), handle.sent)
-        assertEquals("the first poll already proves the state, so nothing had to sleep", emptyList<Long>(), clock.sleeps)
+        assertEquals(
+            "the first read must wait out the spec's 0.5 s floor before it can count as evidence",
+            listOf(VERIFY_FLOOR_MILLIS),
+            clock.sleeps,
+        )
         assertTrue(handle.released)
     }
 
@@ -547,6 +583,78 @@ class MediaToolTest {
         val result = port.control("play", "com.example.music", null)
 
         assertEquals(MediaControlResult.SessionGone, result)
+        assertTrue(handle.released)
+    }
+
+    // ── evidence needs a transition, not a state that was already the target ─────────────────────────────────────
+
+    @Test
+    fun `play pause and stop when the target state is already current are NO_STATE_CHANGE`() {
+        listOf(
+            "play" to "PLAYING",
+            "pause" to "PAUSED",
+            "stop" to "STOPPED",
+        ).forEach { (action, state) ->
+            val clock = FakeClock()
+            val handle = FakeHandle(session(state = state))
+            val port = port(handle, clock)
+
+            val result = port.control(action, "com.example.music", null)
+
+            assertEquals(
+                "$action while the session is already $state is no change, never Done",
+                MediaControlResult.NoChange,
+                result,
+            )
+            assertEquals("the command is still sent", listOf(action), handle.sent)
+            assertEquals("the full verification window is spent", VERIFY_TIMEOUT_MILLIS, clock.value)
+            assertTrue("a refused verification must still release", handle.released)
+        }
+    }
+
+    @Test
+    fun `seek to the position the session already reports is NO_STATE_CHANGE`() {
+        val clock = FakeClock()
+        val handle = FakeHandle(session(positionMs = 30_000L, durationMs = 180_000L))
+        val port = port(handle, clock)
+
+        val result = port.control("seek", "com.example.music", 30_000L)
+
+        assertEquals("a seek the session already satisfies proves no change", MediaControlResult.NoChange, result)
+        assertEquals(listOf("seek@30000"), handle.sent)
+        assertEquals("the full verification window is spent", VERIFY_TIMEOUT_MILLIS, clock.value)
+        assertTrue(handle.released)
+    }
+
+    @Test
+    fun `seek evidence needs a position change beyond the tolerance`() {
+        val clock = FakeClock()
+        val handle = FakeHandle(session(positionMs = 30_000L, durationMs = 180_000L))
+        handle.afterSend = { session(positionMs = 31_500L, durationMs = 180_000L) }
+        val port = port(handle, clock)
+
+        val result = port.control("seek", "com.example.music", 30_000L)
+
+        assertEquals(
+            "a move inside the seek tolerance cannot prove the command moved the session",
+            MediaControlResult.NoChange,
+            result,
+        )
+    }
+
+    @Test
+    fun `an unreadable fresh before snapshot is NO_SESSION with nothing dispatched`() {
+        val handle = FakeHandle(null, name = "com.example.music")
+        val port = port(handle, FakeClock())
+
+        val result = port.control("play", "com.example.music", null)
+
+        assertEquals(
+            "nothing was sent, so the answer is a pre-send NoSession rather than a post-send SessionGone",
+            MediaControlResult.NoSession,
+            result,
+        )
+        assertTrue("no transport command may be sent without a pre-send snapshot", handle.sent.isEmpty())
         assertTrue(handle.released)
     }
 
@@ -663,13 +771,14 @@ class MediaToolTest {
 
     private class FakeHandle(
         private var current: MediaSessionInfo?,
+        name: String = requireNotNull(current).packageName,
     ) : MediaSessionHandle {
         /** The session's answer on the poll after the send; `null` models a session that went away. */
         var afterSend: (() -> MediaSessionInfo?)? = null
         val sent = mutableListOf<String>()
         var released = false
 
-        override val packageName: String = current!!.packageName
+        override val packageName: String = name
 
         override fun snapshot(): MediaSessionInfo? = current
 
@@ -701,6 +810,7 @@ class MediaToolTest {
 
     private companion object {
         const val VERIFY_TIMEOUT_MILLIS = 1_500L
+        const val VERIFY_FLOOR_MILLIS = 500L
         const val ALL_ACTIONS = PlaybackState.ACTION_PLAY or
             PlaybackState.ACTION_PAUSE or
             PlaybackState.ACTION_PLAY_PAUSE or
