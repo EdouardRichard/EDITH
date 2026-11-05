@@ -223,12 +223,18 @@ internal fun PhoneScreen(
                     PhoneTab.MEMORY -> ScrollableTab(body, state.errorCode) {
                         root.memoryLogView?.let { MemorySection(it) } ?: Text("记忆服务不可用")
                     }
-                    PhoneTab.SETTINGS -> SettingsShell(
-                        root = root,
-                        state = state,
-                        initialRoute = settingsRoute,
-                        onInitialRouteConsumed = { settingsRoute = null },
-                    )
+                    // The top-level settings page is a sibling of the three tabs above, so it must consume the
+                    // Scaffold's inner padding exactly like they do. Without `body` the home fills the full content
+                    // slot (including the area behind the in-app bottom NavigationBar): its vertical scroll then
+                    // believes the content fits, the last group sits under the bar, and swiping cannot reveal it.
+                    PhoneTab.SETTINGS -> Box(body) {
+                        SettingsShell(
+                            root = root,
+                            state = state,
+                            initialRoute = settingsRoute,
+                            onInitialRouteConsumed = { settingsRoute = null },
+                        )
+                    }
                 }
             }
         }
