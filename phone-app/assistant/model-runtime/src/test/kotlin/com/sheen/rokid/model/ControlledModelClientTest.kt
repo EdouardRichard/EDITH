@@ -497,6 +497,25 @@ class ControlledModelClientTest {
         }
     }
 
+    @Test fun `reasoning events surface only for a thinking capable profile`() {
+        // 0.53 §5.4: the client is the capability gate for the stream. A non-DeepSeek profile must stay byte- and
+        // event-identical to 0.5.2, so a stray ReasoningDelta is swallowed while the answer text still flows. The
+        // Chat protocol is used here so the assertion is about this filter, not about a protocol decoder.
+        for (capable in listOf(true, false)) Rig().use { rig ->
+            rig.profile = rig.repository.save(
+                rig.profile.copy(protocolId = "OPENAI_CHAT_COMPLETIONS", thinkingSupported = capable),
+            )
+            rig.verify()
+            rig.server.enqueue(sse(CHAT_REASONING_BODY))
+            rig.start(); rig.awaitTerminal()
+            val reasoning = rig.events.filterIsInstance<ModelStreamEvent.ReasoningDelta>().map { it.text }
+            if (capable) assertEquals(listOf("think"), reasoning, "a capable profile receives the chain of thought")
+            else assertTrue(reasoning.isEmpty(), "a non-DeepSeek profile never sees reasoning")
+            assertEquals(listOf("hi"), rig.events.filterIsInstance<ModelStreamEvent.TextDelta>().map { it.text })
+            assertEquals(listOf(ModelEnd.COMPLETED), rig.ends())
+        }
+    }
+
     private fun assertProbeFailureDeniesOrdinaryRequest(rig: Rig) {
         assertEquals(1, rig.server.requestCount)
         assertEquals(1, rig.resolutions.get())
@@ -574,5 +593,18 @@ class ControlledModelClientTest {
         const val COMPLETED = "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"
         const val FAILED = "data: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"failed\"}}\n\n"
         const val INCOMPLETE = "data: {\"type\":\"response.incomplete\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"incomplete\"}}\n\n"
+
+        /** A reasoning fragment, then the answer, then the terminal: the shape a thinking chat turn streams. */
+        const val CHAT_REASONING_BODY =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n" +
+            "data: [DONE]\n\n"
+
+        /** A reasoning fragment, then the answer, then the terminal: the shape a thinking Responses turn streams. */
+        const val REASONING_BODY = CREATED +
+            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\",\"item_id\":\"rs\",\"content_index\":0,\"delta\":\"think\"}\n\n" +
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m\",\"content_index\":0,\"delta\":\"hi\"}\n\n" +
+            "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"
     }
 }

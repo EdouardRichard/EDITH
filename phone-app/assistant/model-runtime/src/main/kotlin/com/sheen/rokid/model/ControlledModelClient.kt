@@ -69,7 +69,10 @@ class ControlledModelClient(
             ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)
         else ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
         val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
-        val pending = Pending(input, profile.revision, deadline, listener)
+        // 0.53 §5.4: the capability gate for the stream's reasoning. A decoder may surface a ReasoningDelta for any
+        // model that happens to emit one; only a profile the catalog marked thinking-capable may see it, so a
+        // non-DeepSeek provider stays event-identical to 0.5.2.
+        val pending = Pending(input, profile.revision, deadline, profile.thinkingSupported, listener)
         val superseded: List<Pending>
         synchronized(lock) {
             if (closed) rejected()
@@ -212,6 +215,8 @@ class ControlledModelClient(
     }
 
     private inner class Pending(val input: ModelRequest, val revision: Long, val deadline: Long,
+        /** 0.53: whether this profile may receive reasoning at all (`ModelProfile.thinkingSupported`). */
+        private val reasoningCapable: Boolean,
         private val listener: (ModelStreamEvent) -> Unit) : CancellationHandle {
         private val done = AtomicBoolean(false)
         val delta = AtomicBoolean(false)
@@ -235,6 +240,9 @@ class ControlledModelClient(
         }
         fun deliver(event: ModelStreamEvent) {
             if (!active()) return
+            // 0.53 §5.4: reasoning is not answer text — it must neither reach an incapable profile nor satisfy the
+            // 429/5xx retry gate (which is about text already delivered to the listener).
+            if (event is ModelStreamEvent.ReasoningDelta && !reasoningCapable) return
             if (event is ModelStreamEvent.Terminal) end(event.end, event.safeCode, event.usage)
             else {
                 val admitted = synchronized(lock) { !done.get() }
