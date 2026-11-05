@@ -254,6 +254,46 @@ class RefRegistryTest {
     }
 
     @Test
+    fun `a ref thirty seconds old is still inside the forty-five second ttl`() {
+        // 0.5.4 Task 13: the turn's policy widened the ref TTL from 20 s to 45 s, so a long
+        // thinking/model step no longer turns a perfectly good ref into a STALE_REF refusal.
+        val registry = registryInSnapshot()
+        val observation = testObservation()
+        val ref = registry.assign(observation).getValue("0")
+
+        assertEquals(
+            RefResult.Ok(ref),
+            registry.resolveForAction(
+                observation,
+                ref,
+                ISSUED_AT + 30_000L,
+                PACKAGE,
+                ACTIVITY,
+                TTL,
+            ),
+        )
+    }
+
+    @Test
+    fun `a ref forty-six seconds old expired under the forty-five second ttl`() {
+        val registry = registryInSnapshot()
+        val observation = testObservation()
+        val ref = registry.assign(observation).getValue("0")
+
+        val stale = assertIs<RefResult.Stale>(
+            registry.resolveForAction(
+                observation,
+                ref,
+                ISSUED_AT + 46_000L,
+                PACKAGE,
+                ACTIVITY,
+                TTL,
+            ),
+        )
+        assertEquals("REF_EXPIRED", stale.code)
+    }
+
+    @Test
     fun `a non-positive ttl expires every snapshot immediately`() {
         listOf(0L, -1L).forEach { ttl ->
             val registry = registryInSnapshot()
@@ -442,6 +482,6 @@ class RefRegistryTest {
         const val PACKAGE = "com.example.app"
         const val ACTIVITY = ".MainActivity"
         const val ISSUED_AT = 1_000L
-        const val TTL = 20_000L
+        const val TTL = 45_000L
     }
 }

@@ -70,6 +70,11 @@ class AccessibilityExecutionBackendTest {
         private val readBackAnswers: List<String?>? = null,
         /** Whether the port still recognises the snapshot id it was handed (0.5.4 T12). */
         private val snapshotValid: Boolean = true,
+        /**
+         * One structural fingerprint per read, in order (0.5.4 T13). The post-action settle reads this sequence, so a
+         * test can script a UI that updates late or keeps moving; calls beyond the list repeat the last answer.
+         */
+        private val fingerprintAnswers: List<String>? = null,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
         val longPressByIndexCalls = mutableListOf<Pair<String, Int>>()
@@ -85,6 +90,9 @@ class AccessibilityExecutionBackendTest {
         override fun setText(text: String): Boolean = clickable
         override fun screenFingerprint(): String {
             fingerprints++
+            fingerprintAnswers?.let { answers ->
+                return answers.getOrElse(fingerprints - 1) { answers.last() }
+            }
             return if (fingerprints == 1) fingerprintBefore else fingerprintAfter
         }
 
@@ -459,6 +467,82 @@ class AccessibilityExecutionBackendTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(result.detail.contains("tapped"))
+    }
+
+    // ── post-action settle (0.5.4 T13, §6.3.4) ──────────────────────────────
+
+    @Test fun `a tap whose UI updates late is a success, not a false no-screen-change`() {
+        // Task 13: the one-shot after-fingerprint read reported NO_SCREEN_CHANGE for a navigation that committed a few
+        // hundred milliseconds later (the pre-0.5.4 false failure). The settle keeps polling, so the late change is
+        // observed inside the 1 s window. Sample 5 ("c") must never be read: two equal samples already proved stillness.
+        val ui = FakeUi(fingerprintAnswers = listOf("a", "a", "b", "b", "c"))
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("tap", """{"index":0}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the late change is judged a success", 4, ui.fingerprints)
+        assertTrue("the settle is bounded at 1 s: $now", now <= 1_000L)
+    }
+
+    @Test fun `the tap settle stops at the first two identical post-change fingerprints`() {
+        // Two agreeing captures after the change mean the screen has settled: the loop must stop there, not poll the
+        // whole window. The trailing "c" is therefore never read.
+        val ui = FakeUi(fingerprintAnswers = listOf("a", "b", "b", "c", "c"))
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("tap", """{"index":0}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("two identical fingerprints stop the settle", 3, ui.fingerprints)
+        assertEquals("no extra poll after the pair agreed", 100L, now)
+    }
+
+    @Test fun `the tap settle is bounded at one second when the screen keeps moving`() {
+        // A UI that never holds still must not hang the tool: the same 1 s bound ends the settle, and a change seen at
+        // any point is still a success (the tap did something), unlike the old single sample.
+        val ui = FakeUi(fingerprintAnswers = (0..30).map { "screen-$it" })
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("tap", """{"index":0}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the settle never exceeds 1 s", 1_000L, now)
+    }
+
+    @Test fun `an unchanged tap still refuses after the whole settle window`() {
+        // The no-change verdict may not be concluded from the first two equal samples: a UI that is still on the old
+        // screen at 200 ms may update at 300 ms. The window is waited out, then NO_SCREEN_CHANGE is honest.
+        val ui = FakeUi(fingerprintAnswers = listOf("a"))
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("tap", """{"index":0}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("NO_SCREEN_CHANGE", result.detail)
+        assertEquals("the no-change verdict waits the full settle window", 1_000L, now)
+        assertTrue("the settle polls instead of trusting one sample: ${ui.fingerprints}", ui.fingerprints > 2)
+    }
+
+    @Test fun `a coordinate tap settles a late screen change too`() {
+        // The same verdict rule applies to a blind gesture: accepted is not success, and a late change is success.
+        val ui = FakeUi(fingerprintAnswers = listOf("a", "a", "b", "b"))
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+
+        val result = b.execute("tap", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf(540 to 400), ui.clickAtCalls)
+        assertEquals("the late change was seen inside the window", 4, ui.fingerprints)
     }
 
     @Test fun `input_text reports TEXT_NOT_APPLIED when the text did not land and nothing changed`() {

@@ -409,6 +409,13 @@ class PerceptionSnapshotBuilderTest {
     }
 
     @Test
+    fun theDefaultRefTtlIs45Seconds() {
+        // 0.5.4 Task 13: a single model/thinking step can outlive 20 s, so the turn's ref TTL is 45 s. The registry
+        // itself is value-agnostic (the caller passes the TTL); this pins the policy default the host injects.
+        assertEquals(45_000L, PerceptionPolicy().refTtlMillis)
+    }
+
+    @Test
     fun aCallerLimitAboveTheDefaultPolicyIsClampedTo120() {
         val observation = observation(
             (0 until 130).map { index ->

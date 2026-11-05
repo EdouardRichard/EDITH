@@ -54,6 +54,18 @@ private const val TEXT_SETTLE_TIMEOUT_MILLIS = 800L
 private const val TEXT_SETTLE_POLL_MILLIS = 50L
 
 /**
+ * 0.5.4 T13 (§6.3.4): how long a dispatched tap/long_press is given to show its effect before the action is judged.
+ *
+ * A click can navigate asynchronously: the one-shot before/after fingerprint comparison reported `NO_SCREEN_CHANGE`
+ * for a screen that committed a few hundred milliseconds later (the pre-0.5.4 false failure). The verdict now polls
+ * this window and stops at the first two agreeing captures after a change.
+ */
+private const val ACTION_SETTLE_TIMEOUT_MILLIS = 1_000L
+
+/** One post-action settle poll: fine enough to see a fast commit, coarse enough not to spin the a11y tree. */
+private const val ACTION_SETTLE_POLL_MILLIS = 100L
+
+/**
  * 0.5.4 T11 coordinate codes.
  *
  * [MISSING_POINT] means "the request does not designate a usable on-screen point": one coordinate without the other,
@@ -541,8 +553,9 @@ class AccessibilityExecutionBackend(
         // Dispatched means the screen may already have changed: the snapshot goes with the action, whatever it returned.
         invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
-        val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after != before) {
+        // 0.5.4 T13: a navigation/list can commit after the dispatch. Settle up to 1 s so a late change is the success
+        // it is, not the old one-sample NO_SCREEN_CHANGE.
+        return if (settleScreenChange(before)) {
             done(if (longPress) "long pressed index $index" else "tapped index $index")
         } else {
             refused(NO_SCREEN_CHANGE)
@@ -559,12 +572,42 @@ class AccessibilityExecutionBackend(
         // A dispatched blind gesture may have changed the screen: the snapshot goes with it, whatever it returned.
         invalidateSnapshot()
         if (!accepted) return refused(NO_SCREEN_CHANGE)
-        val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after != before) {
+        // 0.5.4 T13: same post-action settle as an index click - accepted is not success, and a late change is.
+        return if (settleScreenChange(before)) {
             done(if (longPress) "long pressed ($x,$y)" else "tapped ($x,$y)")
         } else {
             refused(NO_SCREEN_CHANGE)
         }
+    }
+
+    /**
+     * 0.5.4 T13 (§6.3.4): the short post-action settle for `tap`/`long_press`.
+     *
+     * A dispatched click can commit asynchronously. This polls the structural fingerprint for at most
+     * [ACTION_SETTLE_TIMEOUT_MILLIS] and stops as soon as two **consecutive post-change** samples agree: the screen then
+     * held still after reacting, so the change is the action's and `Done` is honest. A still screen is deliberately
+     * waited out to the full window - stopping at two equal old-state samples would keep the original false
+     * `NO_SCREEN_CHANGE` for a UI that updates a few hundred milliseconds later.
+     *
+     * The loop is bounded twice: by the injected clock and by [ACTION_SETTLE_TIMEOUT_MILLIS] / poll count, so a test
+     * clock that never advances still terminates. A throwing fingerprint read is an unreadable sample, never a crash.
+     */
+    private fun settleScreenChange(before: String): Boolean {
+        val deadline = elapsedMillis() + ACTION_SETTLE_TIMEOUT_MILLIS
+        val maxPolls = (ACTION_SETTLE_TIMEOUT_MILLIS / ACTION_SETTLE_POLL_MILLIS).toInt() + 1
+        var previous: String? = null
+        var changed = false
+        repeat(maxPolls) {
+            val sample = runCatching { ui.screenFingerprint() }.getOrDefault("")
+            if (sample != before) changed = true
+            if (changed && sample == previous) return true
+            previous = sample
+            val remaining = deadline - elapsedMillis()
+            if (remaining <= 0L) return changed
+            val wait = minOf(ACTION_SETTLE_POLL_MILLIS, remaining)
+            if (runCatching { sleepMillis(wait) }.isFailure) return changed
+        }
+        return changed
     }
 
     /**

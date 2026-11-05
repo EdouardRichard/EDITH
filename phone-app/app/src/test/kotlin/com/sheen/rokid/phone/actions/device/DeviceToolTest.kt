@@ -114,7 +114,7 @@ class DeviceToolTest {
         refRegistry: RefRegistry? = null,
         foreground: () -> Foreground? = { null },
         nowMillis: () -> Long = { 0L },
-        refTtlMillis: () -> Long = { 20_000L },
+        refTtlMillis: () -> Long = { 45_000L },
         visionEnabled: () -> Boolean = { true },
     ): DeviceTool {
         val projectorRegistry = refRegistry ?: registry
@@ -1051,7 +1051,9 @@ class DeviceToolTest {
             operations,
             perception = perception,
             refRegistry = actionRegistry,
-            foreground = { Foreground("com.example.settings", null) },
+            // Task 13: a same-foreground TTL expiry now attempts one identity rebind. This case is the refusal path
+            // (the ref cannot be rebound), so the app in front deliberately differs from the snapshot.
+            foreground = { Foreground("com.example.app", null) },
             nowMillis = { 1_000L },
             refTtlMillis = { 0L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
@@ -1066,6 +1068,140 @@ class DeviceToolTest {
         assertTrue("the stale answer carries fresh perception content", result.nonPersistent)
         assertEquals("the stale answer is a real read, not the cached turn snapshot", 1L, perception.refreshCalls.toLong())
         assertEquals("afterAction is reserved for post-act only", 0L, perception.afterActions.toLong())
+    }
+
+    // - 0.5.4 Task 13 (R2, §6.3.4): widened TTL, one re-observe/rebind, identity-changed refusal -
+
+    @Test
+    fun `an act with a thirty second old ref is still inside the widened ttl`() {
+        // Task 13: one thinking/model step can outlive the old 20 s TTL. At 30 s the ref is still valid, so the tool
+        // must dispatch straight to the kernel and never spend a re-observation.
+        val before = observation(rev = 1, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(before)
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-old", 0L, "com.example.settings", null)
+        actionRegistry.assign(before)
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+
+        val result = tool(
+            operations,
+            perception = perception,
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.example.settings", null) },
+            nowMillis = { 30_000L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("a 30 s old ref is still valid under the 45 s ttl", 0, perception.refreshCalls)
+        assertEquals(Ref("#n0"), operations.actCalls.single().ref)
+    }
+
+    @Test
+    fun `an expired ref re-observes once rebinds the same identity and executes`() {
+        // Task 13: on a TTL expiry with the same foreground/package and the node's unchanged identity, one refresh
+        // re-assigns the registry under a new snapshot; the same ref is then dispatchable again. The retried act is
+        // the same count-only P3_ACT line plus `rebind=1`.
+        val before = observation(rev = 1, nodes = listOf(node("A")))
+        val refreshed = observation(rev = 2, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(before)
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-old", 0L, "com.example.settings", null)
+        actionRegistry.assign(before)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-after"),
+        )
+        perception.onRefresh = {
+            // The production refresh: the kernel re-observes, the provider opens a new snapshot and re-assigns.
+            operations.observation = refreshed
+            actionRegistry.beginSnapshot("snap-new", 46_000L, "com.example.settings", null)
+            actionRegistry.assign(refreshed)
+        }
+
+        val (result, acts) = withP3Sink { captured ->
+            val outcome = tool(
+                operations,
+                perception = perception,
+                refRegistry = actionRegistry,
+                foreground = { Foreground("com.example.settings", null) },
+                nowMillis = { 46_000L },
+            ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+            outcome to captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("exactly one re-observe, never a loop", 1, perception.refreshCalls)
+        assertEquals("the action is retried with the rebound ref", 1, operations.actCalls.size)
+        assertEquals(Ref("#n0"), operations.actCalls.single().ref)
+        assertEquals("the retry is the one post-act read", 1, perception.afterActions)
+        assertEquals("snap-after", observationOf(result).snapshotId)
+        assertEquals(listOf("P3_ACT settleMs=0 rebind=1"), acts)
+    }
+
+    @Test
+    fun `an expired ref whose identity changed is refused with STALE_REF`() {
+        // Task 13: the rebind is identity-stable only. The refreshed node keeps the same structural slot/viewId/bounds
+        // but changed its text, which is exactly the case the registry's weak rebind key would follow. Exact identity
+        // must win here: the refreshed snapshot mints a new ref and the old binding is cross-snapshot stale. The refusal
+        // uses the refresh the rebind attempt already made - it must not read the screen a second time.
+        val before = observation(rev = 1, nodes = listOf(node("A")))
+        val refreshed = observation(rev = 2, nodes = listOf(node("B", viewId = "id/A")))
+        val operations = FakeDeviceOperations(before)
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-old", 0L, "com.example.settings", null)
+        actionRegistry.assign(before)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            refreshedSnapshot = perceptionSnapshot(
+                snapshotId = "snap-fresh",
+                elements = listOf(perceptionElement(ref = "#n9", text = "B")),
+            ),
+        )
+        perception.onRefresh = {
+            operations.observation = refreshed
+            actionRegistry.beginSnapshot("snap-new", 46_000L, "com.example.settings", null)
+            actionRegistry.assign(refreshed)
+        }
+
+        val result = tool(
+            operations,
+            perception = perception,
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.example.settings", null) },
+            nowMillis = { 46_000L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("STALE_REF", executionOf(result).code)
+        assertTrue("the changed identity is never re-targeted", operations.actCalls.isEmpty())
+        assertEquals("the rebind attempt's own re-observe answers the refusal", 1, perception.refreshCalls)
+        assertEquals("snap-fresh", observationOf(result).snapshotId)
+        assertEquals(0, perception.afterActions)
+    }
+
+    @Test
+    fun `an expired ref with a different foreground is refused with STALE_REF`() {
+        // Task 13: the re-observe is only for the same foreground/package. A different app in front means the model's
+        // screen is gone, not late, so the tool refuses with the fresh screen instead of re-targeting the ref.
+        val before = observation(rev = 1, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(before)
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-old", 0L, "com.example.settings", null)
+        actionRegistry.assign(before)
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+
+        val result = tool(
+            operations,
+            perception = perception,
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.other.app", null) },
+            nowMillis = { 46_000L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("STALE_REF", executionOf(result).code)
+        assertTrue("the foreground change is never rebound", operations.actCalls.isEmpty())
+        assertEquals("the stale answer still shows one fresh read", 1, perception.refreshCalls)
     }
 
     @Test
@@ -1100,7 +1236,7 @@ class DeviceToolTest {
             refRegistry = actionRegistry,
             foreground = { Foreground("com.example.settings", null) },
             nowMillis = { 1_000L },
-            refTtlMillis = { 20_000L },
+            refTtlMillis = { 45_000L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -1292,7 +1428,9 @@ class DeviceToolTest {
             operations,
             perception = perception,
             refRegistry = actionRegistry,
-            foreground = { Foreground("com.example.settings", null) },
+            // Task 13: a same-foreground TTL expiry now attempts one identity rebind; this test owns the stale-answer
+            // path, so the foreground differs from the snapshot and no rebind is attempted.
+            foreground = { Foreground("com.example.app", null) },
             nowMillis = { 1_000L },
             refTtlMillis = { 0L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
@@ -1494,7 +1632,7 @@ class DeviceToolTest {
             refRegistry = actionRegistry,
             foreground = { Foreground("com.example.settings", null) },
             nowMillis = { 1_000L },
-            refTtlMillis = { 20_000L },
+            refTtlMillis = { 45_000L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -1523,7 +1661,7 @@ class DeviceToolTest {
             refRegistry = actionRegistry,
             foreground = { Foreground("com.example.settings", null) },
             nowMillis = { 1_000L },
-            refTtlMillis = { 20_000L },
+            refTtlMillis = { 45_000L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
@@ -1702,7 +1840,7 @@ class DeviceToolTest {
             refRegistry = actionRegistry,
             foreground = { Foreground("com.example.settings", null) },
             nowMillis = { 0L },
-            refTtlMillis = { 20_000L },
+            refTtlMillis = { 45_000L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -2763,6 +2901,13 @@ class DeviceToolTest {
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
 
+        /**
+         * The production `refresh()` re-observes through the kernel and re-assigns the registry under a new snapshot
+         * (AndroidPerceptionProvider.openSnapshot). A test that exercises the Task 13 expiry rebind wires that same
+         * side effect here, because the two fakes are separate objects.
+         */
+        var onRefresh: (() -> Unit)? = null
+
         override fun beginTurn(): PerceptionSnapshot = snapshot
 
         override fun refresh(): PerceptionSnapshot {
@@ -2770,6 +2915,7 @@ class DeviceToolTest {
             refreshCalls++
             if (refreshThrows) error("refresh port died")
             refreshedSnapshot?.let { snapshot = it }
+            onRefresh?.invoke()
             return snapshot
         }
 

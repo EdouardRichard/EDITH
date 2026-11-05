@@ -178,8 +178,8 @@ class DeviceTool(
     private val foreground: () -> Foreground? = { null },
     /** Epoch millis for the ref TTL check; injectable so the TTL boundary is testable without sleeping. */
     private val nowMillis: () -> Long = { System.currentTimeMillis() },
-    /** The turn's ref TTL policy; the composition passes `PerceptionPolicy.refTtlMillis`. */
-    private val refTtlMillis: () -> Long = { 20_000L },
+    /** The turn's ref TTL policy; the composition passes `PerceptionPolicy.refTtlMillis` (45 s since 0.5.4 T13). */
+    private val refTtlMillis: () -> Long = { 45_000L },
     /** edith-0.3 Phase 2: the vision switch. Off answers `VISION_DISABLED` without capturing anything. */
     private val visionEnabled: () -> Boolean = { true },
 ) : ActionExecutor {
@@ -322,8 +322,21 @@ class DeviceTool(
         if (kind == ActKind.SCROLL_TO_TEXT) return scrollToText(args, timeout)
         val ref = args.stringArg("ref")?.trim()?.takeIf { it.isNotEmpty() }?.let(::normalizedRef)
         val resolution = ref?.let(::resolveForAction)
-        if (resolution is RefResult.Stale) return staleRefAnswer(resolution)
-        val resolvedRef = (resolution as? RefResult.Ok)?.ref ?: ref
+        var reboundRef: Ref? = null
+        if (resolution is RefResult.Stale) {
+            // 0.5.4 Task 13: a TTL expiry is recoverable when nothing about the screen changed underneath the ref. One
+            // re-observe + identity-stable rebind may retry the action; every other stale answer keeps the old path.
+            if (resolution.code == REF_EXPIRED) {
+                when (val attempt = rebindAfterExpiry(ref)) {
+                    is RebindAttempt.Rebound -> reboundRef = attempt.ref
+                    is RebindAttempt.Refused -> return staleRefAnswer(attempt.stale, attempt.fresh)
+                    null -> return staleRefAnswer(resolution)
+                }
+            } else {
+                return staleRefAnswer(resolution)
+            }
+        }
+        val resolvedRef = reboundRef ?: (resolution as? RefResult.Ok)?.ref ?: ref
         val revisionBefore = operations.revision
         val envelope = operations.act(
             kind = kind,
@@ -334,7 +347,7 @@ class DeviceTool(
             key = args.stringArg("key"),
             timeoutMillis = timeout,
         )
-        return actResult(envelope, revisionBefore)
+        return actResult(envelope, revisionBefore, rebind = reboundRef != null)
     }
 
     /**
@@ -350,12 +363,15 @@ class DeviceTool(
      * cached `snapshot()`: the stale ref may have gone stale because the user changed the screen by hand, and a
      * cache-only answer would re-serve the old screen and re-stamp its refs as current. `afterAction` stays the
      * post-act read, where the action itself produced the observation.
+     *
+     * 0.5.4 Task 13: [fresh] is the read a failed expiry rebind has already made. Passing it in keeps the "one
+     * re-observe" rule - the refusal shows that read instead of spending a second one.
      */
-    private fun staleRefAnswer(stale: RefResult.Stale): ActionResult {
+    private fun staleRefAnswer(stale: RefResult.Stale, fresh: PerceptionSnapshot? = null): ActionResult {
         val provider = checkNotNull(perception) {
             "STALE_REF is only reachable when the perception provider owns the ref gate"
         }
-        val snapshot = provider.refresh()
+        val snapshot = fresh ?: provider.refresh()
         // Task 3: the refreshed screen is exactly what the model needs to re-target, so the refusal carries its image
         // and the same vision marker an observe would. Task 8: that screen is the observation; `data` repeats none of it.
         val capture = captureVision()
@@ -383,6 +399,58 @@ class DeviceTool(
             ),
             observation = observation,
         )
+    }
+
+    /** The outcome of the one identity-stable rebind Task 13 allows after a TTL expiry. */
+    private sealed interface RebindAttempt {
+        /** The refreshed screen still carries the ref's exact identity; this is the ref to dispatch. */
+        data class Rebound(val ref: Ref) : RebindAttempt
+
+        /** The re-observe already ran and the ref cannot address the refreshed screen; answer with that read. */
+        data class Refused(val fresh: PerceptionSnapshot, val stale: RefResult.Stale) : RebindAttempt
+    }
+
+    /**
+     * 0.5.4 Task 13 (§6.3.4): the one re-observe allowed when a ref expires under an unchanged screen.
+     *
+     * A ref only expires because of time. When the app/activity the snapshot recorded is still in front, the screen was
+     * not replaced, so it is worth one real [PerceptionProvider.refresh] read: the provider re-observes through the
+     * kernel and re-assigns the registry under a new snapshot, and [RefRegistry.resolveForAction] then answers with the
+     * same ref only when the node's **exact identity** survived (a changed text/description/geometry mints a new ref
+     * and leaves the old binding cross-snapshot). Exactly one refresh runs; a failed rebind reports
+     * [RebindAttempt.Refused] with that read, so the stale answer never reads the screen twice.
+     *
+     * `null` means "no rebind may be attempted here" (no perception/registry, no snapshot, a different foreground, or a
+     * throwing read); the caller falls back to the ordinary stale answer.
+     */
+    private fun rebindAfterExpiry(ref: Ref): RebindAttempt? {
+        val provider = perception ?: return null
+        val actionRegistry = registry ?: return null
+        val expired = actionRegistry.currentSnapshot() ?: return null
+        val currentForeground = runCatching { foreground() }.getOrNull()
+        if (expired.foregroundPackage != currentForeground?.packageName ||
+            expired.foregroundActivity != currentForeground?.activity
+        ) {
+            return null
+        }
+        val fresh = runCatching { provider.refresh() }.getOrNull() ?: return null
+        val observation = operations.latestObservation
+            ?: return RebindAttempt.Refused(
+                fresh,
+                RefResult.Stale("ref ${ref.value} cannot be resolved: the refresh observed no screen"),
+            )
+        val retry = actionRegistry.resolveForAction(
+            observation = observation,
+            ref = ref,
+            nowEpochMillis = nowMillis(),
+            foregroundPackage = currentForeground?.packageName,
+            foregroundActivity = currentForeground?.activity,
+            ttlMillis = refTtlMillis(),
+        )
+        return when (retry) {
+            is RefResult.Ok -> RebindAttempt.Rebound(retry.ref)
+            is RefResult.Stale -> RebindAttempt.Refused(fresh, retry)
+        }
     }
 
     /** The [RefResult.Ok] resolution when this call is gated, or null when the gate does not apply/cannot decide. */
@@ -414,10 +482,18 @@ class DeviceTool(
      * scroll loop used to bypass it, leaking the projector's `bounds=` text and leaving the provider cache one screen
      * behind). `changed` is derived from the envelope this call actually returns - never assumed from the dispatch.
      */
-    private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?, partial: Boolean = false): ActionResult {
+    private fun actResult(
+        envelope: DeviceEnvelope,
+        revisionBefore: Long?,
+        partial: Boolean = false,
+        rebind: Boolean = false,
+    ): ActionResult {
         // 0.5.4 Task 8 (§6.2.2): `settleMs` is the kernel's post-action observation/settle window, which it already
-        // measures (`observeMs` starts right after the write). Task 13 appends `rebind=` to this same count-only line.
-        P3Log.line("P3_ACT settleMs=${envelope.timing.observeMs}")
+        // measures (`observeMs` starts right after the write). Task 13 appends `rebind=1` to this same count-only line,
+        // and only for the one action the expiry rebind retried: a plain act keeps the exact pre-Task-13 line. No screen
+        // text and no ref value ever rides it.
+        val rebindField = if (rebind) " rebind=1" else ""
+        P3Log.line("P3_ACT settleMs=${envelope.timing.observeMs}$rebindField")
         val snapshot = perception?.afterAction()
         val projected = project(envelope, lastFilter)
         // Task 3: the capture follows `afterAction()`, so the image is the screen the action produced. `scrollToText`
@@ -1367,6 +1443,9 @@ class DeviceTool(
         /** edith-0.3 Phase 2 Task 7: the two tool-level refusals the model can branch on. */
         private const val STALE_REF = "STALE_REF"
         private const val VISION_DISABLED = "VISION_DISABLED"
+
+        /** 0.5.4 T13: the registry's "the snapshot outlived the TTL" code, the only stale answer that may rebind. */
+        private const val REF_EXPIRED = "REF_EXPIRED"
 
         /** The auto-vision marker reason when the injected capture throws despite the provider contract. */
         private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
