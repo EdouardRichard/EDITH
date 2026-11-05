@@ -3522,6 +3522,13 @@ class HostCompositionRoot internal constructor(
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
             val scriptedWire = ScriptedModelWire()
             val http = OkHttpClient.Builder()
+                // 0.5.4 Task 6: `ControlledModelClient` owns the request's liveness (first-token grace, stream idle,
+                // hard cap). The transport must not impose its own read/write deadlines on top of that - OkHttp's
+                // default 10 s read timeout would cut a thinking stream long before the client's 20 s idle window, and
+                // could never see the 45 s first-token grace. The connect timeout is the one bound OkHttp keeps.
+                .callTimeout(0, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.SECONDS)
+                .writeTimeout(0, TimeUnit.SECONDS)
                 // Debug-only scripted wire, first so a canned answer still passes through `ModelHttpLog` below and the
                 // `P3_HTTP` line keeps telling the truth about what the client saw. Inert until armed.
                 .addInterceptor(scriptedWire)

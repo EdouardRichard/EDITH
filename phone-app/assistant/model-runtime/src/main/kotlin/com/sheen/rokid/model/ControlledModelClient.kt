@@ -18,6 +18,33 @@ import kotlinx.serialization.json.*
 /** R70: a bounded read of a provider error body — enough for its machine code, never a full diagnostic dump. */
 private const val MAX_ERROR_BODY_BYTES = 8_192L
 
+/**
+ * 0.5.4 Task 6: the three stages that bound one model request. [ControlledModelClient] owns all of them, so no caller
+ * (and no HTTP-library default) can silently decide when a request dies.
+ *
+ * - [firstTokenMillis]: send → first `TextDelta`/`ReasoningDelta`. A thinking model may spend a long time before the
+ *   first visible fragment; 45 s is the grace, not the whole answer budget.
+ * - [streamIdleMillis]: the longest silence allowed **between** two fragments. Every accepted delta restarts it, so a
+ *   stream that keeps flowing never trips it.
+ * - [hardCapMillis]: the whole request, whatever the profile or caller allows. It is only ever lowered by the caller's
+ *   own `ModelRequest.deadlineNanos`.
+ */
+data class RequestTimeouts(
+    val firstTokenMillis: Long = 45_000,
+    val streamIdleMillis: Long = 20_000,
+    val hardCapMillis: Long = 90_000,
+) {
+    init {
+        require(firstTokenMillis > 0 && streamIdleMillis > 0 && hardCapMillis > 0)
+    }
+}
+
+// Stable machine codes for the three stages. A timeout is never a verdict on the answer; these tell an operator (and
+// Task 8's `P3_MODEL_REQ`) which stage expired. The turn/gateway boundary keeps its own `DEADLINE`.
+private const val FIRST_TOKEN_TIMEOUT = "FIRST_TOKEN_TIMEOUT"
+private const val STREAM_IDLE_TIMEOUT = "STREAM_IDLE_TIMEOUT"
+private const val REQUEST_DEADLINE = "REQUEST_DEADLINE"
+
 class ControlledModelClient(
     http: OkHttpClient, private val repository: ProfileRepository, private val resolver: SecretResolver,
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
@@ -34,6 +61,8 @@ class ControlledModelClient(
 ) : ModelClient, ProfileProbeTransport, AutoCloseable {
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
+    /** Task 6: one policy for every request this client sends. */
+    private val timeouts = RequestTimeouts()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
     // Mutable media source: starts as no-op, can be replaced after construction when the audio bridge is ready.
     @Volatile private var activeMediaSource: MediaSource = mediaSource ?: NoOpMediaSource
@@ -68,7 +97,10 @@ class ControlledModelClient(
         val endpoint = if (chatCompletions)
             ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)
         else ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
-        val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
+        val admittedAt = clock.nowNanos()
+        // Task 6: the client is the single owner of the request cap. It never re-applies `profile.timeoutMillis` — the
+        // caller (AgentLoop) already folded that into `deadlineNanos`; here only min(caller deadline, hard cap) remains.
+        val deadline = minOf(input.deadlineNanos, saturatedAdd(admittedAt, millisNanos(timeouts.hardCapMillis)))
         // 0.53 design (revised) §5.4: reasoning is passed through as-is. The system does not guess a model family, and
         // a server that returns reasoning must be answered with it on the next tool-bearing request — whatever the
         // user switch says — so the client never filters the event.
@@ -105,15 +137,23 @@ class ControlledModelClient(
             rejected()
         }
         if (!pending.active()) return pending
-        pending.attachTimer(scheduler.at(deadline) { pending.end(ModelEnd.DEADLINE, "DEADLINE") })
-        if (clock.nowNanos() >= deadline) pending.end(ModelEnd.DEADLINE, "DEADLINE")
+        // The hard cap covers the whole request, retries included. It is armed first so that a scheduler which runs the
+        // callback immediately (tests) settles the request before the grace is considered at all.
+        pending.attachTimer(scheduler.at(deadline) { pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE) })
+        // The grace only matters while it can still expire before the cap; arming it past the cap would produce a
+        // timer that can never decide anything.
+        val graceAt = saturatedAdd(admittedAt, millisNanos(timeouts.firstTokenMillis))
+        if (graceAt < deadline && pending.active()) {
+            pending.attachFirstTokenGrace(scheduler.at(graceAt) { pending.firstTokenTimedOut() })
+        }
+        if (clock.nowNanos() >= deadline) pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE)
         else execute(pending, encoded ?: rejected(), 0)
         return pending
     }
 
     private fun execute(pending: Pending, request: Request, attempt: Int) {
         if (!pending.active()) return
-        if (clock.nowNanos() >= pending.deadline) { pending.end(ModelEnd.DEADLINE, "DEADLINE"); return }
+        if (clock.nowNanos() >= pending.deadline) { pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE); return }
         // OkHttp status follow-ups bypass retryOnConnectionFailure; only our scheduler may repeat a POST.
         val body = requireNotNull(request.body)
         val attemptBody = object : RequestBody() {
@@ -229,12 +269,16 @@ class ControlledModelClient(
         private val listener: (ModelStreamEvent) -> Unit) : CancellationHandle {
         private val done = AtomicBoolean(false)
         val delta = AtomicBoolean(false)
+        /** Task 6: true once the first `TextDelta`/`ReasoningDelta` arrived; disarms the first-token grace. */
+        private val firstToken = AtomicBoolean(false)
+        private var firstTokenTimer: CancellationHandle? = null
+        private var idleTimer: CancellationHandle? = null
         private var call: Call? = null
         private val timers = mutableListOf<CancellationHandle>()
         fun active(): Boolean {
             if (done.get()) return false
             if (repository.get(input.profileId)?.revision != revision) { end(ModelEnd.CANCELLED, "PROFILE_CHANGED"); return false }
-            if (clock.nowNanos() >= deadline) { end(ModelEnd.DEADLINE, "DEADLINE"); return false }
+            if (clock.nowNanos() >= deadline) { end(ModelEnd.DEADLINE, REQUEST_DEADLINE); return false }
             return !done.get()
         }
         fun attachCall(value: Call): Boolean {
@@ -247,14 +291,56 @@ class ControlledModelClient(
             val accepted = synchronized(lock) { if (done.get()) false else { timers += value; true } }
             if (!accepted) value.cancel()
         }
+        /** Task 6: the first-token grace is kept separately so the first fragment can disarm it early. */
+        fun attachFirstTokenGrace(value: CancellationHandle) {
+            val accepted = synchronized(lock) {
+                if (done.get()) false else { firstTokenTimer = value; timers += value; true }
+            }
+            if (!accepted) value.cancel()
+        }
+        fun firstTokenTimedOut() {
+            if (!firstToken.get()) end(ModelEnd.FAILED, FIRST_TOKEN_TIMEOUT)
+        }
+        /** Task 6: mark the first fragment as seen (`TextDelta`/`ReasoningDelta`) and disarm the grace. */
+        private fun noteFirstToken(event: ModelStreamEvent) {
+            if (event !is ModelStreamEvent.TextDelta && event !is ModelStreamEvent.ReasoningDelta) return
+            if (!firstToken.compareAndSet(false, true)) return
+            val grace = synchronized(lock) { val armed = firstTokenTimer; firstTokenTimer = null; armed }
+            grace?.cancel()
+        }
+        /**
+         * Task 6: (re)start the idle window. Called after every accepted delta — a thinking stream that keeps producing
+         * fragments therefore never trips it. Every delta replaces the previous window, so only total silence expires.
+         */
+        private fun armIdle() {
+            if (done.get()) return
+            val handle = scheduler.at(saturatedAdd(clock.nowNanos(), millisNanos(timeouts.streamIdleMillis))) {
+                end(ModelEnd.FAILED, STREAM_IDLE_TIMEOUT)
+            }
+            var previous: CancellationHandle? = null
+            val accepted = synchronized(lock) {
+                if (done.get()) false else { previous = idleTimer; idleTimer = handle; timers += handle; true }
+            }
+            if (!accepted) { handle.cancel(); return }
+            previous?.cancel()
+        }
         fun deliver(event: ModelStreamEvent) {
             if (!active()) return
+            if (event is ModelStreamEvent.Terminal) {
+                end(event.end, event.safeCode, event.usage)
+                return
+            }
+            // Mark liveness **before** the listener runs: a fragment that has arrived must win the race against a
+            // watchdog callback firing on another thread at the same instant.
+            noteFirstToken(event)
             // 0.53 (revised) §5.4: reasoning is forwarded verbatim. It is still not answer text, so it never satisfies
             // the 429/5xx retry gate (which is about text already delivered to the listener).
-            if (event is ModelStreamEvent.Terminal) end(event.end, event.safeCode, event.usage)
-            else {
-                val admitted = synchronized(lock) { !done.get() }
-                if (admitted) try { listener(event) } catch (_: Exception) { end(ModelEnd.FAILED, "LISTENER_FAILED") }
+            val admitted = synchronized(lock) { !done.get() }
+            if (admitted) try { listener(event) } catch (_: Exception) { end(ModelEnd.FAILED, "LISTENER_FAILED") }
+            // Deltas of any kind are liveness for the idle window; metadata only (`response.created`) is not.
+            if (event is ModelStreamEvent.TextDelta || event is ModelStreamEvent.ReasoningDelta ||
+                event is ModelStreamEvent.ToolCallDelta || event is ModelStreamEvent.ToolCallTerminal) {
+                armIdle()
             }
         }
         fun end(end: ModelEnd, code: String?, usage: ModelUsage? = null) {
@@ -264,7 +350,12 @@ class ControlledModelClient(
         }
         fun discard() { if (done.compareAndSet(false, true)) release() }
         private fun release() {
-            val resources = synchronized(lock) { requests.remove(this); val resources = call to timers.toList(); call = null; timers.clear(); resources }
+            val resources = synchronized(lock) {
+                requests.remove(this)
+                val resources = call to timers.toList()
+                call = null; timers.clear(); firstTokenTimer = null; idleTimer = null
+                resources
+            }
             resources.first?.cancel(); resources.second.forEach { it.cancel() }
         }
         override fun cancel() { end(ModelEnd.CANCELLED, "CANCELLED") }

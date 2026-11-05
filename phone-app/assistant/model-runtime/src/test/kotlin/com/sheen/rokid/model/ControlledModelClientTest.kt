@@ -299,6 +299,98 @@ class ControlledModelClientTest {
         assertTrue(rig.failed.await(5, TimeUnit.SECONDS))
     }
 
+    // Task 6: one request is bounded by three stages. The grace runs from send until the first token/thinking
+    // fragment; the idle window restarts on every delta after it; the hard cap covers the whole request and can never
+    // exceed 90 s, whatever the profile says. The client owns all three; the profile timeout is applied once, by the
+    // caller that built `deadlineNanos` (AgentLoop), never a second time here.
+    @Test fun `a slow first token fails with FIRST_TOKEN_TIMEOUT after the grace`() = Rig().use { rig ->
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        rig.client.request(rig.request().copy(deadlineNanos = 120_000_000_000L), rig::event)
+        rig.awaitRequest()
+        val grace = rig.timers.entries.filter { it.deadline == 45_000_000_000L }
+        assertEquals(1, grace.size, "the first-token grace must be armed 45 s after the request was sent")
+        rig.timers.fire(grace.single())
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        assertEquals("FIRST_TOKEN_TIMEOUT", rig.terminal().safeCode)
+        assertEquals(45_000_000_000L, rig.settledAtNanos, "the grace, not the hard cap, decided this request")
+    }
+
+    @Test fun `a reasoning stream that keeps flowing does not trip the idle timeout`() = Rig().use { rig ->
+        rig.server.enqueue(sse(CREATED + reasoning(1, "a") + reasoning(2, "b") + reasoning(3, "c") + completed(4)))
+        rig.client.request(rig.request().copy(deadlineNanos = 120_000_000_000L)) { event ->
+            // Thinking fragments are liveness: the fake clock moves 8 s per fragment, so the stream outlives one idle
+            // window (20 s) while every window stays far from its deadline.
+            if (event is ModelStreamEvent.ReasoningDelta) rig.advance(8_000_000_000L)
+            rig.event(event)
+        }
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.COMPLETED), rig.ends())
+        val idleDeadlines = rig.timers.entries.map { it.deadline }
+            .filter { it in 20_000_000_000L..44_999_999_999L }
+        assertEquals(3, idleDeadlines.size, "every reasoning fragment restarts the idle window")
+        assertTrue(
+            idleDeadlines.zipWithNext().all { (earlier, later) -> later > earlier },
+            "the idle deadline must move forward with each delta, not stay on the first one",
+        )
+        assertTrue(
+            rig.timers.entries.single { it.deadline == 45_000_000_000L }.cancelled,
+            "the first token must disarm the first-token grace",
+        )
+    }
+
+    @Test fun `a silent stream fails with STREAM_IDLE_TIMEOUT`() = Rig().use { rig ->
+        // A deterministic watchdog seam: the 20 s idle window elapses the moment it is armed. The grace and the hard
+        // cap stay inert, so only the idle stage can decide this stream.
+        val time = AtomicLong(0)
+        val clock = object : MonotonicClock { override fun nowNanos() = time.get() }
+        val idleNanos = 20_000_000_000L
+        val scheduler = object : DeadlineScheduler {
+            override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
+                if (deadlineNanos == time.get() + idleNanos) { time.set(deadlineNanos); task() }
+                return object : CancellationHandle { override fun cancel() {} }
+            }
+        }
+        rig.server.enqueue(sse(CREATED + DELTA + COMPLETED))
+        ControlledModelClient(OkHttpClient(), rig.repository, rig.resolver, CapabilityGate(), ContextBudgeter(), clock,
+            scheduler, { rig.consent }, rig.wall, allowLocalHttp = true).use { client ->
+            var settledAtNanos = -1L
+            client.request(rig.request().copy(deadlineNanos = 120_000_000_000L)) { event ->
+                if (event is ModelStreamEvent.Terminal) settledAtNanos = time.get()
+                rig.event(event)
+            }
+            rig.awaitTerminal()
+            assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+            assertEquals("STREAM_IDLE_TIMEOUT", rig.terminal().safeCode)
+            assertEquals(idleNanos, settledAtNanos, "the idle window, not the grace or the cap, decided this request")
+            assertEquals(listOf("hi"), rig.events.filterIsInstance<ModelStreamEvent.TextDelta>().map { it.text })
+        }
+    }
+
+    @Test fun `a request over the hard cap fails with REQUEST_DEADLINE`() = Rig().use { rig ->
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        rig.client.request(rig.request().copy(deadlineNanos = 120_000_000_000L), rig::event)
+        rig.awaitRequest()
+        val cap = rig.timers.entries.filter { it.deadline == 90_000_000_000L }
+        assertEquals(1, cap.size, "the hard cap must be armed at 90 s even though the caller allowed 120 s")
+        rig.timers.fire(cap.single())
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
+        assertEquals("REQUEST_DEADLINE", rig.terminal().safeCode)
+        assertEquals(90_000_000_000L, rig.settledAtNanos, "the hard cap decided this request")
+    }
+
+    @Test fun `the profile timeout is not applied twice`() = Rig().use { rig ->
+        rig.profile = rig.repository.save(rig.profile.copy(timeoutMillis = 1_000))
+        rig.verify()
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        rig.client.request(rig.request().copy(deadlineNanos = 60_000_000_000L), rig::event)
+        rig.awaitRequest()
+        val deadlines = rig.timers.entries.map { it.deadline }
+        assertFalse(1_000_000_000L in deadlines, "the client must not re-apply profile.timeoutMillis")
+        assertTrue(60_000_000_000L in deadlines, "the request cap is min(caller deadline, 90 s)")
+    }
+
     @Test fun `raw comments cannot bypass response cap`() = Rig().use { rig ->
         rig.server.enqueue(sse(": comment\n\n".repeat(100_000)))
         rig.start(); rig.awaitTerminal()
@@ -395,7 +487,9 @@ class ControlledModelClientTest {
         rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
         ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
         rig.awaitRequest()
-        rig.timers.fire(rig.timers.entries.single())
+        // Task 6: the probe allows itself `Long.MAX_VALUE`, so the client also armed the 45 s first-token grace; the
+        // hard cap is armed first and is the request deadline this test fires.
+        rig.timers.fire(rig.timers.entries.first())
         rig.awaitTerminal()
         assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
         assertTrue(rig.failed.await(5, TimeUnit.SECONDS))
@@ -568,7 +662,7 @@ class ControlledModelClientTest {
             override fun revoke(handle: SecretHandle) { resolver.revoke(handle) }
         }
         val repository = MemoryProfileRepository(resolver::revoke)
-        private val time = AtomicLong(0)
+        val time = AtomicLong(0)
         val clock = object : MonotonicClock { override fun nowNanos() = time.get() }
         val timers = Timers(time)
         val wall = Clock.fixed(Instant.parse("2026-10-07T00:00:00Z"), ZoneOffset.UTC)
@@ -576,12 +670,20 @@ class ControlledModelClientTest {
         var profile = repository.save(profileFixture().copy(baseUrl = server.url("/v1").newBuilder().host("127.0.0.1").build().toString(), secret = resolver.put("dummy-key".toCharArray())))
         val events = CopyOnWriteArrayList<ModelStreamEvent>()
         private val terminal = CountDownLatch(1)
+        /** The fake-clock reading at which the terminal was delivered (Task 6 elapsed-bound assertions). */
+        @Volatile var settledAtNanos = -1L
         val client = ControlledModelClient(http, repository, resolving, CapabilityGate(), ContextBudgeter(), clock, timers,
             { consent }, wall, allowLocalHttp = true)
         init { verify() }
         fun verify() { repository.verify("p", verification(revision = profile.revision)); profile = repository.get("p")!! }
         fun request() = requestFixture().copy(profileRevision = repository.get("p")!!.revision)
-        fun event(value: ModelStreamEvent) { events += value; if (value is ModelStreamEvent.Terminal) terminal.countDown() }
+        fun event(value: ModelStreamEvent) {
+            if (value is ModelStreamEvent.Terminal) settledAtNanos = clock.nowNanos()
+            events += value
+            if (value is ModelStreamEvent.Terminal) terminal.countDown()
+        }
+        fun advance(nanos: Long) { time.addAndGet(nanos) }
+        fun terminal() = events.filterIsInstance<ModelStreamEvent.Terminal>().single()
         fun start() = client.request(request(), ::event)
         fun awaitRequest() = assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
         fun awaitTerminal() { assertTrue(terminal.await(5, TimeUnit.SECONDS), "terminal missing") }
@@ -623,5 +725,12 @@ class ControlledModelClientTest {
             "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\",\"item_id\":\"rs\",\"content_index\":0,\"delta\":\"think\"}\n\n" +
             "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m\",\"content_index\":0,\"delta\":\"hi\"}\n\n" +
             "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"
+
+        /** Task 6: back-to-back reasoning frames with strictly increasing sequence numbers. */
+        fun reasoning(sequence: Int, text: String) =
+            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":$sequence,\"response_id\":\"s\",\"item_id\":\"rs\",\"content_index\":0,\"delta\":\"$text\"}\n\n"
+
+        fun completed(sequence: Int) =
+            "data: {\"type\":\"response.completed\",\"sequence_number\":$sequence,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"
     }
 }

@@ -57,7 +57,9 @@ data class Provider(
     val baseUrl: String,
     // 0.52 C1: the catalog default and the runtime support id are the same single-source vocabulary (ProtocolIds).
     val protocolId: String = ProtocolIds.DEFAULT,
-    val timeoutMillis: Long = 30_000,
+    // 0.5.4 Task 6: a new provider gets the 90 s hard request cap by default. Stored providers keep the value they
+    // were created with - this default is not a migration.
+    val timeoutMillis: Long = 90_000,
     val secretHandleId: String? = null,
     val revision: Long = 1,
     val lastSyncedAtEpochMillis: Long? = null,
