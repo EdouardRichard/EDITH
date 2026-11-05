@@ -1,15 +1,18 @@
 package com.sheen.rokid.phone.ui.settings
 
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.model.ControlledProfileTester
 import com.sheen.rokid.model.GatewayModelSnapshot
 import com.sheen.rokid.model.ModelListError
 import com.sheen.rokid.model.ModelListResult
 import com.sheen.rokid.model.ModelListSource
+import com.sheen.rokid.model.ProfileProbeTransport
 import com.sheen.rokid.model.ProfileTester
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.phone.model.ProbeConsent
+import com.sheen.rokid.phone.model.ProfileProbeGate
 import com.sheen.rokid.phone.model.catalog.CatalogCredentialStore
 import com.sheen.rokid.phone.model.catalog.ModelCatalog
 import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
@@ -19,11 +22,13 @@ import com.sheen.rokid.phone.model.catalog.ModelOrigin
 import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.phone.model.domain
 import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
 import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.plugin.VerificationState
@@ -265,6 +270,39 @@ class ModelCatalogViewModelTest {
         scope = CoroutineScope(Dispatchers.Unconfined),
         clock = { now },
     )
+
+    /**
+     * The production probe chain over an in-memory catalog: `ProfileProbeGate.grant` is the consent seam, the gate
+     * admits the probe, and `ControlledProfileTester` records `TEXT_REQUEST`/`IMAGE_REQUEST` through
+     * `CatalogProfileRepository.verify`. The transport answers synchronously with [end]/[safeCode], so a test observes
+     * the exact evidence a real terminal would write (Task 14's selection prerequisite).
+     */
+    private fun controlledProbes(
+        repository: ModelCatalogRepository,
+        end: ModelEnd = ModelEnd.COMPLETED,
+        safeCode: String? = null,
+    ): Pair<ProfileTester, (ProbeConsent) -> Unit> {
+        val profiles = CatalogProfileRepository(repository)
+        val gate = ProfileProbeGate(profiles)
+        val transport = ProfileProbeTransport { _, listener ->
+            listener(ModelStreamEvent.Terminal("probe", end, ModelUsage(null, null), safeCode))
+            object : CancellationHandle { override fun cancel() = Unit }
+        }
+        val controlled = ControlledProfileTester(
+            client = transport,
+            repository = profiles,
+            clock = object : MonotonicClock { override fun nowNanos() = 0L },
+            probeImageRef = { "probe-image" },
+        )
+        val tester = object : ProfileTester {
+            override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle =
+                gate.test(controlled, profileId, listener)
+
+            override fun testImage(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle =
+                gate.testImage(controlled, profileId, listener)
+        }
+        return tester to gate::grant
+    }
 
     private fun draft(
         providerId: String? = null,
@@ -787,5 +825,123 @@ class ModelCatalogViewModelTest {
         )
         assertTrue(model.state.value.lastTest?.passed == true)
         assertEquals(domain("https://synthetic.example/v1"), "synthetic.example")
+    }
+
+    @Test
+    fun `a passing text and image probe records the evidence that unlocks selection`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1", image = true)))
+        repository.setActiveProvider("p-1")
+        val (tester, consent) = controlledProbes(repository)
+        val model = viewModel(repository, tester = tester, probeConsent = consent)
+        model.enter()
+
+        val before = requireNotNull(repository.catalog().activeProvider())
+        assertFalse(
+            "without evidence the image-capable row is not selectable",
+            ModelCatalogUi.canSelect(before.models.single { it.id == "m-1" }, before),
+        )
+
+        model.testModel("m-1", withImage = false)
+
+        val afterText = requireNotNull(repository.catalog().activeProvider())
+        val textEntry = afterText.models.single { it.id == "m-1" }
+        assertTrue(
+            "a passing text probe writes current-revision TEXT_REQUEST evidence",
+            textEntry.verifications.any {
+                it.operation == "TEXT_REQUEST" && it.state == VerificationState.Verified &&
+                    it.profileRevision == afterText.revision
+            },
+        )
+        assertTrue("TEXT_REQUEST is the selection prerequisite", ModelCatalogUi.canSelect(textEntry, afterText))
+        assertTrue(model.state.value.lastTest?.passed == true)
+
+        model.testModel("m-1", withImage = true)
+
+        val afterImage = requireNotNull(repository.catalog().activeProvider())
+        val imageEntry = afterImage.models.single { it.id == "m-1" }
+        assertTrue(
+            "the image probe writes its own IMAGE_REQUEST evidence",
+            imageEntry.verifications.any {
+                it.operation == "IMAGE_REQUEST" && it.state == VerificationState.Verified &&
+                    it.profileRevision == afterImage.revision
+            },
+        )
+        assertTrue(ModelCatalogUi.imageVerified(imageEntry, afterImage.revision))
+        assertTrue(model.state.value.lastTest?.image == true)
+    }
+
+    @Test
+    fun `a failed probe shows the safe code and writes no evidence`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1", image = true)))
+        repository.setActiveProvider("p-1")
+        val (tester, consent) = controlledProbes(repository, end = ModelEnd.FAILED, safeCode = "HTTP_500")
+        val model = viewModel(repository, tester = tester, probeConsent = consent)
+        model.enter()
+
+        model.testModel("m-1", withImage = false)
+
+        assertEquals("测试失败：HTTP_500", model.state.value.lastTest?.message)
+        assertFalse(model.state.value.lastTest?.passed == true)
+        val provider = requireNotNull(repository.catalog().activeProvider())
+        val entry = provider.models.single { it.id == "m-1" }
+        assertTrue("a failed probe records a Failed verification", entry.verifications.any {
+            it.operation == "TEXT_REQUEST" && it.state == VerificationState.Failed
+        })
+        assertFalse(ModelCatalogUi.canSelect(entry, provider))
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // detail-page delete scoping (T13 review carry-over)
+    // ---------------------------------------------------------------------------------------------------------
+
+    @Test
+    fun `a model delete confirmation stays scoped to the provider that opened it`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        save(repository, provider("p-2", "Two", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.deleteModel("m-1")
+
+        val pending = model.state.value.confirmation as CatalogConfirmation.DeleteModel
+        assertEquals("the confirmation remembers the provider it was opened from", "p-1", pending.providerId)
+        assertEquals("m-1", pending.modelId)
+
+        // The UI cannot switch providers behind the dialog; the confirmation must still refuse rather than deleting
+        // the now-active provider's same-id row.
+        repository.setActiveProvider("p-2")
+        model.confirmPending()
+
+        assertEquals(
+            listOf("m-1"),
+            repository.catalog().providers.first { it.id == "p-1" }.models.map { it.id },
+        )
+        assertEquals(
+            "the non-addressed provider's same-id row is untouched",
+            listOf("m-1"),
+            repository.catalog().providers.first { it.id == "p-2" }.models.map { it.id },
+        )
+        assertNull(model.state.value.confirmation)
+    }
+
+    @Test
+    fun `a key handed to a page that has already left is zeroed`() {
+        val credentials = LooseCredentials()
+        val repository = repository(credentials)
+        val model = viewModel(repository)
+        model.enter()
+        model.leave()
+
+        val key = "sk-abandoned-9876".toCharArray()
+        model.saveProvider(draft(key = key))
+
+        assertTrue("the early return must not keep the caller's key buffer", key.all { it == '\u0000' })
+        assertNull("nothing is staged after the page left", credentials.lastStaged)
+        assertTrue(repository.catalog().providers.isEmpty())
+        assertFalse(model.state.value.saving)
     }
 }

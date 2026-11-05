@@ -31,7 +31,7 @@ import kotlinx.coroutines.sync.withLock
 import java.util.UUID
 
 /**
- * 0.52 design §§5.9/5.10: the page state owner for the model service, provider list and provider form.
+ * 0.52 design §§5.9/5.10: the page state owner for the model service, provider list, provider form and model detail.
  *
  * Every catalog read-modify-write runs inside one [Mutex] on the host-provided [scope], so a fetch, a save, a switch and
  * a delete can never interleave even when the user taps quickly. The repository stays the only persisted authority; this
@@ -43,9 +43,13 @@ import java.util.UUID
  *    then the stop, then the write, then [selectionChanged] with the restored profile (making the old provider's rows
  *    untouched - switching never deletes a provider);
  *  - the caller's API key buffer is zeroed after every save, successful or refused, and only a `sk-••••{last4}` mask ever
- *    enters [ModelCatalogUiState];
+ *    enters [ModelCatalogUiState]. The early return for a page that already left zeroes it too;
  *  - [leave] cancels the scope, so in-flight fetches/writes die with the page; the shell builds a fresh view model when the
  *    page is entered again and [enter] re-reads the catalog.
+ *
+ * The detail page's outcomes are one-shot state events, not methods the page polls: [updateModel] publishes
+ * [ModelCatalogUiState.savedModelId] (consumed by `consumeSavedModel`) and [restoreDefaults] bumps
+ * [ModelCatalogUiState.modelEditEpoch] so the page re-reads the restored row without losing the rest of the catalog.
  */
 internal class ModelCatalogViewModel(
     private val repository: ModelCatalogRepository,
@@ -121,6 +125,12 @@ internal class ModelCatalogViewModel(
      */
     fun saveProvider(draft: ProviderDraft) {
         val key = draft.apiKey
+        // `launch` refuses work once the page left; the early return there would otherwise keep the caller's key
+        // buffer alive. Zero it here instead of relying on a coroutine body that will never run.
+        if (!entered) {
+            key?.fill('\u0000')
+            return
+        }
         val nameError = ModelCatalogUi.providerNameError(draft.name)
         val urlError = ModelCatalogUi.providerBaseUrlError(draft.baseUrl, allowLocalHttp = BuildConfig.DEBUG)
         val newProvider = draft.providerId == null
@@ -352,7 +362,13 @@ internal class ModelCatalogViewModel(
             val next = repository.catalog()
             applyCatalog(next)
             if (next.activeProviderId == provider.id) selectionChanged(next.activeProfile())
-            _state.update { it.copy(notice = ModelCatalogUi.savedProvider(changed.displayName)) }
+            _state.update {
+                it.copy(
+                    notice = ModelCatalogUi.savedProvider(changed.displayName),
+                    // Task 14: the detail page's one-shot pop signal; it is consumed after leaving the row.
+                    savedModelId = changed.id,
+                )
+            }
         } catch (error: Throwable) {
             _state.update { it.copy(error = ModelCatalogUi.saveError(error)) }
         } finally {
@@ -381,7 +397,13 @@ internal class ModelCatalogViewModel(
                 val next = repository.catalog()
                 applyCatalog(next)
                 if (next.activeProviderId == provider.id) selectionChanged(next.activeProfile())
-                _state.update { it.copy(notice = ModelCatalogUi.restoredDefaults(restored.displayName)) }
+                _state.update {
+                    it.copy(
+                        notice = ModelCatalogUi.restoredDefaults(restored.displayName),
+                        // The page re-reads the restored row from this catalog; its unsaved draft must not survive.
+                        modelEditEpoch = it.modelEditEpoch + 1,
+                    )
+                }
             }
         } catch (error: Throwable) {
             _state.update { it.copy(error = ModelCatalogUi.saveError(error)) }
@@ -514,6 +536,11 @@ internal class ModelCatalogViewModel(
     /** Consumes the editor's "saved" event; the form then closes itself. */
     fun consumeSaved() {
         _state.update { it.copy(savedProviderId = null) }
+    }
+
+    /** Consumes the detail page's "saved model" event after it has returned to the model service (Task 14). */
+    fun consumeSavedModel() {
+        _state.update { it.copy(savedModelId = null) }
     }
 
     // ---------------------------------------------------------------------------------------------------------

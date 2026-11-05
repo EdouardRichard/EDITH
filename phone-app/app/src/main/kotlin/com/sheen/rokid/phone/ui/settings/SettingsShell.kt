@@ -47,6 +47,8 @@ import com.sheen.rokid.phone.ui.PhoneDetailPage
  * [com.sheen.rokid.phone.ui.settings.ModelCatalogViewModel] for as long as any catalog route is open: `leave()` cancels
  * in-flight work when the group closes and a re-entry composes a fresh view model that re-reads the catalog. The home
  * snapshot is re-read whenever that view model publishes a catalog, so the 模型服务 summary is never stale after a save.
+ * Task 14 adds the model detail page to the same group; it is a catalog form (no text-selection container) whose saved
+ * and confirmed-delete events pop it back to the model service, where the notice is shown.
  * [initialRoute] is the first-run prompt's 「去配置」 hand-off (PhoneScreen sets the settings tab and asks for 模型服务).
  */
 @Composable
@@ -267,6 +269,7 @@ internal fun SettingsShell(
                         confirmPending = catalogViewModel::confirmPending,
                         cancelPending = catalogViewModel::cancelPending,
                         consumeSaved = catalogViewModel::consumeSaved,
+                        consumeSavedModel = catalogViewModel::consumeSavedModel,
                     )
                 }
                 when (route) {
@@ -298,6 +301,14 @@ internal fun SettingsShell(
                         actions = actions,
                         help = rememberHelpState(),
                         providerId = route.providerId,
+                        requestPop = requestPop,
+                        registerBackGuard = registerBackGuard,
+                    )
+                    is SettingsRoute.ModelDetail -> ModelDetailScreen(
+                        state = catalogState,
+                        actions = actions,
+                        help = rememberHelpState(),
+                        modelId = route.modelId,
                         requestPop = requestPop,
                         registerBackGuard = registerBackGuard,
                     )
@@ -413,10 +424,13 @@ internal fun SettingsShellContent(
     )
 
     val route = stack.lastOrNull() ?: return
-    val catalogRoute = route is SettingsRoute.ProviderEditor || when (route) {
-        SettingsRoute.ModelService, SettingsRoute.Providers, SettingsRoute.AddProvider -> true
-        else -> false
-    }
+    // T14: the model detail page is a catalog form too - it writes the catalog, has its own back guard and must not be
+    // wrapped in the detail surface's text-selection container.
+    val catalogRoute = route is SettingsRoute.ProviderEditor ||
+        route is SettingsRoute.ModelDetail || when (route) {
+            SettingsRoute.ModelService, SettingsRoute.Providers, SettingsRoute.AddProvider -> true
+            else -> false
+        }
     PhoneDetailPage(
         title = route.title,
         // One guarded exit for the arrow and for the dialog's own system-back dismissal. The page registers the

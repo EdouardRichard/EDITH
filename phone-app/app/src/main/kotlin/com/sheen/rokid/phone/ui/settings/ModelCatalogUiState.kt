@@ -39,6 +39,14 @@ internal data class ModelCatalogUiState(
     val confirmation: CatalogConfirmation? = null,
     val keyMask: Map<String, String> = emptyMap(),
     val savedProviderId: String? = null,
+    /** The model whose edit the view model just committed (Task 14); the detail page consumes it and pops. */
+    val savedModelId: String? = null,
+    /**
+     * Bumped when the detail page must re-read its stored row from the catalog (Task 14's restore defaults). Ordinary
+     * page state changes - a probe's reload, a notice - must not disturb an unsaved draft, so a counter is used instead
+     * of watching the whole entry.
+     */
+    val modelEditEpoch: Int = 0,
     val warning: String? = null,
     val testAvailable: Boolean = true,
 ) {
@@ -126,6 +134,8 @@ internal data class ModelCatalogActions(
     val cancelPending: () -> Unit = {},
     /** Clears the "saved" event after the editor has left. */
     val consumeSaved: () -> Unit = {},
+    /** Clears the detail page's saved-model event after it has popped. */
+    val consumeSavedModel: () -> Unit = {},
 )
 
 /**
