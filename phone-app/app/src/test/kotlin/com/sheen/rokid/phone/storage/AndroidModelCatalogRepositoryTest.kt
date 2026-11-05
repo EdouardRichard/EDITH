@@ -117,6 +117,27 @@ class AndroidModelCatalogRepositoryTest {
         assertFalse(catalog.lastSelectedModelIdByProvider.containsKey("p-1"))
     }
 
+    /** I1: the persisted selection boundary refuses a gateway-removed row even if a caller bypasses the view model. */
+    @Test fun `selecting a gateway-removed model is rejected by the repository`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider(), "synthetic-key".toCharArray())
+        repository.saveModels(
+            "provider-1",
+            listOf(entry("m-1"), entry("m-removed").copy(missing = true)),
+            null,
+        )
+        repository.setActiveProvider("provider-1")
+
+        val error = assertThrows(ContractError.ConfigurationRejected::class.java) {
+            repository.selectModel("m-removed")
+        }
+
+        assertEquals("模型已被网关移除", error.message)
+        assertNull("the refused selection is not persisted", repository.catalog().selectedModelId)
+    }
+
     /** 0.52 I1: the one selection rule — present, image-capable and TEXT_REQUEST-verified at the current revision. */
     @Test fun `switching restores the last model only when it is currently selectable`() {
         val blobs = Blobs()

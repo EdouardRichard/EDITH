@@ -169,9 +169,10 @@ class AndroidModelCatalogRepository(
             val previous = load()
             val provider = previous.activeProvider()
                 ?: throw ContractError.ConfigurationRejected("尚未选择提供商")
-            if (provider.models.none { it.id == modelId }) {
-                throw ContractError.ConfigurationRejected("模型不存在")
-            }
+            val model = provider.models.firstOrNull { it.id == modelId }
+                ?: throw ContractError.ConfigurationRejected("模型不存在")
+            // I1: a gateway-removed row is never a legal persisted selection, even for a caller that bypassed the UI.
+            if (model.missing) throw ContractError.ConfigurationRejected("模型已被网关移除")
             val oldModelId = previous.selectedModelId
             if (oldModelId == modelId) return
             ModelCatalogJson.write(
