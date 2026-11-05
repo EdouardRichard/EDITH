@@ -71,4 +71,11 @@ data class Segment(
             "only an assistant segment can carry reasoning"
         }
     }
+
+    /**
+     * Content-free by construction: origin and speaker only. The generated `toString()` of a data class prints every
+     * member, which would put [text], [reasoning] and the image references into any stray log line or assertion
+     * message; a request segment carries untrusted content that must not leak.
+     */
+    override fun toString(): String = "Segment(origin=$origin, role=$role, redacted)"
 }

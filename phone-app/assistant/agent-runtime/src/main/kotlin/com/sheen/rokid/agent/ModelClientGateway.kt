@@ -248,7 +248,13 @@ class ModelClientGateway(
             }
             if (isContextOverflow(reply)) {
                 if (recoveries >= MAX_OVERFLOW_RECOVERIES) {
-                    return contextOverflowFailure(reply.usage, recoveries = recoveries)
+                    return contextOverflowFailure(
+                        usage = reply.usage,
+                        recoveries = recoveries,
+                        // The provider's own overflow verdict is the last attempt; the chain of thought it streamed
+                        // before that verdict is diagnosis state, not answer text, and must survive the final reply.
+                        reasoning = reply.reasoning,
+                    )
                 }
                 recoveries++
                 overflowRecoveries++
@@ -268,9 +274,18 @@ class ModelClientGateway(
     private fun isContextOverflow(reply: GatewayReply): Boolean =
         reply.safeCode?.contains(CONTEXT_OVERFLOW, ignoreCase = true) == true
 
-    private fun contextOverflowFailure(usage: ModelUsage? = null, recoveries: Int = 0): GatewayReply {
+    /**
+     * The terminal verdict after both deterministic recoveries were exhausted. No answer text is kept — the turn
+     * produced no answer — but the provider's own accounting and the reasoning its last attempt streamed are: both are
+     * diagnosis state the run reports, and the reasoning is never rendered or logged by this adapter.
+     */
+    private fun contextOverflowFailure(
+        usage: ModelUsage? = null,
+        recoveries: Int = 0,
+        reasoning: String? = null,
+    ): GatewayReply {
         overflowFailures++
-        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries)
+        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries, reasoning)
     }
 
     /** Builds the one stateless request shape every model call of this gateway uses. */
@@ -330,15 +345,22 @@ class ModelClientGateway(
      * surface; the family rule lives in the catalog projection, not here). It describes what the operator set — not
      * whether this particular stream happened to produce reasoning — so a device log can tell "thinking off" from
      * "thinking on but the model reasoned nothing". `reasoningChars` and `replayChars` are character counts only — no
-     * reasoning text ever rides this line, exactly like `P3_CACHE`.
+     * reasoning text ever rides this line, exactly like `P3_CACHE`. `replayChars` describes what this request actually
+     * replays: it is zero unless the request carries tools, the one shape the adapter sends history reasoning on.
      */
     private fun emitThinkingMetric(request: GatewayTurn, reply: GatewayReply, modelRequest: ModelRequest) {
         val profile = profileLookup(request.profileId) ?: return
         val active = profile.thinkingEnabled
         val effort = if (active) profile.thinkingEffort.name.lowercase() else "-"
         val reasoningChars = reply.reasoning?.length ?: 0
-        val replayChars = modelRequest.history.filterIsInstance<ModelHistoryItem.Text>()
-            .sumOf { it.reasoning?.length ?: 0 }
+        // Only a tool-bearing request replays the history's reasoning (the adapter's measured rule); counting it on a
+        // no-tool request would claim bytes the wire never carries.
+        val replayChars = if (request.tools.isEmpty()) {
+            0
+        } else {
+            modelRequest.history.filterIsInstance<ModelHistoryItem.Text>()
+                .sumOf { it.reasoning?.length ?: 0 }
+        }
         val line = "P3_THINKING active=$active effort=$effort reasoningChars=$reasoningChars replayChars=$replayChars"
         runCatching { metricLine(line) }
     }

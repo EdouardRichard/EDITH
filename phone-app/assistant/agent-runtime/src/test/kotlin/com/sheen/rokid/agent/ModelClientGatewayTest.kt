@@ -559,6 +559,36 @@ class ModelClientGatewayTest {
         assertEquals("想到一半", reply.reasoning)
     }
 
+    @Test fun `an exhausted overflow keeps the reasoning the provider already streamed`() {
+        // M1 review fix: the provider's own overflow verdict is the last turn of the recursion, and the chain of
+        // thought it streamed before that verdict is diagnosis state. `contextOverflowFailure` used to build a fresh
+        // empty reply, so the reasoning the adapter had already received was lost exactly where it is most useful.
+        val reasoning = "先把窗口算清楚"
+        val client = FakeModelClient { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, reasoning))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.FAILED, null, CONTEXT_OVERFLOW))
+        }
+
+        val reply = gateway(client).turn(
+            turn(
+                frame = frame(
+                    Segment(SegmentOrigin.TRANSCRIPT, true, "旧问题", SegmentRole.USER),
+                    Segment(SegmentOrigin.TRANSCRIPT, true, "旧回答", SegmentRole.ASSISTANT),
+                    Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+                ),
+            ),
+        )
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(CONTEXT_OVERFLOW, reply.safeCode)
+        assertEquals(3, client.requests.size, "two recoveries: exactly three attempts")
+        assertEquals(
+            reasoning,
+            reply.reasoning,
+            "the exhausted-recovery FAILED reply must not drop the reasoning it already received",
+        )
+    }
+
     @Test fun `the thinking metric line carries counts only and never the reasoning text`() {
         val lines = mutableListOf<String>()
         lookup = {
@@ -579,11 +609,37 @@ class ModelClientGatewayTest {
             ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
         )
 
-        gateway(client, metricLine = { lines += it }).turn(turn(history = history))
+        gateway(client, metricLine = { lines += it }).turn(
+            turn(
+                history = history,
+                // M2 review fix: only a tool-bearing request replays history reasoning, so only that request may count
+                // it. This request carries a tool, which is the one shape the adapter replays the history on.
+                tools = listOf(ToolSpec("notify_user", "notify the wearer", "{}")),
+            ),
+        )
 
         val line = lines.single { it.startsWith("P3_THINKING") }
         assertEquals("P3_THINKING active=true effort=high reasoningChars=2 replayChars=2", line)
         assertFalse(line.contains("新想") || line.contains("旧想"))
+    }
+
+    @Test fun `history reasoning is not counted when the request carries no tools`() {
+        // M2 review fix: `replayChars` describes reasoning the adapter will actually replay. A no-tool request drops
+        // the history's reasoning at encode time, so counting it overstates the bytes on the wire.
+        val lines = mutableListOf<String>()
+        lookup = { profile.copy(thinkingEnabled = true) }
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "问"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想"),
+            ModelHistoryItem.Text(MessageRole.USER, "再问"),
+        )
+
+        gateway(terminalClient(), metricLine = { lines += it }).turn(turn(history = history))
+
+        assertEquals(
+            "P3_THINKING active=true effort=low reasoningChars=0 replayChars=0",
+            lines.single { it.startsWith("P3_THINKING") },
+        )
     }
 
     @Test fun `the thinking metric reports active from the enabled switch alone`() {

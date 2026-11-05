@@ -309,7 +309,14 @@ data class AgentRun(
      * can replay it; it is memory-only and never logged.
      */
     val finalReasoning: String? = null,
-)
+) {
+    /**
+     * Content-free by construction: outcome and step count only. The generated `toString()` of a data class prints
+     * every member, which would put [finalText], [finalReasoning] and the transcript bodies into any stray log line or
+     * assertion message. Neither the answer nor the chain of thought may ride one.
+     */
+    override fun toString(): String = "AgentRun(outcome=$outcome, steps=${steps.size}, redacted)"
+}
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
 private const val CONFIRMATION_UNAVAILABLE = "CONFIRMATION_UNAVAILABLE"

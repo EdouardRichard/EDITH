@@ -122,4 +122,11 @@ data class GatewayReply(
      * renders it, and only the DeepSeek adapters replay it. Redacted by every `toString()` in the contract.
      */
     val reasoning: String? = null,
-)
+) {
+    /**
+     * Content-free by construction: the call count and the verdict only. The generated `toString()` of a data class
+     * prints every member, which would put [text] and [reasoning] into any stray log line or assertion message. Neither
+     * may ride one, so this override states exactly what a reader may see.
+     */
+    override fun toString(): String = "GatewayReply(toolCalls=${toolCalls.size}, terminal=$terminal, redacted)"
+}

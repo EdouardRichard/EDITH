@@ -46,10 +46,9 @@ data class ModelProfile(
     val thinkingEnabled: Boolean = false,
     val thinkingEffort: ThinkingEffort = ThinkingEffort.LOW,
     /**
-     * R21: whether the selected model belongs to the DeepSeek family and accepts its native thinking fields. The
-     * adapters send those fields only when this is true (plus the measured tool-request rule); an OpenAI-compatible
-     * non-DeepSeek gateway may answer HTTP 400 to `thinking`/`reasoning`, so the default is false — the pre-0.5.2 wire
-     * shape — until the catalog knows the model supports them.
+     * Storage-only compatibility field, kept so a catalog stored by 0.52 still round-trips its old value. **0.5.3
+     * ignores it**: whether thinking is requested is decided by [thinkingEnabled] alone, and the adapters gate on that
+     * switch (no adapter reads this bit). Any family or protocol rule lives in the catalog projection, not here.
      */
     val thinkingSupported: Boolean = false,
 ) {
