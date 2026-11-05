@@ -88,6 +88,12 @@ data class ToolResult(
      * `false` — the default — keeps every pre-Phase-2 result and every non-perception tool byte-for-byte unchanged.
      */
     val nonPersistent: Boolean = false,
+    /**
+     * 0.5.4 Task 2: projected verbatim from `plugin-api`'s `ActionResult.awaitingUser` — this successful call leaves the
+     * turn waiting for the wearer's answer. The loop ends the run as `AgentOutcome.AWAITING_USER` without another model
+     * request. `false` — the default — keeps every pre-0.5.4 result and run unchanged.
+     */
+    val awaitingUser: Boolean = false,
 ) {
     /** The one model-facing result shape; see [ToolResultEnvelope]. */
     val payload: String = ToolResultEnvelope.encode(execution, observation, data)

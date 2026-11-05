@@ -2094,4 +2094,69 @@ class AgentLoopTest {
 
         assertTrue(p4PolicyLines(lines).isEmpty(), "an unknown name is not a policy decision: $lines")
     }
+
+    // ---------------------------------------------------------------- awaiting user (0.5.4 Task 2)
+
+    @Test fun `an awaiting-user tool result ends the run as AWAITING_USER`() {
+        // 0.5.4 Task 2: a successful tool that declares it is waiting for the wearer terminalizes the run without
+        // another model turn. The assistant text and the tool output stay in history, exactly as for a TERMINAL scope.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "已问用户", awaitingUser = true) }
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "想继续吗？", calls = listOf(call("c1", "notify_user")))),
+        )
+
+        val loop = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.AWAITING_USER, run.outcome)
+        assertEquals(1, gateway.requests.size, "an awaiting-user result must not ask the model again")
+        assertTrue(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "想继续吗？") in run.transcript,
+            "the assistant text that opened the round stays in history: ${run.transcript}",
+        )
+        assertTrue(
+            ModelHistoryItem.ToolOutput("c1", doneEnvelope("已问用户")) in run.transcript,
+            "the tool output stays in history: ${run.transcript}",
+        )
+    }
+
+    @Test fun `an ordinary successful tool result still completes normally`() {
+        // The regression guard for the default: a tool that does not set the flag keeps the pre-0.5.4 behaviour.
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "answer")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("answer", run.finalText)
+        assertEquals(2, gateway.requests.size)
+    }
+
+    @Test fun `awaiting user is not a failure and keeps the tool output in history`() {
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, """{"awaiting_user":true}""", awaitingUser = true)
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "等你回复", calls = listOf(call("c1", "notify_user")))),
+        )
+
+        val loop = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.AWAITING_USER, run.outcome)
+        assertNull(run.safeCode, "waiting for the wearer is not a failure")
+        assertEquals(listOf(AgentStep(1, "notify_user", "ok")), run.steps)
+        assertTrue(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "等你回复") in run.transcript,
+            "the assistant text stays in history: ${run.transcript}",
+        )
+        val toolOutput = assertIs<ModelHistoryItem.ToolOutput>(run.transcript.last())
+        assertEquals("c1", toolOutput.callId)
+        assertEquals(doneEnvelope("""{"awaiting_user":true}"""), toolOutput.output)
+    }
 }

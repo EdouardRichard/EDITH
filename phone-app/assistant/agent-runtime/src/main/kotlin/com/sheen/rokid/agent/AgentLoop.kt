@@ -25,8 +25,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** The six terminal states of one agent run (spec §6.3). */
-enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED }
+/** The seven terminal states of one agent run (spec §6.3; 0.5.4 Task 2 adds [AWAITING_USER]). */
+enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED, AWAITING_USER }
 
 /**
  * One agent run request.
@@ -230,7 +230,9 @@ data class AgentMetrics(
  * The terminal result of one run.
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
- * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED].
+ * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set for [AgentOutcome.COMPLETED] (the
+ * model's answer) and [AgentOutcome.AWAITING_USER] (the awaiting tool's own `data`); every failure outcome leaves it
+ * `null`.
  *
  * [humanWaitNanos] is the wall clock this run spent waiting for a **person** — the confirmation port and the bounded
  * mayAskHuman wait a tool reports as its deadline shift (the shell/`ConfirmingActions` wrapper) — and it is
@@ -1165,6 +1167,17 @@ class AgentLoop(
                     result.images,
                     nonPersistent = mustRedact(result),
                 )
+                // 0.5.4 Task 2: a tool that says it is waiting for the wearer ends the run right here. The assistant
+                // text and the tool output are already in history (above), so the turn can be settled from the
+                // transcript; no second model request is made, because the answer is the person's to give. This is not
+                // a failure: no safe code and no failure hint. It sits before the terminal-scope check because the
+                // awaiting declaration is the stronger verdict of the two.
+                if (result.awaitingUser) {
+                    return finish(
+                        AgentOutcome.AWAITING_USER, null, result.data, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
+                }
                 if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) {
                     return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps, reply.reasoning)

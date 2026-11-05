@@ -206,6 +206,14 @@ data class ActionResult(
      * fields in [detail]. An empty-but-attempted observation is a real observation (see [ToolObservation]).
      */
     val observation: ToolObservation? = null,
+    /**
+     * 0.5.4 Task 2: this successful result leaves the turn **waiting for the wearer**, so the agent run terminalizes
+     * with `AgentOutcome.AWAITING_USER` instead of asking the model again or claiming the turn finished.
+     *
+     * The tool owns the question (e.g. `notify_user` asked it); the loop only reads the flag. `false` — the default —
+     * keeps every existing tool, every existing constructor and every pre-0.5.4 run byte-for-byte unchanged.
+     */
+    val awaitingUser: Boolean = false,
 )
 
 /**

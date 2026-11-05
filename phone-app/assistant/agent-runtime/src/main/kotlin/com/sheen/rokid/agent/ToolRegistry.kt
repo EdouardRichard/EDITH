@@ -114,6 +114,8 @@ class ToolRegistry(
             stateChanging = result.stateChanging,
             images = result.images,
             nonPersistent = result.nonPersistent,
+            // 0.5.4 Task 2: the awaiting-user declaration rides through like the other per-call facts.
+            awaitingUser = result.awaitingUser,
         )
     }
 
