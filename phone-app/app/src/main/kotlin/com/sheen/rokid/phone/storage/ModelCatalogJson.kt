@@ -65,13 +65,22 @@ object ModelCatalogJson {
 
     private fun decodeOrThrow(json: JsonObject): ModelCatalog {
         if (json.getValue("version").jsonPrimitive.int != VERSION) unavailable()
+        val providers = json.getValue("providers").jsonArray.map { decodeProvider(it.jsonObject) }
+        val activeProviderId = json.nullableText("activeProviderId")
+        // 0.52 I2: a persisted selection (or restore entry) that is not backed by a stored model is stale. Dropping it on
+        // decode prevents a deleted model from being resurrected by the next save/refresh; it is a repair, not corruption,
+        // because the rest of the catalog is consistent.
+        fun present(providerId: String?, modelId: String): Boolean =
+            providers.firstOrNull { it.id == providerId }?.models?.any { it.id == modelId } == true
+        val selectedModelId = json.nullableText("selectedModelId")?.takeIf { present(activeProviderId, it) }
+        val lastSelected = json.getValue("lastSelectedModelIdByProvider").jsonObject.mapValues {
+            it.value.jsonPrimitive.contentOrNull ?: throw IllegalArgumentException("missing model id")
+        }.filter { (providerId, modelId) -> present(providerId, modelId) }
         return ModelCatalog(
-            activeProviderId = json.nullableText("activeProviderId"),
-            selectedModelId = json.nullableText("selectedModelId"),
-            providers = json.getValue("providers").jsonArray.map { decodeProvider(it.jsonObject) },
-            lastSelectedModelIdByProvider = json.getValue("lastSelectedModelIdByProvider").jsonObject.mapValues {
-                it.value.jsonPrimitive.contentOrNull ?: throw IllegalArgumentException("missing model id")
-            },
+            activeProviderId = activeProviderId,
+            selectedModelId = selectedModelId,
+            providers = providers,
+            lastSelectedModelIdByProvider = lastSelected,
         )
     }
 

@@ -1,9 +1,9 @@
 package com.sheen.rokid.phone.ui.settings
 
 import com.sheen.rokid.phone.model.catalog.ModelCatalog
+import com.sheen.rokid.phone.model.catalog.ModelSelection
 import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.InputModality
-import com.sheen.rokid.plugin.VerificationState
 
 /**
  * 0.52 design §3.2 / §5.10: the home's summaries, as a pure JVM function.
@@ -34,8 +34,8 @@ internal object SettingsSummaries {
     const val AUDIT_SUMMARY = "已收起 · 进入后加载"
 
     /** The operation a text probe records; named here so the shell and the tests share one spelling. */
-    const val TEXT_OPERATION = "TEXT_REQUEST"
-    private const val IMAGE_REQUEST = "IMAGE_REQUEST"
+    const val TEXT_OPERATION = ModelSelection.TEXT_OPERATION
+    private const val IMAGE_REQUEST = ModelSelection.IMAGE_OPERATION
 
     /**
      * Builds the home model from the catalog and the live switches.
@@ -73,15 +73,7 @@ internal object SettingsSummaries {
         verifications: List<CapabilityVerification>,
         revision: Long,
         operation: String,
-    ): Boolean {
-        val latest = verifications.withIndex()
-            .filter { it.value.profileRevision == revision && it.value.operation == operation }
-            .maxWithOrNull(
-                compareBy<IndexedValue<CapabilityVerification>> { it.value.testedAtEpochMillis }
-                    .thenBy { it.index },
-            )
-        return latest?.value?.state == VerificationState.Verified
-    }
+    ): Boolean = ModelSelection.latestVerified(verifications, revision, operation)
 
     private fun modelSummary(catalog: ModelCatalog?, textVerified: Boolean): Pair<String, ModelStatus> {
         val provider = catalog?.activeProvider()

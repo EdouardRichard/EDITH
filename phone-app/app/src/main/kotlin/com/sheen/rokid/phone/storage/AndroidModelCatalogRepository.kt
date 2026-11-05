@@ -6,10 +6,10 @@ import com.sheen.rokid.phone.model.catalog.ModelCatalog
 import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
 import com.sheen.rokid.phone.model.catalog.ModelEntry
 import com.sheen.rokid.phone.model.catalog.ModelProfileProjection
+import com.sheen.rokid.phone.model.catalog.ModelSelection
 import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.CapabilityVerification
-import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.SecretHandle
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -129,21 +129,26 @@ class AndroidModelCatalogRepository(
                 revision = if (changed) Math.addExact(old.revision, 1L) else old.revision,
                 lastSyncedAtEpochMillis = lastSyncedAtEpochMillis ?: old.lastSyncedAtEpochMillis,
             )
-            var next = previous.copy(providers = previous.providers.toMutableList().also { it[index] = saved })
-            if (selectedModelId != null) {
-                next = next.copy(
-                    lastSelectedModelIdByProvider = next.lastSelectedModelIdByProvider + (providerId to selectedModelId),
-                )
-            }
-            if (next.activeProviderId == providerId) next = next.copy(selectedModelId = selectedModelId)
+            // 0.52 I2: a selection is only meaningful while its model exists. Never persist a dangling id or a restore
+            // entry that would resurrect a deleted model on the next refresh.
+            val selection = selectedModelId?.takeIf { id -> nextModels.any { it.id == id } }
+            var next = previous.copy(
+                providers = previous.providers.toMutableList().also { it[index] = saved },
+                lastSelectedModelIdByProvider = if (selection == null) {
+                    previous.lastSelectedModelIdByProvider - providerId
+                } else {
+                    previous.lastSelectedModelIdByProvider + (providerId to selection)
+                },
+            )
+            if (next.activeProviderId == providerId) next = next.copy(selectedModelId = selection)
             ModelCatalogJson.write(blobs, next)
             affected = when {
                 changed -> affectedIds(old) + affectedIds(saved)
                 // A selection-only save invalidates nothing; report exactly the old and new derived profiles.
-                previous.activeProviderId == providerId && previous.selectedModelId != selectedModelId ->
+                previous.activeProviderId == providerId && previous.selectedModelId != selection ->
                     linkedSetOf<String>().apply {
                         previous.selectedModelId?.let { add(ModelProfileProjection.profileId(providerId, it)) }
-                        selectedModelId?.let { add(ModelProfileProjection.profileId(providerId, it)) }
+                        selection?.let { add(ModelProfileProjection.profileId(providerId, it)) }
                     }
                 else -> emptySet()
             }
@@ -189,10 +194,13 @@ class AndroidModelCatalogRepository(
             val provider = previous.providers.firstOrNull { it.id == providerId }
                 ?: throw ContractError.ConfigurationRejected("Model provider unavailable")
             if (previous.activeProviderId == providerId) return
+            // 0.52 I1/design §5.9: restore the remembered model only when it is selectable now; otherwise fall back to
+            // the first selectable row. Never guess a text-only or untested model into an unusable selection.
             val selected = previous.lastSelectedModelIdByProvider[providerId]
-                ?.takeIf { id -> provider.models.any { it.id == id } }
-                ?: provider.models.firstOrNull { InputModality.IMAGE in it.inputs }?.id
-                ?: provider.models.firstOrNull()?.id
+                ?.let { remembered -> provider.models.firstOrNull { it.id == remembered } }
+                ?.takeIf { ModelSelection.isSelectable(it, provider.revision) }
+                ?.id
+                ?: ModelSelection.firstSelectable(provider.models, provider.revision)?.id
             ModelCatalogJson.write(
                 blobs,
                 previous.copy(

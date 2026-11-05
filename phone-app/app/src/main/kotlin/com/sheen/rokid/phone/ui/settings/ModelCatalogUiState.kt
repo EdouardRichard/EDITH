@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.model.ModelListError
 import com.sheen.rokid.model.ProtocolIds
 import com.sheen.rokid.phone.model.catalog.CatalogValidation
+import com.sheen.rokid.phone.model.catalog.ModelSelection
 import com.sheen.rokid.phone.model.catalog.ModelCatalog
 import com.sheen.rokid.phone.model.catalog.ModelEntry
 import com.sheen.rokid.phone.model.catalog.ModelField
@@ -158,7 +159,7 @@ internal object ModelCatalogUi {
     const val FETCH_MODELS = "获取模型"
     const val FETCHING = "获取中…"
     const val ADD_MODEL = "新增模型"
-    const val NO_MODEL_SELECTED = "尚未选择模型，请在上方列表中选择一个。"
+    const val NO_MODEL_SELECTED = "请先测试并选择模型"
     const val SWITCH_PROVIDER = "切换提供商"
     const val ACTIVE_CHIP = "生效中"
     const val KEY_UNKNOWN = "sk-••••"
@@ -188,6 +189,8 @@ internal object ModelCatalogUi {
     const val TEXT_ONLY_DISABLED = "不支持图片，助手不可用"
     const val MISSING_SELECTED = "当前选择的模型已不存在，请重新选择模型"
     const val MISSING_GATEWAY = "当前选择的模型已被网关移除，建议重新选择模型"
+    /** 0.52 I1: tapping the radio of a gateway-removed row. */
+    const val SELECT_MISSING_ROW = "该模型已被网关移除，无法选择"
     const val PROVIDER_MISSING = "提供商不存在，请返回后重新进入"
     const val MODEL_MISSING = "模型不存在，请刷新后重试"
     const val ADD_PROVIDER_FIRST = "请先添加提供商"
@@ -303,17 +306,18 @@ internal object ModelCatalogUi {
 
     /** True when [entry] carries current-revision TEXT_REQUEST evidence (the CapabilityGate rule). */
     fun freshTextVerified(entry: ModelEntry, revision: Long): Boolean =
-        SettingsSummaries.latestVerified(entry.verifications, revision, SettingsSummaries.TEXT_OPERATION)
+        ModelSelection.latestVerified(entry.verifications, revision, ModelSelection.TEXT_OPERATION)
 
     fun imageVerified(entry: ModelEntry, revision: Long): Boolean =
-        SettingsSummaries.latestVerified(entry.verifications, revision, "IMAGE_REQUEST")
+        ModelSelection.latestVerified(entry.verifications, revision, ModelSelection.IMAGE_OPERATION)
 
-    /** The 0.52 design §5.10 selectability rule: image-capable, present, and tested at the current revision. */
+    /** The one selectability rule from I1, shared with the repository fallbacks and the host's start gate. */
     fun canSelect(entry: ModelEntry, provider: Provider): Boolean =
-        !entry.missing && InputModality.IMAGE in entry.inputs && freshTextVerified(entry, provider.revision)
+        ModelSelection.isSelectable(entry, provider.revision)
 
     /** Why a row's radio is disabled, or null when it is selectable. */
     fun disabledReason(entry: ModelEntry, provider: Provider): String? = when {
+        entry.missing -> SELECT_MISSING_ROW
         InputModality.IMAGE !in entry.inputs -> TEXT_ONLY_DISABLED
         !freshTextVerified(entry, provider.revision) -> SELECT_NEEDS_TEST
         else -> null

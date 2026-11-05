@@ -10,12 +10,14 @@ import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
 import com.sheen.rokid.phone.storage.CatalogProfileRepository
 import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.VerificationState
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.util.UUID
@@ -64,7 +66,12 @@ class ModelCatalogSelectionTest {
     )
 
     private fun save(catalog: ModelCatalogRepository, provider: Provider) {
-        catalog.saveProvider(provider, "synthetic-dummy-secret".toCharArray())
+        val saved = catalog.saveProvider(provider, "synthetic-dummy-secret".toCharArray())
+        // 0.52 I1: automatic selection needs current-revision TEXT_REQUEST evidence.
+        saved.models.forEach { model ->
+            catalog.verify("${saved.id}:${model.id}",
+                CapabilityVerification(saved.revision, "TEXT_REQUEST", VerificationState.Verified, 1))
+        }
     }
 
     private class InertModel : ModelClient {

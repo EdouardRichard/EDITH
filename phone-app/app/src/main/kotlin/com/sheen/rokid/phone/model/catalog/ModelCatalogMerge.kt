@@ -58,8 +58,14 @@ object ModelCatalogMerge {
         }
         for (previous in provider.models) {
             if (previous.id !in offeredById) {
-                models += previous.copy(missing = true)
-                missing += 1
+                if (previous.origin == ModelOrigin.MANUAL) {
+                    // I3: a manual row was never fetched from the gateway, so its absence is not a removal. Keep it
+                    // available (and repair a legacy wrongly-marked manual row) without counting it as 网关已移除.
+                    models += previous.copy(missing = false)
+                } else {
+                    models += previous.copy(missing = true)
+                    missing += 1
+                }
             }
         }
 

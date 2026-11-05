@@ -10,6 +10,7 @@ import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
 import com.sheen.rokid.phone.model.catalog.ModelCatalogService
 import com.sheen.rokid.phone.model.catalog.ModelEntry
 import com.sheen.rokid.phone.model.catalog.ModelOrigin
+import com.sheen.rokid.phone.model.catalog.ModelSelection
 import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.phone.model.catalog.RefreshOutcome
 import com.sheen.rokid.plugin.InputModality
@@ -248,11 +249,16 @@ internal class ModelCatalogViewModel(
             return@launch
         }
         if (catalog.selectedModelId == modelId) return@launch
+        // I1: a gateway-removed row is never selectable, even if it still carries old evidence.
+        if (model.missing) {
+            _state.update { it.copy(error = ModelCatalogUi.SELECT_MISSING_ROW) }
+            return@launch
+        }
         if (InputModality.IMAGE !in model.inputs) {
             _state.update { it.copy(error = ModelCatalogUi.TEXT_ONLY_DISABLED) }
             return@launch
         }
-        if (!ModelCatalogUi.freshTextVerified(model, provider.revision)) {
+        if (!ModelSelection.isSelectable(model, provider.revision)) {
             _state.update { it.copy(error = ModelCatalogUi.SELECT_NEEDS_TEST) }
             return@launch
         }
@@ -711,8 +717,13 @@ internal class ModelCatalogViewModel(
         }
         val wasSelected = catalog.selectedModelId == pending.modelId
         val remaining = provider.models.filterNot { it.id == pending.modelId }
-        // Design §5.9: a deleted selected model falls back to the provider's first image-capable row, else nothing.
-        val fallback = if (wasSelected) remaining.firstOrNull { InputModality.IMAGE in it.inputs }?.id else null
+        // I1/design §5.9: a deleted selected model falls back only to a selectable row (image + current text evidence);
+        // otherwise the selection becomes null and the page asks for a test instead of silently picking an unusable row.
+        val fallback = if (wasSelected) {
+            ModelSelection.firstSelectable(remaining, provider.revision)?.id
+        } else {
+            null
+        }
         _state.update { it.copy(saving = true, error = null, notice = null) }
         try {
             if (wasSelected) beforeSelectionChange()

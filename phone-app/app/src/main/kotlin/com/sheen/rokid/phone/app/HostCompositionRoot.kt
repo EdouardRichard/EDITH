@@ -37,6 +37,7 @@ import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.model.ModelStartGate
 import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
 import com.sheen.rokid.phone.model.catalog.ModelCatalogService
+import com.sheen.rokid.phone.model.catalog.ModelSelection
 import com.sheen.rokid.phone.ui.settings.ModelCatalogViewModel
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
@@ -1145,6 +1146,17 @@ class HostCompositionRoot internal constructor(
     internal val modelCatalogRepository: ModelCatalogRepository? get() = modelCatalog
 
     /**
+     * 0.52 I1: refuses a session whose catalog selection is not currently usable (removed by the gateway, or its
+     * TEXT_REQUEST evidence no longer matches the provider revision). Hand-built rigs without a catalog keep the
+     * pre-existing profile-only gate; an unreadable catalog is answered by the configuration path, not invented here.
+     */
+    private fun catalogSelectionStartupError(): String? {
+        val repository = modelCatalog ?: return null
+        val catalog = runCatching { repository.catalog() }.getOrNull() ?: return null
+        return ModelSelection.startRefusal(catalog)
+    }
+
+    /**
      * 0.52 design §5.10: builds the model-service page's view model, or null when this composition has no catalog or no
      * refresh service - the page then says 「模型服务不可用」 rather than fabricating an empty catalog.
      *
@@ -1326,6 +1338,12 @@ class HostCompositionRoot internal constructor(
         val startupError = profileStartupError(selectedProfile(pluginId))
         if (startupError != null) {
             mutableState.update { it.copy(errorCode = startupError) }
+            return
+        }
+        // 0.52 I1: the same selectability rule the radio and the repository use also gates the session start. A stale
+        // selection (content change cleared its TEXT evidence) or a gateway-removed one refuses here, visibly.
+        catalogSelectionStartupError()?.let { refusal ->
+            mutableState.update { it.copy(errorCode = refusal) }
             return
         }
         val session = SessionId(UUID.randomUUID().toString())
@@ -3086,6 +3104,13 @@ class HostCompositionRoot internal constructor(
         // back to text-only between sessions is refused visibly instead of starting a request the gate would deny.
         val chosenProfile = selectedProfile(selected)
         profileStartupError(chosenProfile)?.let { code ->
+            disarmAudioEpoch()
+            host.pause()
+            error(code)
+            return
+        }
+        // 0.52 I1: the start gate uses the same selectability rule as the settings radio and the repository fallbacks.
+        catalogSelectionStartupError()?.let { code ->
             disarmAudioEpoch()
             host.pause()
             error(code)

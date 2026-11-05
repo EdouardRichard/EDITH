@@ -747,6 +747,9 @@ internal fun errorLabel(code: String) = when (code) {
     "MIC_FORMAT_UNSUPPORTED" -> "麦克风音频格式不受支持"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
     "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型不支持图片输入；请更换支持图片的模型（本版要求 IMAGE+TEXT）"
+    // 0.52 I1: the start gate can also find the selection removed or its evidence stale (provider revision changed).
+    "PROFILE_MODEL_MISSING" -> "当前选择的模型已被移除，请重新选择模型"
+    "PROFILE_MODEL_UNVERIFIED" -> "当前选择的模型需要重新测试，请在模型详情完成文本测试"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"
     "UNKNOWN_PLUGIN" -> "插件不可用"
     else -> "会话异常"

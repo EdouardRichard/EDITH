@@ -22,6 +22,7 @@ import com.sheen.rokid.phone.storage.KeystoreVault
 import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.ConfiguredPlugin
 import com.sheen.rokid.plugin.DeactivationReason
@@ -36,6 +37,7 @@ import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.VerificationState
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import com.sheen.rokid.testsupport.RecordingInputPort
@@ -94,8 +96,15 @@ class CatalogWiringTest {
         models = models.map(::entry),
     )
 
-    private fun save(catalog: ModelCatalogRepository, provider: Provider): Provider =
-        catalog.saveProvider(provider, "synthetic-dummy-secret".toCharArray())
+    private fun save(catalog: ModelCatalogRepository, provider: Provider): Provider {
+        val saved = catalog.saveProvider(provider, "synthetic-dummy-secret".toCharArray())
+        // 0.52 I1: the selection rule auto-selects only a row whose TEXT_REQUEST evidence matches the current revision.
+        saved.models.forEach { model ->
+            catalog.verify("${saved.id}:${model.id}",
+                CapabilityVerification(saved.revision, "TEXT_REQUEST", VerificationState.Verified, 1))
+        }
+        return saved
+    }
 
     // ---- the composition-shaped rig ----------------------------------------------------------------------------
 
@@ -227,7 +236,9 @@ class CatalogWiringTest {
         val blobs = TestBlobs()
         val vault = KeystoreVault(blobs)
         val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(vault))
-        catalog.saveProvider(provider("provider-1", "m-1"), "synthetic-dummy-secret".toCharArray())
+        val saved = catalog.saveProvider(provider("provider-1", "m-1"), "synthetic-dummy-secret".toCharArray())
+        catalog.verify("provider-1:m-1",
+            CapabilityVerification(saved.revision, "TEXT_REQUEST", VerificationState.Verified, 1))
         catalog.setActiveProvider("provider-1")
         val secret = requireNotNull(catalog.catalog().activeProfile()).secret
 
@@ -359,6 +370,8 @@ class CatalogWiringTest {
         )
         save(catalog, textOnly)
         catalog.setActiveProvider("provider-1")
+        // The row is text-only, so the selection rule leaves it unselected; pin the selection this test is about.
+        catalog.selectModel("m-text")
         val rig = Rig(catalog)
         try {
             rig.root.attachCxrActivity(Any())
@@ -367,6 +380,26 @@ class CatalogWiringTest {
             // The image gate is a property of the one active model, not of the smart plugin's id: the interview
             // activation path must refuse the same text-only selection instead of starting a session under it.
             assertEquals("PROFILE_MODEL_NOT_MULTIMODAL", rig.root.state.value.errorCode)
+            assertEquals("a refused start begins no session", SessionState.Idle, rig.root.host.currentState)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun `a selection whose evidence a content change invalidated refuses the start gate`() {
+        val catalog = catalog()
+        save(catalog, provider("provider-1", "m-1"))
+        catalog.setActiveProvider("provider-1")
+        // A real provider/model content change bumps the revision and clears the evidence bound to the old one (R28).
+        // The selection itself stays, so the only correct behavior is to refuse the start and ask for a fresh test.
+        catalog.saveModels("provider-1", listOf(entry("m-1").copy(displayName = "Renamed")), "m-1")
+        val rig = Rig(catalog)
+        try {
+            rig.root.attachCxrActivity(Any())
+            rig.root.start("smart-assistant")
+
+            assertEquals("PROFILE_MODEL_UNVERIFIED", rig.root.state.value.errorCode)
             assertEquals("a refused start begins no session", SessionState.Idle, rig.root.host.currentState)
         } finally {
             rig.close()

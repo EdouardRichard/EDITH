@@ -95,6 +95,94 @@ class AndroidModelCatalogRepositoryTest {
 
     private fun bytes(blobs: Blobs, id: String) = blobs.values.getValue(id).toString(Charsets.UTF_8)
 
+    private fun textVerified(revision: Long) =
+        CapabilityVerification(revision, "TEXT_REQUEST", VerificationState.Verified, 1)
+
+    /** 0.52 I2: a selection that is not in the saved model list is nulled, and its restore entry disappears. */
+    @Test fun `saving models clears a selection that is no longer in the list and its restore entry`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-key".toCharArray())
+        val saved = repository.saveModels("p-1", listOf(entry("m-1"), entry("m-2")), "m-2")
+        repository.verify("p-1:m-2", textVerified(saved.revision))
+        repository.setActiveProvider("p-1")
+        assertEquals("m-2", repository.catalog().selectedModelId)
+
+        // The delete path passes the (now absent) old selection; saveModels must not persist it or its restore entry.
+        repository.saveModels("p-1", listOf(entry("m-1")), "m-2")
+
+        val catalog = repository.catalog()
+        assertNull(catalog.selectedModelId)
+        assertFalse(catalog.lastSelectedModelIdByProvider.containsKey("p-1"))
+    }
+
+    /** 0.52 I1: the one selection rule — present, image-capable and TEXT_REQUEST-verified at the current revision. */
+    @Test fun `switching restores the last model only when it is currently selectable`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1")), "m-1")
+        repository.verify("p-1:m-1", textVerified(1))
+        repository.saveProvider(provider("p-2", name = "Second"), "synthetic-second-key".toCharArray())
+        val second = repository.saveModels(
+            "p-2",
+            listOf(
+                entry("m-3").copy(inputs = setOf(InputModality.TEXT)),
+                entry("m-4"),
+                entry("m-5"),
+            ),
+            null,
+        )
+        repository.verify("p-2:m-5", textVerified(second.revision))
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                // m-4 exists and is image-capable but has no TEXT_REQUEST evidence: it must not be restored.
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-4"),
+            ),
+        )
+
+        repository.setActiveProvider("p-2")
+
+        val catalog = repository.catalog()
+        assertEquals("an unverified remembered model is skipped for the first tested image-capable row",
+            "m-5", catalog.selectedModelId)
+        assertEquals("m-5", catalog.lastSelectedModelIdByProvider["p-2"])
+    }
+
+    @Test fun `switching to a provider with no selectable model selects nothing and clears the restore entry`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1")), "m-1")
+        repository.verify("p-1:m-1", textVerified(1))
+        repository.saveProvider(provider("p-2", name = "Second"), "synthetic-second-key".toCharArray())
+        repository.saveModels(
+            "p-2",
+            listOf(entry("m-3").copy(inputs = setOf(InputModality.TEXT)), entry("m-4")),
+            null,
+        )
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-4"),
+            ),
+        )
+
+        repository.setActiveProvider("p-2")
+
+        val catalog = repository.catalog()
+        assertNull("no tested image-capable row: nothing may be auto-selected", catalog.selectedModelId)
+        assertFalse("the stale restore entry must not resurrect a model", catalog.lastSelectedModelIdByProvider.containsKey("p-2"))
+    }
+
     @Test fun `a new provider is stored with revision one and a staged credential`() {
         val blobs = Blobs()
         val credentials = Credentials()
@@ -415,16 +503,17 @@ class AndroidModelCatalogRepositoryTest {
             repository.catalog().copy(
                 activeProviderId = "p-1",
                 selectedModelId = "m-1",
-                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-3"),
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-4"),
             ),
         )
+        repository.verify("p-2:m-4", textVerified(repository.catalog().providers.first { it.id == "p-2" }.revision))
 
         repository.setActiveProvider("p-2")
 
         val catalog = repository.catalog()
         assertEquals("p-2", catalog.activeProviderId)
-        assertEquals("m-3", catalog.selectedModelId)
-        assertEquals("m-3", catalog.lastSelectedModelIdByProvider["p-2"])
+        assertEquals("the remembered model is restored when it is selectable", "m-4", catalog.selectedModelId)
+        assertEquals("m-4", catalog.lastSelectedModelIdByProvider["p-2"])
     }
 
     @Test fun `switching falls back to the first image capable model`() {
@@ -451,6 +540,7 @@ class AndroidModelCatalogRepositoryTest {
                 lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-missing"),
             ),
         )
+        repository.verify("p-2:m-4", textVerified(repository.catalog().providers.first { it.id == "p-2" }.revision))
 
         repository.setActiveProvider("p-2")
 
@@ -499,6 +589,7 @@ class AndroidModelCatalogRepositoryTest {
                 lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-3"),
             ),
         )
+        repository.verify("p-2:m-3", textVerified(repository.catalog().providers.first { it.id == "p-2" }.revision))
         val revisions = repository.catalog().providers.associate { it.id to it.revision }
         val notified = mutableListOf<Set<String>>()
         val subscription = repository.listenChanges { notified += it }

@@ -454,6 +454,9 @@ class ModelCatalogViewModelTest {
         repository.setActiveProvider("p-1")
         repository.setActiveProvider("p-2")
         repository.selectModel("m-4")
+        // I1: a restore only picks a model whose TEXT evidence matches the provider's current revision.
+        repository.verify("p-2:m-4", CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now))
+        repository.verify("p-1:m-1", CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now))
         repository.setActiveProvider("p-1")
         val model = viewModel(repository)
         model.enter()
@@ -520,12 +523,13 @@ class ModelCatalogViewModelTest {
     @Test
     fun `deleting the selected model falls back to the first image capable model`() {
         val repository = repository()
+        val current = CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now)
         save(repository, provider(
             "p-1",
             "One",
             entry("m-text", image = false),
             entry("m-image", image = true),
-            entry("m-image-2", image = true),
+            entry("m-image-2", image = true, verifications = listOf(current)),
         ))
         repository.setActiveProvider("p-1")
         repository.selectModel("m-image")
@@ -543,6 +547,50 @@ class ModelCatalogViewModelTest {
 
         assertNull("no image-capable row left, so nothing is selected", repository.catalog().selectedModelId)
         assertNull(model.state.value.selectedModel)
+    }
+
+    @Test
+    fun `deleting the selected model never auto-selects an untested image-capable row`() {
+        val repository = repository()
+        save(repository, provider(
+            "p-1",
+            "One",
+            entry("m-sel", verifications = listOf(
+                CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now))),
+            // Image-capable but never tested: the design's radio is disabled for it, so a delete fallback must not pick it.
+            entry("m-untested", image = true),
+        ))
+        repository.setActiveProvider("p-1")
+        repository.selectModel("m-sel")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.deleteModel("m-sel")
+        model.confirmPending()
+
+        assertNull("no tested image-capable candidate: leave the selection empty", repository.catalog().selectedModelId)
+        assertNull(model.state.value.selectedModel)
+    }
+
+    @Test
+    fun `selecting a gateway-removed model is refused even with fresh evidence`() {
+        val repository = repository()
+        val current = CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now)
+        save(repository, provider(
+            "p-1",
+            "One",
+            entry("m-ok", verifications = listOf(current)),
+            entry("m-removed", missing = true, verifications = listOf(current)),
+        ))
+        repository.setActiveProvider("p-1")
+        repository.selectModel("m-ok")
+        val model = viewModel(repository)
+        model.enter()
+
+        model.selectModel("m-removed")
+
+        assertEquals("该模型已被网关移除，无法选择", model.state.value.error)
+        assertEquals("the current choice stays", "m-ok", repository.catalog().selectedModelId)
     }
 
     @Test
@@ -618,13 +666,13 @@ class ModelCatalogViewModelTest {
 
         model.selectModel("m-1")
         assertEquals("请先在模型详情测试连接", model.state.value.error)
-        assertEquals("the failed selection leaves the previous choice in place", "m-pre", repository.catalog().selectedModelId)
+        assertNull("no row is auto-selected before its text test", repository.catalog().selectedModelId)
 
         val profileId = "p-1:m-1"
         repository.verify(profileId, CapabilityVerification(0, "TEXT_REQUEST", VerificationState.Verified, now))
         model.selectModel("m-1")
         assertEquals("evidence from a previous revision must not count", "请先在模型详情测试连接", model.state.value.error)
-        assertEquals("m-pre", repository.catalog().selectedModelId)
+        assertNull(repository.catalog().selectedModelId)
 
         repository.verify(profileId, CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now))
         model.selectModel("m-1")
@@ -706,19 +754,63 @@ class ModelCatalogViewModelTest {
     }
 
     @Test
-    fun `a missing selected model keeps the choice and warns`() {
+    fun `a selected model removed from the catalog is cleared on save`() {
         val repository = repository()
         save(repository, provider("p-1", "One", entry("m-1")))
         repository.setActiveProvider("p-1")
         repository.selectModel("m-1")
+        // I2: the model list no longer contains the selected id; the write must not keep pointing at it.
         repository.saveModels("p-1", emptyList(), selectedModelId = "m-1")
         val model = viewModel(repository)
         model.enter()
 
         assertNull(model.state.value.selectedModel)
-        assertNotNull(model.state.value.warning)
-        assertTrue("the warning tells the user to pick again", model.state.value.warning!!.contains("重新选择"))
-        assertEquals("the stored choice is not silently cleared", "m-1", repository.catalog().selectedModelId)
+        assertNull("the stored selection is cleared, not silently kept", repository.catalog().selectedModelId)
+        assertFalse(repository.catalog().lastSelectedModelIdByProvider.containsKey("p-1"))
+    }
+
+    @Test
+    fun `a gateway-removed selected model keeps the choice and warns`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1", missing = true)))
+        repository.setActiveProvider("p-1")
+        repository.saveModels(
+            "p-1",
+            requireNotNull(repository.catalog().activeProvider()).models,
+            selectedModelId = "m-1",
+        )
+        val model = viewModel(repository)
+        model.enter()
+
+        assertEquals("m-1", model.state.value.selectedModel?.id)
+        assertEquals(ModelCatalogUi.MISSING_GATEWAY, model.state.value.warning)
+    }
+
+    @Test
+    fun `a deleted model id is not resurrected by a later refresh`() {
+        val repository = repository()
+        save(repository, provider(
+            "p-1",
+            "One",
+            entry("m-1", verifications = listOf(
+                CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now))),
+        ))
+        repository.setActiveProvider("p-1")
+        val source = Source(ModelListResult.Success(listOf(snapshot("m-1")), truncated = false))
+        val model = viewModel(repository, source)
+        model.enter()
+
+        model.deleteModel("m-1")
+        model.confirmPending()
+        assertNull(repository.catalog().selectedModelId)
+
+        // The gateway offers the deleted id again; the stale restore entry must not turn it back into the selection.
+        model.refresh()
+
+        assertEquals("the refreshed row exists again", listOf("m-1"),
+            repository.catalog().activeProvider()?.models?.map { it.id })
+        assertNull("a deleted selection must not resurrect on refresh", repository.catalog().selectedModelId)
+        assertNull(model.state.value.selectedModel)
     }
 
     // ---------------------------------------------------------------------------------------------------------

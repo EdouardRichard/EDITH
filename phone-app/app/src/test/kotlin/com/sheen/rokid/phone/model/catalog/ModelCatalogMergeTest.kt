@@ -6,6 +6,7 @@ import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ThinkingEffort
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -119,6 +120,24 @@ class ModelCatalogMergeTest {
             previous,
         ).catalog.providers.single().models.single()
         assertEquals(previousEntry.copy(missing = false), refreshed)
+    }
+
+    @Test fun `a manual model the gateway omits stays available and is never marked missing`() {
+        // I3: a manual row was entered by the user, not fetched; a gateway that does not know it has not "removed" it.
+        val manual = entry(
+            id = "m-manual",
+            origin = ModelOrigin.MANUAL,
+            window = 123_456,
+            output = 4_096,
+            lastSeenAt = 7,
+        )
+        val refresh = applied(listOf(GatewayModel("gw-1")), catalog(provider(manual)))
+        val models = refresh.catalog.providers.single().models
+
+        assertEquals(listOf("gw-1", "m-manual"), models.map { it.id })
+        assertFalse("a manual row must never be marked 网关已移除", models.first { it.id == "m-manual" }.missing)
+        assertEquals("manual rows are not gateway-removed counts", 0, refresh.counts.missing)
+        assertEquals(123_456, models.first { it.id == "m-manual" }.contextWindowTokens)
     }
 
     @Test fun `a missing gateway model is flagged and kept`() {

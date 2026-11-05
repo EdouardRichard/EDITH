@@ -23,6 +23,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -148,6 +149,28 @@ class ModelCatalogJsonTest {
             encodedModel.keys,
         )
         assertEquals(setOf("enabled", "effort"), encodedModel.getValue("thinking").jsonObject.keys)
+    }
+
+    @Test fun `a selection absent from its provider models is dropped on decode`() {
+        // I2: a stale id must not survive a reload and resurrect a deleted model on the next save/refresh.
+        val encoded = ModelCatalogJson.encode(
+            ModelCatalog(
+                activeProviderId = "11111111-1111-1111-1111-111111111111",
+                selectedModelId = "deleted-model",
+                providers = listOf(provider()),
+                lastSelectedModelIdByProvider = mapOf(
+                    "11111111-1111-1111-1111-111111111111" to "deleted-model",
+                    "33333333-3333-3333-3333-333333333333" to "also-gone",
+                ),
+            ),
+        )
+
+        val decoded = ModelCatalogJson.decode(encoded)
+
+        assertNull("a selected id that is not in the active provider's models is not restored", decoded.selectedModelId)
+        assertFalse(decoded.lastSelectedModelIdByProvider.containsKey("11111111-1111-1111-1111-111111111111"))
+        assertFalse("entries for providers that no longer exist are dropped too",
+            decoded.lastSelectedModelIdByProvider.containsKey("33333333-3333-3333-3333-333333333333"))
     }
 
     @Test fun `a v1 or wrong version blob is refused without being rewritten`() {
