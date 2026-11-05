@@ -41,7 +41,7 @@ import org.junit.Test
  * - About renders the build version, not a literal;
  * - the T15 copy corrections are settled: the immediate 不拦截 switch no longer says 「保存后」, the shared restart
  *   sentence names only the settings that are really read at launch, and the bundle-readiness codes are Chinese;
- * - the model detail page's remaining user copy lives in its page object, and audio stays off in 0.52.
+ * - the model detail page's remaining user copy lives in its page object, and audio stays off in 0.5.3.
  */
 class SettingsCopyTest {
 
@@ -567,8 +567,13 @@ class SettingsCopyTest {
     }
 
     @Test
-    fun `model detail user copy lives in the page object and audio stays off in 052`() {
-        assertFalse("0.52 has no audio input path; the switch must stay off", ModelDetailUi.AUDIO_ENABLED)
+    fun `model detail user copy lives in the page object and audio stays off`() {
+        assertFalse("0.5.3 has no audio input path; the switch must stay off", ModelDetailUi.AUDIO_ENABLED)
+        assertEquals("未接入（后续版本评估开放）", ModelDetailUi.AUDIO_DISABLED)
+        assertFalse(
+            "the capped reserve means a small legal window still admits input; copy must not promise rejection",
+            ModelDetailUi.THINKING_WINDOW_HINT.contains("会被拒绝"),
+        )
         assertEquals("K tokens", ModelDetailUi.K_TOKENS)
         assertEquals("图片", ModelDetailUi.IMAGE)
         assertEquals("音频", ModelDetailUi.AUDIO)

@@ -181,7 +181,7 @@ object HelpContent {
     /** §5.6: text locked, image optional, audio reserved; the image-off and unverified consequences. */
     val MODEL_INPUT_IMAGE = HelpText(
         title = "支持的输入",
-        body = "文本是必选输入；图片可开关；音频预留但 0.52 未接入，0.53 开放。" +
+        body = "文本是必选输入；图片可开关；音频预留但未接入（后续版本评估开放）。" +
             "关闭图片后，该模型不可用于助手会话，模型列表的该行显示「不支持图片，助手不可用」，单选禁用。" +
             "图片未测试时显示「未验证」，不影响选择，但会在首页/模型页提示风险。",
         impact = "影响：保存后立即生效",

@@ -260,6 +260,34 @@ class ChatCompletionsDecoderTest {
         assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
     }
 
+    @Test fun `two parallel tool call indexes aggregate independently`() {
+        // M10 review gap: a provider may stream several calls in one turn, each identified only by its
+        // `tool_calls[].index`. The decoder keys them by that index; nothing pinned the parallel case, where a shared
+        // buffer or a single "current call" would merge two calls into one and pair the wrong arguments with a name.
+        val decoder = ChatCompletionsDecoder("q")
+
+        val opening = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"ci"}},{"index":1,"id":"call_2","type":"function","function":{"name":"weather","arguments":"{\"day"}}]},"index":0}]}"""))
+        assertEquals(
+            listOf(
+                ModelStreamEvent.ToolCallDelta("q", "chat:0", "lookup", "{\"ci"),
+                ModelStreamEvent.ToolCallDelta("q", "chat:1", "weather", "{\"day"),
+            ),
+            opening,
+            "each index keeps its own name and argument stream",
+        )
+
+        val finishing = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Hangzhou\"}"}},{"index":1,"function":{"arguments":"\":\"today\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"""))
+
+        val calls = finishing.filterIsInstance<ModelStreamEvent.ToolCallTerminal>()
+        assertEquals(listOf("call_1", "call_2"), calls.map { it.callId })
+        assertEquals(listOf("lookup", "weather"), calls.map { it.name })
+        assertEquals(listOf("chat:0", "chat:1"), calls.map { it.itemId })
+        assertEquals(listOf("""{"city":"Hangzhou"}""", """{"day":"today"}"""), calls.map { it.argsJson })
+        assertEquals(ModelEnd.COMPLETED, finishing.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
     // ------------------------------------------------------------ review round 1 fixes
 
     @Test fun `a whitespace-only reasoning fragment is ignored and the turn survives`() {

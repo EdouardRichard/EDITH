@@ -195,17 +195,20 @@ class ModelDetailStateTest {
             ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
         )
         assertEquals(
-            "若模型的上下文窗口小于「官方默认输出（64K/128K）+ 安全余量（256 tokens）」，开启思考后请求会因预算不足被拒绝；" +
-                "DeepSeek V4.1 Flash 的窗口为 1M。",
+            "窗口较小时预算按 8K 最小输入余量封顶，长请求可能放不下；DeepSeek V4.1 Flash 的 1M 窗口无此问题。",
             ModelDetailUi.THINKING_WINDOW_HINT,
+        )
+        assertFalse(
+            "the reserve is capped so a legal small window still admits ~8K input; a flat rejection claim is false",
+            ModelDetailUi.THINKING_WINDOW_HINT.contains("会被拒绝"),
         )
     }
 
-    // Brief case: `audio is always disabled and labelled for 0.53` (0.53 contains a dot, illegal in a JVM method name).
+    // Brief case: `audio is always disabled and labelled as not connected` (a dot is illegal in a JVM method name).
     @Test
-    fun `audio is always disabled and labelled for the next release`() {
-        assertEquals("0.52 未接入，0.53 开放", ModelDetailUi.AUDIO_DISABLED)
-        assertFalse("0.52 has no audio input", ModelDetailUi.AUDIO_ENABLED)
+    fun `audio is always disabled and labelled as not connected`() {
+        assertEquals("未接入（后续版本评估开放）", ModelDetailUi.AUDIO_DISABLED)
+        assertFalse("0.5.3 has no audio input path", ModelDetailUi.AUDIO_ENABLED)
 
         // An audio declaration that predates 0.52 is preserved, never editable, and never added by an edit.
         val previous = entry(inputs = setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO))

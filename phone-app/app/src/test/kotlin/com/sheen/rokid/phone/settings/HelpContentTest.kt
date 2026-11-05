@@ -163,7 +163,7 @@ class HelpContentTest {
         assertTrue(HelpContent.MODEL_OUTPUT.body.contains("最大输出"))
         assertTrue(HelpContent.MODEL_OUTPUT.body.contains("输入预算"))
 
-        assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("0.52 未接入，0.53 开放"))
+        assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("未接入（后续版本评估开放）"))
         assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("不支持图片，助手不可用"))
         assertTrue(HelpContent.MODEL_INPUT_IMAGE.body.contains("未验证"))
 

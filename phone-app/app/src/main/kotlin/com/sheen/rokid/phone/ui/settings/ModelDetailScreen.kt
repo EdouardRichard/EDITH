@@ -170,10 +170,11 @@ internal data class ModelDetailErrors(
  * 0.52 design §§5.6/5.7 and 0.53 design §§5.7/T9: the detail page's fixed copy and its pure display rules.
  *
  * Every user-visible string the page draws lives here, including the field units, the input rows, the footer and the
- * delete confirmation (Task 15). The audio row is deliberately a constant, not a stored field: 0.52 has no audio input
- * path and the switch stays disabled until 0.53 ([AUDIO_ENABLED] is wired to `checked` so the row cannot drift into a
- * different default). 0.53 ruling A keeps the thinking block always visible and always operable, with two notices
- * instead of family detection: DeepSeek-only support, and the official output-default/caveat wording.
+ * delete confirmation (Task 15). The audio row is deliberately a constant, not a stored field: 0.5.3 has no audio input
+ * path and the switch stays disabled pending a later release ([AUDIO_ENABLED] is wired to `checked` so the row cannot
+ * drift into a different default). 0.53 ruling A keeps the thinking block always visible and always operable, with three
+ * notices instead of family detection: DeepSeek-only support, the official output-default/caveat wording, and the
+ * small-window budget caveat.
  */
 internal object ModelDetailUi {
     const val MODEL_ID = "模型 ID"
@@ -196,7 +197,7 @@ internal object ModelDetailUi {
     const val AUDIO = "音频"
     const val IMAGE_SWITCH = "模型图片输入"
     const val AUDIO_SWITCH = "模型音频输入"
-    const val AUDIO_DISABLED = "0.52 未接入，0.53 开放"
+    const val AUDIO_DISABLED = "未接入（后续版本评估开放）"
     const val AUDIO_ENABLED = false
 
     const val THINKING = "深度思考"
@@ -210,11 +211,12 @@ internal object ModelDetailUi {
     const val THINKING_DEFAULT_BUDGET_HINT =
         "开启后工具回合保留思考，输出预算按官方默认 64K/128K。关闭表示不主动请求深度思考；" +
             "DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。"
-    // 0.53 ruling B consequence: the official output default is reserved out of the window before input, so a small
-    // window cannot fit an enabled round. One sentence only - the owner asked for a notice, not a new validation.
+    // 0.53 ruling B consequence: the official output default is reserved out of the window before input, but the
+    // reservation is capped so at least MIN_INPUT_TOKENS (8K) of prompt still fits. A legal 64K/100K/128K window
+    // therefore still admits input; whether a long request fits depends on its size, not on the window alone. One
+    // sentence only - the owner asked for a notice, not a new validation.
     const val THINKING_WINDOW_HINT =
-        "若模型的上下文窗口小于「官方默认输出（64K/128K）+ 安全余量（256 tokens）」，开启思考后请求会因预算不足被拒绝；" +
-            "DeepSeek V4.1 Flash 的窗口为 1M。"
+        "窗口较小时预算按 8K 最小输入余量封顶，长请求可能放不下；DeepSeek V4.1 Flash 的 1M 窗口无此问题。"
 
     const val TEST_TITLE = "连接测试"
     const val TEST_TEXT = "文本测试"
@@ -573,8 +575,8 @@ private fun DetailBody(
             onCheckedChange = null,
             enabled = false,
             // `Switch` only publishes `Disabled` through the toggleable semantics it installs for a change handler;
-            // with no handler the switch is inert but would still be announced as an enabled control. State the
-            // 0.52 reservation's disabled state explicitly so accessibility matches what the row says and does.
+            // with no handler the switch is inert but would still be announced as an enabled control. State the audio
+            // reservation's disabled state explicitly so accessibility matches what the row says and does.
             modifier = Modifier.semantics {
                 contentDescription = ModelDetailUi.AUDIO_SWITCH
                 disabled()

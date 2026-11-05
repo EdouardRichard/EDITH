@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.SegmentOrigin
+import com.sheen.rokid.agent.SegmentRole
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
@@ -31,6 +32,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -139,6 +141,30 @@ class TurnTranscriptRecordTest {
         assertFalse(entry.containsKey("images"), "a plain output must not invent an images member: ${segment.text}")
         assertEquals("call-1", entry["callId"]?.jsonPrimitive?.content)
         assertEquals("done", entry["output"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `an assistant text carries its reasoning through toSegment`() {
+        // M10 review gap: `toSegment()` is the one channel that puts the store's reasoning back into a request frame.
+        // The renderer already did this; nothing pinned it, so a later simplification could silently drop the chain of
+        // thought and the DeepSeek replay rule would break without a failing test.
+        val item = ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想")
+
+        val segment = item.toSegment()
+
+        assertEquals(SegmentOrigin.TRANSCRIPT, segment.origin)
+        assertEquals(SegmentRole.ASSISTANT, segment.role)
+        assertTrue(segment.trusted)
+        assertEquals("答", segment.text)
+        assertEquals("旧想", segment.reasoning, "the assistant reasoning must survive the frame renderer")
+    }
+
+    @Test
+    fun `a user text never gains reasoning through toSegment`() {
+        val segment = ModelHistoryItem.Text(MessageRole.USER, "问").toSegment()
+
+        assertEquals(SegmentRole.USER, segment.role)
+        assertNull(segment.reasoning)
     }
 
     // ------------------------------------------------------------ store → frame → gateway

@@ -239,4 +239,27 @@ class DiagnosticTextPluginTest {
         // The diagnostic plugin drives no tools, so a tool event must not produce a hint by itself.
         assertEquals(listOf("建议。"), outputs.map { it.text })
     }
+
+    @Test fun `reasoning deltas are ignored and never become diagnostic output`() {
+        // M10 review gap (0.53): a chain of thought is internal state, not a diagnostic suggestion. The plugin ignores
+        // ReasoningDelta on both the stream and the flush path; this pins that so a future "show everything" change
+        // cannot display the model's reasoning as the wearer-facing hint.
+        val t = trace(); val p = plugin(trace = t)
+        duringRequest = { r, cb ->
+            cb(ModelStreamEvent.ReasoningDelta(r.requestId, "SECRET-REASONING"))
+            cb(ModelStreamEvent.ReasoningDelta(r.requestId, "另一段思考"))
+        }
+        p.handle(transcript()); help(p)
+        tick()
+        assertTrue(outputs.isEmpty(), "reasoning alone must not produce a hint")
+        assertFalse("FIRST_TOKEN" in marks(t), "reasoning is not answer content and must not count as a token")
+
+        callbacks.single()(ModelStreamEvent.TextDelta(requests.single().requestId, "建议。"))
+        callbacks.single()(ModelStreamEvent.Terminal(requests.single().requestId, ModelEnd.COMPLETED, null, null))
+        tick()
+
+        assertEquals(listOf("建议。"), outputs.map { it.text })
+        assertFalse(outputs.single().text.contains("SECRET-REASONING"))
+        p.deactivate(DeactivationReason.Stopped)
+    }
 }
