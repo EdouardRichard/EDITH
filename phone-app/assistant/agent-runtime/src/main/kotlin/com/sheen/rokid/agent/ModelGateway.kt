@@ -116,4 +116,10 @@ data class GatewayReply(
      * [AgentRun.metrics] `overflows`, adding one when the reply is the terminal `CONTEXT_OVERFLOW` verdict.
      */
     val overflowRecoveries: Int = 0,
+    /**
+     * 0.53: the chain of thought this model turn produced, or `null` when the model produced none (thinking disabled,
+     * a non-DeepSeek profile, or a turn that never streamed reasoning). It is **not** answer text: the display never
+     * renders it, and only the DeepSeek adapters replay it. Redacted by every `toString()` in the contract.
+     */
+    val reasoning: String? = null,
 )

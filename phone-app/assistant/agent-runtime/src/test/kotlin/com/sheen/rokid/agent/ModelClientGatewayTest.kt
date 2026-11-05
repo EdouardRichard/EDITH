@@ -56,8 +56,9 @@ class ModelClientGatewayTest {
         client: com.sheen.rokid.plugin.ModelClient,
         stop: () -> Boolean = { false },
         audioParts: (() -> List<InputPart>)? = null,
+        metricLine: (String) -> Unit = {},
     ) =
-        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, audioParts)
+        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, audioParts, metricLine)
 
     private fun turn(
         turnId: String = "turn-7",
@@ -525,6 +526,64 @@ class ModelClientGatewayTest {
         val reply = gateway(client).turn(turn(deadlineNanos = 1_000_000_000L))
 
         assertEquals(ModelEnd.COMPLETED, reply.terminal)
+    }
+
+    // ------------------------------------------------------------ 6b. reasoning (0.53)
+
+    @Test fun `a thinking turn keeps its reasoning on the reply without touching the answer text`() {
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "先想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        val reply = gateway(client).turn(turn())
+
+        assertEquals("先想", reply.reasoning)
+        assertEquals("答", reply.text)
+        assertFalse(reply.text.contains("先想"))
+    }
+
+    @Test fun `a turn that ends without a terminal keeps the reasoning it already received`() {
+        // The client consumes the stream on the caller's thread and never sends a terminal: the turn is a failed
+        // no-verdict turn, and the chain of thought it did stream must still ride up for the diagnostic count.
+        val client = FakeModelClient { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, "想到一半"))
+            clock.advance(2_000_000_000L)
+        }
+
+        val reply = gateway(client).turn(turn(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals("NO_TERMINAL", reply.safeCode)
+        assertEquals("想到一半", reply.reasoning)
+    }
+
+    @Test fun `the thinking metric line carries counts only and never the reasoning text`() {
+        val lines = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingEnabled = true,
+                thinkingSupported = true,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.HIGH,
+            )
+        }
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "问"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想"),
+            ModelHistoryItem.Text(MessageRole.USER, "再问"),
+        )
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "新想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        gateway(client, metricLine = { lines += it }).turn(turn(history = history))
+
+        val line = lines.single { it.startsWith("P3_THINKING") }
+        assertEquals("P3_THINKING active=true effort=high reasoningChars=2 replayChars=2", line)
+        assertFalse(line.contains("新想") || line.contains("旧想"))
     }
 
     // ------------------------------------------------------------ 7. stop

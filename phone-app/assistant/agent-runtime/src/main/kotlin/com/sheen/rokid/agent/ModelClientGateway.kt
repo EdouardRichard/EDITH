@@ -319,7 +319,26 @@ class ModelClientGateway(
     ): GatewayReply {
         val reply = sendTurnOnce(request, modelRequest)
         emitCacheMetric(request, reply, sentFrame)
+        emitThinkingMetric(request, reply, modelRequest)
         return reply
+    }
+
+    /**
+     * 0.53: the count-only `P3_THINKING` line of one model request.
+     *
+     * `active` is the profile's configuration (not whether this particular stream happened to produce reasoning), so a
+     * device log can tell "thinking off" from "thinking on but the model reasoned nothing". `reasoningChars` and
+     * `replayChars` are character counts only — no reasoning text ever rides this line, exactly like `P3_CACHE`.
+     */
+    private fun emitThinkingMetric(request: GatewayTurn, reply: GatewayReply, modelRequest: ModelRequest) {
+        val profile = profileLookup(request.profileId) ?: return
+        val active = profile.thinkingSupported && profile.thinkingEnabled
+        val effort = if (active) profile.thinkingEffort.name.lowercase() else "-"
+        val reasoningChars = reply.reasoning?.length ?: 0
+        val replayChars = modelRequest.history.filterIsInstance<ModelHistoryItem.Text>()
+            .sumOf { it.reasoning?.length ?: 0 }
+        val line = "P3_THINKING active=$active effort=$effort reasoningChars=$reasoningChars replayChars=$replayChars"
+        runCatching { metricLine(line) }
     }
 
     /**
@@ -380,14 +399,20 @@ class ModelClientGateway(
             // verdict; waiting further could only burn the deadline.
             if (accumulated.sawSynchronousEvent) {
                 handle.cancel()
-                return GatewayReply(emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL)
+                return GatewayReply(
+                    emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL,
+                    reasoning = accumulated.reasoningText(),
+                )
             }
             while (true) {
                 if (stop()) return cancel(handle, accumulated)
                 if (accumulated.settled) return reply(accumulated)
                 if (clock.nowNanos() >= request.deadlineNanos) {
                     handle.cancel()
-                    return GatewayReply(emptyList(), accumulated.text(), ModelEnd.DEADLINE, DEADLINE)
+                    return GatewayReply(
+                        emptyList(), accumulated.text(), ModelEnd.DEADLINE, DEADLINE,
+                        reasoning = accumulated.reasoningText(),
+                    )
                 }
                 accumulated.waitForStep(WAIT_STEP_MILLIS)
             }
@@ -407,12 +432,16 @@ class ModelClientGateway(
         // real and rides the cancelled reply up to the run.
         return GatewayReply(
             emptyList(), accumulated.text(), ModelEnd.CANCELLED, CANCELLED, accumulated.terminal?.usage,
+            reasoning = accumulated.reasoningText(),
         )
     }
 
     private fun reply(accumulated: Accumulated): GatewayReply {
         val terminal = accumulated.terminal
-            ?: return GatewayReply(emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL)
+            ?: return GatewayReply(
+                emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL,
+                reasoning = accumulated.reasoningText(),
+            )
         val calls = accumulated.calls()
         val text = accumulated.text()
         // A verdict the transport already delivered (FAILED / DEADLINE / CANCELLED) is not softened. An otherwise
@@ -424,9 +453,15 @@ class ModelClientGateway(
             // Keep the provider's own machine-readable reason when it sent one: re-labelling the verdict must not erase
             // what the transport actually reported. The token accounting survives the re-label for the same reason.
             val code = terminal.safeCode?.let { "$TOOL_CALL_DELIVERY_INCOMPLETE:$it" } ?: TOOL_CALL_DELIVERY_INCOMPLETE
-            GatewayReply(emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage)
+            GatewayReply(
+                emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage,
+                reasoning = accumulated.reasoningText(),
+            )
         } else {
-            GatewayReply(calls, text, terminal.end, terminal.safeCode, terminal.usage)
+            GatewayReply(
+                calls, text, terminal.end, terminal.safeCode, terminal.usage,
+                reasoning = accumulated.reasoningText(),
+            )
         }
     }
 
@@ -721,6 +756,8 @@ class ModelClientGateway(
         private val lock = ReentrantLock()
         private val ready = lock.newCondition()
         private val text = StringBuilder()
+        /** 0.53: the chain of thought of this turn, accumulated exactly like the answer text but never displayed. */
+        private val reasoning = StringBuilder()
         private val deltaItems = LinkedHashSet<String>()
         private val terminalItems = LinkedHashSet<String>()
         private val terminalCalls = mutableListOf<ModelStreamEvent.ToolCallTerminal>()
@@ -733,6 +770,9 @@ class ModelClientGateway(
         val hasDanglingDelta: Boolean get() = lock.withLock { deltaItems.any { it !in terminalItems } }
 
         fun text(): String = lock.withLock { text.toString() }
+
+        /** The turn's chain of thought, or `null` when it streamed none. Never part of the answer text. */
+        fun reasoningText(): String? = lock.withLock { reasoning.toString().ifBlank { null } }
 
         fun calls(): List<ToolCall> = lock.withLock {
             terminalCalls.map { ToolCall(it.callId, it.name, it.argsJson, it.itemId) }
@@ -749,6 +789,11 @@ class ModelClientGateway(
                         // Only text is a display increment; the other events stay internal to the accumulation, so
                         // the observer is called exactly once per accepted answer chunk.
                         true
+                    }
+                    is ModelStreamEvent.ReasoningDelta -> {
+                        // 0.53: internal state, never a display increment and never part of the answer text.
+                        reasoning.append(event.text)
+                        false
                     }
                     is ModelStreamEvent.ToolCallDelta -> {
                         deltaItems += event.itemId
