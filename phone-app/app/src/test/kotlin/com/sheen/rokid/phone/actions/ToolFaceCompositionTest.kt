@@ -8,12 +8,12 @@ import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /**
- * edith-0.3 Phase 4A Task 4 (A4), updated 0.5.4 Task 14: the **production composition**
- * (`HostCompositionRoot.create`) installs the 22-host-tool `ToolSurface` as the one `Capability.Actions` provider.
+ * edith-0.3 Phase 4A Task 4 (A4), updated 0.5.4 Task 15: the **production composition**
+ * (`HostCompositionRoot.create`) installs the 23-host-tool `ToolSurface` as the one `Capability.Actions` provider.
  *
  * The JVM composition is the honest environment for this test: the accessibility service is not bound and Shizuku's
  * binder is absent, so every channel-dependent leg is down. That is exactly the state the stable-advertising rule is
- * about — the face must stay 22 and `execute` must refuse, not disappear.
+ * about — the face must stay 23 and `execute` must refuse, not disappear.
  */
 class ToolFaceCompositionTest {
 
@@ -28,12 +28,14 @@ class ToolFaceCompositionTest {
         "list_apps", "system_action",
         // 0.5.4 Task 14: the app-process ACTION_VIEW deep-link leg
         "deep_link",
+        // 0.5.4 Task 15: the notification-listener media-session control leg
+        "media",
         // the umbrella catalog
         "device", "shell", "open", "dial",
     )
 
     @Test
-    fun `the production composition wires the 22 host tools into the one Actions surface`() {
+    fun `the production composition wires the 23 host tools into the one Actions surface`() {
         val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
         try {
             val surface = requireNotNull(root.toolSurfaceForProbe) {
@@ -42,8 +44,8 @@ class ToolFaceCompositionTest {
 
             val names = surface.descriptors().map { it.name }
 
-            assertEquals(22, names.size)
-            assertEquals("no duplicate name may be advertised", 22, names.toSet().size)
+            assertEquals(23, names.size)
+            assertEquals("no duplicate name may be advertised", 23, names.toSet().size)
             assertEquals(hostNames, names)
             assertEquals("a second read is the same fixed schema", names, surface.descriptors().map { it.name })
 
@@ -73,7 +75,7 @@ class ToolFaceCompositionTest {
     }
 
     @Test
-    fun `a blind JVM composition keeps the 22 advertised and refuses the channel dependent legs`() {
+    fun `a blind JVM composition keeps the 23 advertised and refuses the channel dependent legs`() {
         val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
         try {
             val surface = requireNotNull(root.toolSurfaceForProbe)
@@ -92,6 +94,12 @@ class ToolFaceCompositionTest {
             assertEquals(ActionOutcome.Refused, clearData.outcome)
             assertEquals("ACTION_CHANNEL_UNAVAILABLE", clearData.detail)
 
+            // `media` reads the notification listener, which is unbound on the JVM: the honest answer is the access
+            // refusal, never an empty session list (that would be indistinguishable from "no media is playing").
+            val media = surface.execute("media", """{"action":"list"}""")
+            assertEquals(ActionOutcome.Refused, media.outcome)
+            assertEquals("NO_NOTIFICATION_ACCESS", media.execution?.code)
+
             // The umbrella refusal is proven through `shell`, not `device observe`: on a JVM the absent KeyguardManager
             // reads as a locked phone, so `device`/`open`/`dial` intentionally enter the unlock gate and wait there.
             // `shell` has no unlock gate (a privileged command needs no UI), so it answers the catalog's stable refusal.
@@ -100,7 +108,7 @@ class ToolFaceCompositionTest {
             assertEquals("CHANNEL_UNAVAILABLE", shell.execution?.code)
 
             // Nothing above may have changed the advertised schema.
-            assertEquals(22, surface.descriptors().size)
+            assertEquals(23, surface.descriptors().size)
         } finally {
             root.close()
         }

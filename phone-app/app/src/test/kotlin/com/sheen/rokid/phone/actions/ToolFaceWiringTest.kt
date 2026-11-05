@@ -33,6 +33,10 @@ import com.sheen.rokid.phone.actions.intent.IntentAtomicExecutor
 import com.sheen.rokid.phone.actions.intent.IntentLauncher
 import com.sheen.rokid.phone.actions.intent.LaunchAppExecutor
 import com.sheen.rokid.phone.actions.intent.SystemActionExecutor
+import com.sheen.rokid.phone.actions.media.MediaControlPort
+import com.sheen.rokid.phone.actions.media.MediaControlResult
+import com.sheen.rokid.phone.actions.media.MediaSessionInfo
+import com.sheen.rokid.phone.actions.media.MediaTool
 import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
 import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.phone.actions.shizuku.ShizukuExecutionBackend
@@ -47,13 +51,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * edith-0.3 Phase 4A Task 4 (A4): the production-shaped host face — 18 atomic tools plus the umbrella catalog's four —
+ * edith-0.3 Phase 4A Task 4 (A4): the production-shaped host face — 19 atomic tools plus the umbrella catalog's four —
  * is **one** `ActionExecutor` with stable advertising.
  *
  * What is pinned here, and why each half matters:
- * - the 22 names, in the fixed order the composition builds (`a11y`, intent without `dial`, Shizuku, launch, system,
- *   deep link, catalog), because a tool table that changes shape between reads would also change the cached prompt
- *   prefix;
+ * - the 23 names, in the fixed order the composition builds (`a11y`, intent without `dial`, Shizuku, launch, system,
+ *   deep link, media, catalog), because a tool table that changes shape between reads would also change the cached
+ *   prompt prefix;
  * - `dial` has exactly one owner and it is the catalog's L1 `DialTool`; the legacy L2 row inside `IntentActionExecutor`
  *   stays reachable only through that tool, never as its own advertised action (the surface refuses a duplicate name at
  *   construction, so the filter is load-bearing rather than cosmetic);
@@ -67,7 +71,7 @@ class ToolFaceWiringTest {
 
     // ── the expected host face ───────────────────────────────────────────────────────────────────────────────
 
-    /** The 18 atomic descriptors, grouped the way the six backends declare them. */
+    /** The 19 atomic descriptors, grouped the way the seven backends declare them. */
     private val atomicNames = listOf(
         // accessibility (atomic perception/operation)
         "read_screen", "tap", "long_press", "scroll", "input_text",
@@ -81,6 +85,8 @@ class ToolFaceWiringTest {
         "system_action",
         // 0.5.4 Task 14: the app-process ACTION_VIEW deep-link leg
         "deep_link",
+        // 0.5.4 Task 15: the notification-listener media-session control leg
+        "media",
     )
 
     /** The umbrella catalog's four, in its own descriptor order. */
@@ -140,24 +146,27 @@ class ToolFaceWiringTest {
             // 0.5.4 Task 14: the deep-link leg owns no channel and no turn state; the exercised host-face paths here
             // never call its launcher, so the fake answers NoHandler if a test ever routes a name to it.
             AtomicActionExecutor(DeepLinkTool(launcher = NeverAskedDeepLinkLauncher)),
+            // 0.5.4 Task 15: the media leg reads the notification listener at call time; this suite never routes a
+            // media name to it, so the fake refuses the same way a missing grant would.
+            AtomicActionExecutor(MediaTool(NeverAskedMediaPort)),
         )
         return HostFace(ToolSurface(catalog, atomic), intent, atomicIntent, launcher, shell)
     }
 
-    // ── the 22-name host face ───────────────────────────────────────────────────────────────────────────────
+    // ── the 23-name host face ───────────────────────────────────────────────────────────────────────────────
 
     @Test
-    fun `the host face advertises the eighteen atomic tools then the catalog's four`() {
+    fun `the host face advertises the nineteen atomic tools then the catalog's four`() {
         val names = hostFace().surface.descriptors().map { it.name }
 
         assertEquals(atomicNames.size, names.count { it in atomicNames })
-        assertEquals(18, atomicNames.size)
+        assertEquals(19, atomicNames.size)
         assertEquals(hostNames, names)
-        assertEquals("22 distinct names, no duplicate", 22, names.toSet().size)
+        assertEquals("23 distinct names, no duplicate", 23, names.toSet().size)
     }
 
     @Test
-    fun `every read advertises the same 22 names`() {
+    fun `every read advertises the same 23 names`() {
         val surface = hostFace().surface
 
         val first = surface.descriptors().map { it.name }
@@ -205,7 +214,7 @@ class ToolFaceWiringTest {
     // ── stable advertising across channel states ─────────────────────────────────────────────────────────────
 
     @Test
-    fun `a down accessibility channel keeps all 22 advertised and refuses without asking the UI`() {
+    fun `a down accessibility channel keeps all 23 advertised and refuses without asking the UI`() {
         var up = false
         val face = hostFace(a11y = { up })
 
@@ -225,7 +234,7 @@ class ToolFaceWiringTest {
     }
 
     @Test
-    fun `a down Shizuku channel keeps all 22 advertised and runs no command`() {
+    fun `a down Shizuku channel keeps all 23 advertised and runs no command`() {
         var up = false
         val face = hostFace(shizuku = { up })
 
@@ -383,6 +392,14 @@ class ToolFaceWiringTest {
     private object NeverAskedDeepLinkLauncher : DeepLinkLauncher {
         override fun launch(uri: String, packageName: String?): DeepLinkLaunchResult =
             DeepLinkLaunchResult.NoHandler
+    }
+
+    /** The media leg is never executed here; a routed call answers as if notification access were missing. */
+    private object NeverAskedMediaPort : MediaControlPort {
+        override fun list(): List<MediaSessionInfo> = emptyList()
+
+        override fun control(action: String, packageName: String?, positionMs: Long?): MediaControlResult =
+            MediaControlResult.NoPermission
     }
 
     /** Every UI call is unexpected: the only a11y-down paths that reach the backend must stop at its `connected` gate. */

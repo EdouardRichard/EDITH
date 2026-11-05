@@ -22,10 +22,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * edith-0.3 Phase 4A Task 5 (A5): the **description contract** of the 24-tool default face.
+ * edith-0.3 Phase 4A Task 5 (A5): the **description contract** of the 25-tool default face.
  *
- * The face is read from production, never from a hand-written fixture: `HostCompositionRoot.create` supplies the 22
- * host descriptors (18 atomic + the 4 umbrella catalog tools) exactly as the JVM composition wires them, and the
+ * The face is read from production, never from a hand-written fixture: `HostCompositionRoot.create` supplies the 23
+ * host descriptors (19 atomic + the 4 umbrella catalog tools) exactly as the JVM composition wires them, and the
  * plugin's own two executors supply `notify_user`/`load_skill`. Those are the same objects the tool registry projects
  * into the model schema, so a description asserted here is the one the model receives.
  *
@@ -35,12 +35,12 @@ import org.junit.Test
 class ToolContractTest {
 
     @Test
-    fun `the default face is exactly the twenty four described tools`() {
+    fun `the default face is exactly the twenty five described tools`() {
         val face = ToolFaceFixture.face()
 
-        assertEquals("the default face is 24 tools", 24, face.size)
+        assertEquals("the default face is 25 tools", 25, face.size)
         assertEquals(
-            "the model-visible names are the spec's 24, whatever the executors' order",
+            "the model-visible names are the spec's 25, whatever the executors' order",
             ToolFaceFixture.DEFAULT_FACE,
             face.keys,
         )
@@ -248,6 +248,7 @@ class ToolContractTest {
             "list_apps" to emptyList(),
             "system_action" to listOf("action"),
             "deep_link" to listOf("uri", "package"),
+            "media" to listOf("action", "package", "position_ms"),
             "device" to listOf("action"),
             "shell" to listOf("command"),
             "open" to listOf("target"),
@@ -287,6 +288,14 @@ class ToolContractTest {
                 "BROWSER_FALLBACK",
                 "UNVERIFIED",
             ),
+            "media" to listOf(
+                "AMBIGUOUS_SESSION",
+                "NO_SESSION",
+                "NO_NOTIFICATION_ACCESS",
+                "ACTION_UNSUPPORTED",
+                "NO_STATE_CHANGE",
+                "SESSION_GONE",
+            ),
             "device" to listOf("STALE_REF"),
             "shell" to listOf("SHELL_NOT_BOUND"),
             "open" to listOf("APP_AMBIGUOUS"),
@@ -298,7 +307,7 @@ class ToolContractTest {
 }
 
 /**
- * The default 24-tool face, assembled from the production executors. Test code only: both the contract and the routing
+ * The default 25-tool face, assembled from the production executors. Test code only: both the contract and the routing
  * suite read this one fixture, so neither can drift into a hand-written stand-in for the composition.
  */
 internal object ToolFaceFixture {
@@ -314,6 +323,8 @@ internal object ToolFaceFixture {
         "list_apps", "system_action",
         // 0.5.4 Task 14: the app-process ACTION_VIEW deep-link leg
         "deep_link",
+        // 0.5.4 Task 15: the notification-listener media-session control leg
+        "media",
         // the umbrella catalog
         "device", "shell", "open", "dial",
         // the plugin's delivery tools

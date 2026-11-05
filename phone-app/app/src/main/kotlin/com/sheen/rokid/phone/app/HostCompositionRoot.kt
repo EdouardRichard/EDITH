@@ -175,6 +175,8 @@ import com.sheen.rokid.phone.actions.device.ShellTool
 import com.sheen.rokid.phone.actions.device.ToolCatalog
 import com.sheen.rokid.phone.actions.deeplink.ContextDeepLinkLauncher
 import com.sheen.rokid.phone.actions.deeplink.DeepLinkTool
+import com.sheen.rokid.phone.actions.media.AndroidMediaControlPort
+import com.sheen.rokid.phone.actions.media.MediaTool
 import com.sheen.rokid.phone.lock.KeystoreLockPinStore
 import com.sheen.rokid.phone.lock.LockPinStore
 import com.sheen.rokid.phone.lock.LockPinValidator
@@ -3881,7 +3883,7 @@ class HostCompositionRoot internal constructor(
                 })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
-            // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed
+            // four verified tools plus the atomic channel legs, 23 descriptors in all. The advertised set is fixed
             // (A3): each channel is asked per call, never at read time, so a channel that goes down refuses rather than
             // disappearing from the model's table.
             val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
@@ -3972,10 +3974,10 @@ class HostCompositionRoot internal constructor(
                 glassesConnected = { hintLink.isEstablished() },
                 glassesWearing = { rootHolder[0]?.glassesWearing() },
             )
-            // ---- 0.3 Phase 4A Task 4: the 22-host-tool surface (spec §4.1/§4.2) ---------------------------------------
+            // ---- 0.3 Phase 4A Task 4: the 23-host-tool surface (spec §4.1/§4.2) ---------------------------------------
             // `ToolCatalog` is the umbrella half: four host tools (`device`/`shell`/`open`/`dial`) that stay advertised
-            // in every channel state (A3). The atomic legs built below it add the 18 fast-path tools, and the plugin
-            // adds `notify_user`/`load_skill` beside the surface - 24 model-visible tools in all. The old 21-tool
+            // in every channel state (A3). The atomic legs built below it add the 19 fast-path tools, and the plugin
+            // adds `notify_user`/`load_skill` beside the surface - 25 model-visible tools in all. The old 21-tool
             // `ExecutionRouter` remains retired from production.
             //
             // The accessibility port is resolved per call through the service's companion: the user can switch the
@@ -4121,13 +4123,13 @@ class HostCompositionRoot internal constructor(
                 observe = toolObservation,
                 capture = { perception.screenshot() },
             )
-            // ---- edith-0.3 Phase 4A Task 4 (A4): the 22-host-tool face ------------------------------------------
-            // `toolCatalog` is the umbrella half (the verified, structured path). The six atomic backends beside it are
-            // the fast path the model may choose instead: one leg per channel (plus 0.5.4's app-process `deep_link`
-            // leg), each answering its own `available()` at call time. `ToolSurface` is the **one**
-            // `Capability.Actions` provider over both halves - 18 atomic descriptors plus the catalog's four = 22 - and
-            // it refuses a duplicate name at construction, which is why the intent leg filters `dial`: the catalog's
-            // `DialTool` is that name's only advertised owner.
+            // ---- edith-0.3 Phase 4A Task 4 (A4): the 23-host-tool face ------------------------------------------
+            // `toolCatalog` is the umbrella half (the verified, structured path). The seven atomic backends beside it are
+            // the fast path the model may choose instead: one leg per channel (plus 0.5.4's app-process `deep_link` and
+            // notification-listener `media` legs), each answering its own `available()` at call time. `ToolSurface` is
+            // the **one** `Capability.Actions` provider over both halves - 19 atomic descriptors plus the catalog's
+            // four = 23 - and it refuses a duplicate name at construction, which is why the intent leg filters `dial`:
+            // the catalog's `DialTool` is that name's only advertised owner.
             //
             // Advertising is stable (A3): a channel that is down keeps its tools advertised and its own `execute`
             // answers the refusal, so the schema and the cached prompt prefix cannot change under the model mid-session.
@@ -4206,6 +4208,18 @@ class HostCompositionRoot internal constructor(
                         launcher = ContextDeepLinkLauncher(context),
                         foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
                         rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                    ),
+                ),
+                // 0.5.4 Task 15 (spec §6.5): `media` - the active-session control leg over the already-granted
+                // notification listener (`MediaSessionManager.getActiveSessions`), not a new permission or Service.
+                // The port sends one transport command, polls PlaybackState for 1.5 s and releases every controller;
+                // without notification access it answers NO_NOTIFICATION_ACCESS, never a fabricated session.
+                AtomicActionExecutor(
+                    MediaTool(
+                        AndroidMediaControlPort(
+                            context = context,
+                            listenerComponent = ComponentName(context, NotificationCategoryService::class.java),
+                        ),
                     ),
                 ),
             )
@@ -4357,9 +4371,9 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 18 atomic tools plus the catalog's four
-                    // (22 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
-                    // plugin adds `notify_user`/`load_skill` beside it for 24. The old 21-tool router stays retired.
+                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 19 atomic tools plus the catalog's four
+                    // (23 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
+                    // plugin adds `notify_user`/`load_skill` beside it for 25. The old 21-tool router stays retired.
                     put(Capability.Actions, gatedActions)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
