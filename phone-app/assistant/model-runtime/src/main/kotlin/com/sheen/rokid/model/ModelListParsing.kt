@@ -78,8 +78,7 @@ private fun JsonObject.toSnapshot(id: String): GatewayModelSnapshot {
             ?: positiveInt("max_tokens"),
         inputs = modalities(),
         ownedBy = ownedBy,
-        thinkingSupported = id.contains("deepseek", ignoreCase = true) ||
-            ownedBy?.contains("deepseek", ignoreCase = true) == true ||
+        thinkingSupported = ModelFamilies.isDeepSeekFamily(id, ownedBy) ||
             declaresReasoningEffort(),
     )
 }
