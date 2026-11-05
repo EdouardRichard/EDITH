@@ -40,6 +40,11 @@ class AccessibilityExecutionBackendTest {
          * re-read the screen: if it did, it would splice in a tree the model never saw (0.5.4 T9 fix round).
          */
         private val laterNodes: List<RawSnapshotNode>? = null,
+        /**
+         * What every `snapshot` call from the third one on answers. Lets a test prove three successive fresh reads are
+         * three different trees - e.g. a new turn must re-read even when the filter still matches (T9 fix round 2).
+         */
+        private val thirdNodes: List<RawSnapshotNode>? = null,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
         val setTextByIndexCalls = mutableListOf<Triple<String, Int, String>>()
@@ -56,7 +61,11 @@ class AccessibilityExecutionBackendTest {
 
         override fun snapshot(filter: ScreenFilter): ScreenSnapshot {
             snapshotCalls++
-            val tree = if (snapshotCalls == 1) nodes else laterNodes ?: nodes
+            val tree = when {
+                snapshotCalls == 1 -> nodes
+                snapshotCalls == 2 -> laterNodes ?: nodes
+                else -> thirdNodes ?: laterNodes ?: nodes
+            }
             val source = object : SnapshotNodeSource {
                 override fun walkNodes(filter: ScreenFilter): List<RawSnapshotNode> = tree
                 override fun maxNodeLimit(): Int = MAX_NODES
@@ -233,13 +242,102 @@ class AccessibilityExecutionBackendTest {
         assertEquals("an offset page must not re-read the screen", 1, ui.snapshotCalls)
     }
 
+    @Test fun `a successful tap invalidates the snapshot so the next page reads fresh`() {
+        // 0.5.4 T9 fix round 2 (controller ruling): a mutating index action changes the screen, and the accessibility
+        // service invalidates its own snapshot after every action. The backend's same-snapshot pagination must not
+        // outlive the mutation: read page 0 -> tap succeeds -> offset 100 must re-read, not page the pre-mutation tree.
+        val screenA = textNodes(150, prefix = "A")
+        val screenB = textNodes(150, prefix = "B")
+        val ui = FakeUi(nodes = screenA, laterNodes = screenB)
+        val b = backend(ui)
+
+        val firstPage = b.execute("read_screen", """{"filter":"all"}""").detail
+        assertTrue("page 0 shows the first read: $firstPage", """[0] "A 0"""" in firstPage)
+        assertEquals("page 0 reads the screen once", 1, ui.snapshotCalls)
+
+        val tap = b.execute("tap", """{"index":0}""")
+        assertEquals("the tap is dispatched and changes the screen", ActionOutcome.Done, tap.outcome)
+
+        val nextPage = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+
+        assertTrue("a page after a tap shows the mutated screen: $nextPage", """[100] "B 100"""" in nextPage)
+        assertFalse("the pre-mutation tree must not be paged after a tap: $nextPage", "A 100" in nextPage)
+        assertEquals("a page after a tap reads the screen again", 2, ui.snapshotCalls)
+    }
+
+    @Test fun `long press and input text also invalidate the snapshot on success`() {
+        // Same rule as `tap`: every successful mutating index action ends the snapshot it was dispatched against.
+        val cases = listOf(
+            "long_press" to """{"index":0}""",
+            "input_text" to """{"index":0,"text":"hello"}""",
+        )
+        cases.forEach { (action, args) ->
+            val ui = FakeUi(nodes = textNodes(150, prefix = "A"), laterNodes = textNodes(150, prefix = "B"))
+            val b = backend(ui)
+            b.execute("read_screen", """{"filter":"all"}""")
+
+            val result = b.execute(action, args)
+            assertEquals("$action succeeds", ActionOutcome.Done, result.outcome)
+
+            val page = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+            assertTrue("$action must make the next page read fresh: $page", """[100] "B 100"""" in page)
+            assertFalse("$action must not leave the pre-action tree pageable: $page", "A 100" in page)
+            assertEquals("$action invalidates the snapshot", 2, ui.snapshotCalls)
+        }
+    }
+
+    @Test fun `a refused index action still invalidates the snapshot`() {
+        // The rule is "dispatched", not "succeeded": the snapshot is cleared after the `ui.*ByIndex` call regardless of
+        // its boolean, so a later page can never be spliced from a tree the action already touched.
+        val cases = listOf(
+            "tap" to """{"index":0}""",
+            "long_press" to """{"index":0}""",
+            "input_text" to """{"index":0,"text":"hello"}""",
+        )
+        cases.forEach { (action, args) ->
+            val ui = FakeUi(
+                clickable = false,
+                nodes = textNodes(150, prefix = "A"),
+                laterNodes = textNodes(150, prefix = "B"),
+            )
+            val b = backend(ui)
+            b.execute("read_screen", """{"filter":"all"}""")
+
+            val result = b.execute(action, args)
+            assertEquals("$action is refused by the UI", ActionOutcome.Refused, result.outcome)
+            assertEquals("$action refusal", "NODE_NOT_CLICKABLE", result.detail)
+
+            val page = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+            assertTrue("$action still invalidates the snapshot: $page", """[100] "B 100"""" in page)
+            assertFalse("a refused $action must not keep the old tree pageable: $page", "A 100" in page)
+            assertEquals("a refused $action still makes the next page read fresh", 2, ui.snapshotCalls)
+        }
+    }
+
+    @Test fun `a successful scroll invalidates the snapshot for later pages`() {
+        // Regression guard for the clear that already existed: a scroll moves the screen, so a same-filter offset page
+        // after it must re-read instead of paging the pre-scroll tree.
+        val ui = FakeUi(nodes = textNodes(150, prefix = "A"), laterNodes = textNodes(150, prefix = "B"))
+        val b = backend(ui)
+        b.execute("read_screen", """{"filter":"all"}""")
+
+        val scroll = b.execute("scroll", """{"direction":"forward"}""")
+        assertEquals("the scroll succeeds", ActionOutcome.Done, scroll.outcome)
+
+        val page = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+        assertTrue("a page after a scroll shows the moved screen: $page", """[100] "B 100"""" in page)
+        assertFalse("the pre-scroll tree must not be paged: $page", "A 100" in page)
+        assertEquals("a page after a scroll reads the screen again", 2, ui.snapshotCalls)
+    }
+
     @Test fun `an offset page with no matching snapshot reads fresh`() {
         // Documented fallback: `offset > 0` can only continue a snapshot that exists in this turn for the same filter.
         // A cold page, a filter change and a new turn have nothing to page, so each reads the screen once - and that
         // read becomes the snapshot the following page reuses.
         val screenA = textNodes(150, prefix = "A")
         val screenB = textNodes(150, prefix = "B")
-        val ui = FakeUi(nodes = screenA, laterNodes = screenB)
+        val screenC = textNodes(150, prefix = "C")
+        val ui = FakeUi(nodes = screenA, laterNodes = screenB, thirdNodes = screenC)
         val b = backend(ui)
 
         val cold = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
@@ -251,10 +349,17 @@ class AccessibilityExecutionBackendTest {
         assertTrue("a filter change reads fresh: $changedFilter", """[100] "B 100"""" in changedFilter)
         assertEquals("a filter change reads the screen again", 2, ui.snapshotCalls)
 
-        // A new turn owns a new snapshot: the old one is gone even for an offset page.
+        // While the filter still matches, a continuation reuses that snapshot instead of reading again.
+        val sameFilter = b.execute("read_screen", """{"filter":"interactive","offset":100}""").detail
+        assertTrue("a matching filter keeps paging the stored tree: $sameFilter", """[100] "B 100"""" in sameFilter)
+        assertEquals("a matching filter does not re-read the screen", 2, ui.snapshotCalls)
+
+        // A new turn owns a new snapshot: the old one is gone even when the next offset page uses the *same* filter, so
+        // this cannot pass merely because a filter mismatch also forces a read.
         b.beginTurn()
-        val newTurn = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
-        assertTrue("a new turn re-reads the screen: $newTurn", """[100] "B 100"""" in newTurn)
+        val newTurn = b.execute("read_screen", """{"filter":"interactive","offset":100}""").detail
+        assertTrue("a new turn re-reads the screen even with the same filter: $newTurn", """[100] "C 100"""" in newTurn)
+        assertFalse("a new turn must not page the previous turn's tree: $newTurn", "B 100" in newTurn)
         assertEquals("a new turn re-reads the screen", 3, ui.snapshotCalls)
     }
 

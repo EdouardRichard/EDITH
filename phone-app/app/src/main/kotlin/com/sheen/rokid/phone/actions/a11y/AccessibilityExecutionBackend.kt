@@ -40,7 +40,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = READ_SCREEN,
         title = "读取当前屏幕内容",
-        description = "读取当前屏幕，返回按索引编号的元素列表（文本、contentDescription 回退 desc、bounds=[l,t][r,b] 与 center=(x,y)，以及 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大；offset 从第 offset 个元素开始返回下一页（默认 0，每页最多 100 条，必须是 >=0 的整数，负数或非数字返回 ARGUMENTS_INVALID 且不读屏），索引始终是全局的，offset 只切页、不改变 tap 用的 index；同一回合内 offset>0 的后续页复用首次读取的那份快照（翻页看到的是同一屏），filter 改变或本回合还没有快照时才重新读取。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
+        description = "读取当前屏幕，返回按索引编号的元素列表（文本、contentDescription 回退 desc、bounds=[l,t][r,b] 与 center=(x,y)，以及 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大；offset 从第 offset 个元素开始返回下一页（默认 0，每页最多 100 条，必须是 >=0 的整数，负数或非数字返回 ARGUMENTS_INVALID 且不读屏），索引始终是全局的，offset 只切页、不改变 tap 用的 index；同一回合内 offset>0 的后续页复用首次读取的那份快照（翻页看到的是同一屏；若中途派发过 tap、long_press、input_text 或滚动，旧快照失效，下一页会重新读取），filter 改变或本回合还没有快照时才重新读取。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"filter":{"type":"string","enum":["all","interactive","text"],"default":"interactive"},"offset":{"type":"integer","minimum":0,"default":0}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -193,6 +193,18 @@ class AccessibilityExecutionBackend(
      * the legacy probe contract does not widen, and a backend without turn state pays nothing.
      */
     internal fun beginTurn() {
+        invalidateSnapshot()
+    }
+
+    /**
+     * Drops [currentSnapshot] and the filter it was read with.
+     *
+     * Called by the turn boundary, by a successful scroll, and - 0.5.4 T9 fix round 2 - after **every dispatched**
+     * `tap`/`long_press`/`input_text`, regardless of the port's boolean. The accessibility service invalidates its own
+     * snapshot after any action, so a stale backend copy would let a later `offset > 0` page reuse a tree that predates
+     * the mutation and then have its indices refused as `NODE_NOT_CLICKABLE`; clearing forces that page to re-read.
+     */
+    private fun invalidateSnapshot() {
         currentSnapshot = null
         currentSnapshotFilter = null
     }
@@ -323,6 +335,8 @@ class AccessibilityExecutionBackend(
         // index itself never rides the line).
         P3Log.line("P3_ACT via=index")
         val accepted = ui.clickByIndex(snapshot.snapshotId, index)
+        // Dispatched means the screen may already have changed: the snapshot goes with the action, whatever it returned.
+        invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
         return if (after != before) done("tapped index $index") else refused(NO_SCREEN_CHANGE)
@@ -340,6 +354,8 @@ class AccessibilityExecutionBackend(
         // the tool result, and a refused long press has no device line.
         P3Log.line("P3_ACT via=index")
         val accepted = ui.longPressByIndex(snapshot.snapshotId, index)
+        // Same invalidation rule as `tap`: the snapshot is consumed by the dispatch, not by its success.
+        invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
         return if (after != before) done("long pressed index $index") else refused(NO_SCREEN_CHANGE)
@@ -352,8 +368,7 @@ class AccessibilityExecutionBackend(
         val accepted = ui.scroll(direction)
         if (!accepted) return refused(NO_SCREEN_CHANGE)
         // Scroll invalidates the current snapshot, and the filter it was read with goes with it.
-        currentSnapshot = null
-        currentSnapshotFilter = null
+        invalidateSnapshot()
         return done("scrolled ${direction.name.lowercase()}")
     }
 
@@ -387,6 +402,8 @@ class AccessibilityExecutionBackend(
         // token only when the write is actually dispatched; the typed text never rides it.
         P3Log.line("P3_ACT via=index")
         val accepted = ui.setTextByIndex(snapshot.snapshotId, index, trimmed)
+        // Same invalidation rule as `tap`: typing mutates the screen, so no later page may continue the old snapshot.
+        invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
         return if (after != before) done("typed into index $index") else refused(NO_SCREEN_CHANGE)
