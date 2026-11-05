@@ -20,8 +20,10 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview (version `0.5.0-preview`). Its features are
-> usable, but performance, stability and the overall experience still need optimization.
+> **Preview status:** EDITH is currently in preview (version `0.5.2`). Its features are usable, but
+> performance, stability and the overall experience still need optimization. Some checks in this
+> build are partial or failed; the [0.5.2 evidence](docs/project/evidence/2026-11-04-0.52-settings-and-model-catalog.md)
+> records the exact matrix.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
@@ -31,6 +33,8 @@ operates Android apps through the accessibility service and Shizuku's shell, and
 the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run in
 **phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
 ball on the home screen and independent translucent message bubbles for replies and tool steps.
+0.5.2 rebuilds Settings around a seven-entry home page and adds a provider-based model service with
+gateway model catalogs.
 
 - **Phone-only mode** — Enable it in Settings and a draggable EDITH-icon ball appears on the home
   screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
@@ -230,6 +234,14 @@ flowchart LR
 With the setting off, the glasses routes above are unchanged: CXR connection, glasses wake, panel
 display and follow-up behavior keep their existing semantics. Phone-only mode is a local
 input/display choice, not a second CXR protocol.
+
+### Settings and model service (0.5.2)
+
+- **Settings home**: seven entries in four groups — Model service, Assistant behavior, Runtime & appearance, Permissions & security, Local capabilities, Audit log, About. Explanations live in `(?)` popovers (close by tapping outside, pressing Back, or opening another); save/restart semantics are unchanged, restart-required rows carry a chip, and the audit page loads only when opened.
+- **Model service**: add a provider with a name, gateway base URL and API key. EDITH fetches the gateway's `GET /models` catalog, keeps user-edited fields across refreshes, supports manually added models, and marks models the gateway no longer returns instead of deleting them. Multiple providers can be stored, but only one is active globally. The catalog is stored in an encrypted v2 blob and the API key stays in Android Keystore. Old model profiles are **not migrated**: a one-time prompt asks you to re-enter a provider and key.
+- **DeepSeek thinking**: an off-by-default switch with low/high/max levels. In 0.5.2 any request that carries tools forces thinking off because reasoning history is not replayed yet; the switch applies to non-tool turns only. Full reasoning history is planned for 0.5.3.
+
+Version 0.5.2 is a preview checkpoint. JVM and settings UI tests pass, but the device evidence includes a failed 720×1280 / fontScale 1.5 settings-home layout and several `NotMeasured` items; do not read this as a version-level pass.
 
 ## Project structure
 
