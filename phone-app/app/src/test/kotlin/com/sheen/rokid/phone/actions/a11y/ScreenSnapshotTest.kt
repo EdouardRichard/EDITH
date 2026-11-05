@@ -185,6 +185,45 @@ class ScreenSnapshotTest {
     }
 
     @Test
+    fun `elements expose content description bounds and centre`() {
+        // 0.5.4 T9: the model needs a fallback label plus a rectangle it can turn into a coordinate. Both are carried
+        // from the raw node, and the centre is the rectangle's midpoint in screen pixels.
+        val tree = listOf(
+            FakeNode(
+                text = null,
+                contentDescription = "搜索设置项",
+                clickable = true,
+                left = 900, top = 120, right = 1056, bottom = 240,
+            ),
+            FakeNode(
+                text = "Wi-Fi",
+                contentDescription = "Wi-Fi 设置",
+                clickable = true,
+                left = 0, top = 0, right = 100, bottom = 50,
+            ),
+            FakeNode(text = "Plain", clickable = true, left = 10, top = 20, right = 30, bottom = 60),
+        )
+        val source = FakeNodeSource(tree)
+
+        val snapshot = SnapshotBuilder.build(source)
+
+        val described = snapshot.elements[0]
+        assertEquals("描述 becomes the fallback label when text is absent", "搜索设置项", described.desc)
+        assertEquals(ScreenBounds(left = 900, top = 120, right = 1056, bottom = 240), described.bounds)
+        assertEquals(ScreenPoint(x = 978, y = 180), described.center)
+
+        val labelled = snapshot.elements[1]
+        assertEquals("Wi-Fi 设置", labelled.desc)
+        assertEquals(ScreenBounds(left = 0, top = 0, right = 100, bottom = 50), labelled.bounds)
+        assertEquals(ScreenPoint(x = 50, y = 25), labelled.center)
+
+        val plain = snapshot.elements[2]
+        assertEquals("a node without a content description carries no desc", null, plain.desc)
+        assertEquals(ScreenBounds(left = 10, top = 20, right = 30, bottom = 60), plain.bounds)
+        assertEquals(ScreenPoint(x = 20, y = 40), plain.center)
+    }
+
+    @Test
     fun `index out of bounds returns a recognizable refusal code`() {
         val tree = listOf(FakeNode(text = "Only", clickable = true))
         val source = FakeNodeSource(tree)

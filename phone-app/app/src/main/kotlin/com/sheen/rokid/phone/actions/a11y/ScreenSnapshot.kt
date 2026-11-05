@@ -24,6 +24,25 @@ data class ScreenSnapshot(
     val fingerprint: ScreenFingerprint,
 )
 
+/**
+ * A screen-pixel rectangle as the accessibility node reports it.
+ *
+ * 0.5.4 T9: carried verbatim from [RawSnapshotNode] so the model can see geometry and a later coordinate action can
+ * aim at it without re-walking the tree. Screen pixels, not density-independent units.
+ */
+data class ScreenBounds(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+) {
+    val centerX: Int get() = (left + right) / 2
+    val centerY: Int get() = (top + bottom) / 2
+}
+
+/** A screen-pixel point; the midpoint of [ScreenBounds] for a rendered element. */
+data class ScreenPoint(val x: Int, val y: Int)
+
 data class ScreenElement(
     val index: Int,
     val text: String?,
@@ -33,7 +52,14 @@ data class ScreenElement(
     val scrollable: Boolean,
     val checked: Boolean,
     val boundsDigest: String,
-)
+    /** The node's contentDescription, the fallback label when [text] is absent (0.5.4 T9). */
+    val desc: String? = null,
+    /** The node's rectangle in screen pixels (0.5.4 T9); defaults keep older producers source-compatible. */
+    val bounds: ScreenBounds = ScreenBounds(0, 0, 0, 0),
+) {
+    /** The rectangle's midpoint, in screen pixels; what a coordinate action aims at. */
+    val center: ScreenPoint get() = ScreenPoint(bounds.centerX, bounds.centerY)
+}
 
 data class ScreenFingerprint(
     val hash: String,
@@ -122,6 +148,8 @@ object SnapshotBuilder {
                 scrollable = raw.scrollable,
                 checked = raw.checked,
                 boundsDigest = boundsDigest(raw),
+                desc = raw.contentDescription,
+                bounds = ScreenBounds(raw.left, raw.top, raw.right, raw.bottom),
             )
         }
 

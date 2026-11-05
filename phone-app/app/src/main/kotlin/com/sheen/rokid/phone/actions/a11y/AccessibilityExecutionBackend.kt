@@ -26,14 +26,22 @@ private const val ACTION_CHANNEL_UNAVAILABLE = "ACTION_CHANNEL_UNAVAILABLE"
 /** Bounded on purpose: this moves another app's UI, not a document-typing service. */
 private const val MAX_TEXT_CHARS = 100
 
+/**
+ * How many elements one `read_screen` page renders (0.5.4 T9).
+ *
+ * The snapshot itself still holds up to [MAX_NODES]; `offset` only slices what is printed, so a 400-node screen is four
+ * pages. Pages exist to keep a single tool result model-sized now that every line also carries geometry.
+ */
+private const val READ_SCREEN_PAGE_SIZE = 100
+
 private val argumentsJson = Json { isLenient = true }
 
 private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = READ_SCREEN,
         title = "读取当前屏幕内容",
-        description = "读取当前屏幕，返回按索引编号的元素列表（文本与 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
-        parametersJson = """{"type":"object","properties":{"filter":{"type":"string","enum":["all","interactive","text"],"default":"interactive"}},"additionalProperties":false}""",
+        description = "读取当前屏幕，返回按索引编号的元素列表（文本、contentDescription 回退 desc、bounds=[l,t][r,b] 与 center=(x,y)，以及 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大；offset 从第 offset 个元素开始返回下一页（默认 0，每页最多 100 条），索引始终是全局的，offset 只切页、不改变 tap 用的 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
+        parametersJson = """{"type":"object","properties":{"filter":{"type":"string","enum":["all","interactive","text"],"default":"interactive"},"offset":{"type":"integer","minimum":0,"default":0}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
         idempotent = false,
@@ -194,10 +202,11 @@ class AccessibilityExecutionBackend(
     // ── read_screen ──────────────────────────────────────────────────────────
 
     private fun executeReadScreen(argsJson: String): ActionResult {
+        val offset = parseOffset(argsJson) ?: return refused(ARGUMENTS_INVALID)
         val filter = parseFilter(argsJson)
         val snapshot = runCatching { ui.snapshot(filter) }.getOrElse { return refused(ACTION_CHANNEL_UNAVAILABLE) }
         currentSnapshot = snapshot
-        val serialized = serializeSnapshot(snapshot)
+        val serialized = serializeSnapshot(snapshot, offset)
         return done(serialized)
     }
 
@@ -215,22 +224,45 @@ class AccessibilityExecutionBackend(
     }
 
     /**
+     * Reads the optional `offset` page start. Absent means the first page; a negative or non-numeric value is a caller
+     * error, not something to clamp silently, because a wrong offset would show the wrong slice of the screen.
+     */
+    private fun parseOffset(argsJson: String): Int? {
+        val args = runCatching { argumentsJson.parseToJsonElement(argsJson) as? JsonObject }.getOrNull()
+            ?: return 0
+        val raw = args["offset"] ?: return 0
+        val offset = (raw as? JsonPrimitive)?.intOrNull ?: return null
+        return offset.takeIf { it >= 0 }
+    }
+
+    /**
      * Serializes a [ScreenSnapshot] into a compact numbered list format for model consumption.
      * Example:
      * ```
-     * [0] "Settings" clickable
-     * [1] "Search" editable
-     * [2] "Wi-Fi" clickable checked
+     * [0] "Settings" bounds=[0,0][100,50] center=(50,25) clickable
+     * [1] desc="搜索设置项" bounds=[900,120][1056,240] center=(978,180) clickable
+     * [2] "Wi-Fi" bounds=[0,50][100,100] center=(50,75) clickable checked
      * truncated: false
      * ```
+     *
+     * [offset] slices the rendered page only. [ScreenElement.index] stays global, so an index printed on any page is
+     * still the index `tap`/`long_press`/`input_text` accept.
      */
-    private fun serializeSnapshot(snapshot: ScreenSnapshot): String {
+    private fun serializeSnapshot(snapshot: ScreenSnapshot, offset: Int): String {
         val sb = StringBuilder()
-        for (element in snapshot.elements) {
+        for (element in snapshot.elements.drop(offset).take(READ_SCREEN_PAGE_SIZE)) {
             sb.append("[${element.index}]")
-            if (element.text != null) {
+            if (!element.text.isNullOrBlank()) {
                 sb.append(" \"${element.text}\"")
             }
+            // contentDescription is the fallback label: shown only when it adds something the text does not already say.
+            val desc = element.desc
+            if (!desc.isNullOrBlank() && desc != element.text) {
+                sb.append(" desc=\"$desc\"")
+            }
+            val bounds = element.bounds
+            sb.append(" bounds=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}]")
+            sb.append(" center=(${element.center.x},${element.center.y})")
             val traits = mutableListOf<String>()
             if (element.clickable) traits += "clickable"
             if (element.editable) traits += "editable"

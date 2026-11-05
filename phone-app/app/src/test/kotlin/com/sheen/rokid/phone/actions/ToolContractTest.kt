@@ -230,7 +230,7 @@ class ToolContractTest {
 
         /** The argument names each schema declares, which its model-facing prose has to bound. */
         val ARGUMENT_NAMES: Map<String, List<String>> = linkedMapOf(
-            "read_screen" to listOf("filter"),
+            "read_screen" to listOf("filter", "offset"),
             "tap" to listOf("index"),
             "long_press" to listOf("index"),
             "scroll" to listOf("direction"),
