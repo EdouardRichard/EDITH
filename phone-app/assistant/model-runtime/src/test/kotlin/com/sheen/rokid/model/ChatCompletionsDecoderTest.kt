@@ -209,4 +209,54 @@ class ChatCompletionsDecoderTest {
             assertEquals("PROVIDER_FAILED", terminal.safeCode, reason)
         }
     }
+
+    // ------------------------------------------------------------ 0.53 Chat tool calls (Task 9 prerequisite)
+
+    @Test fun `streamed tool call fragments become one terminal call and stay replayable`() {
+        // OpenAI/DeepSeek Chat streams a call in pieces: the first fragment carries id/name, later ones append
+        // argument text. The loop only executes a call it received a terminal event for, so the decoder must assemble
+        // the fragments. This was never implemented: 0.52 only used Chat for text, which is why Task 9's chat tool
+        // round could not exist.
+        val decoder = ChatCompletionsDecoder("q")
+        val first = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"reasoning_content":"查"},"index":0}]}"""))
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "查")), first)
+
+        val opening = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"ci"}}]},"index":0}]}"""))
+        assertEquals(
+            listOf(ModelStreamEvent.ToolCallDelta("q", "chat:0", "lookup", "{\"ci")),
+            opening,
+            "the fragment is surfaced as a delta under a stable per-call identity",
+        )
+
+        val finishing = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Hangzhou\"}"}}]},"index":0},{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"""))
+        val call = finishing.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().single()
+        assertEquals("call_1", call.callId)
+        assertEquals("lookup", call.name)
+        assertEquals("""{"city":"Hangzhou"}""", call.argsJson, "argument fragments are assembled in order")
+        assertEquals("chat:0", call.itemId, "the delta and terminal share one item identity")
+        assertEquals(ModelEnd.COMPLETED, finishing.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a tool call without a finish reason still completes at the stream end`() {
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"lookup","arguments":"{}"}}]}}]}"""))
+        val events = decoder.accept(done())
+        assertEquals("call_9", events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().single().callId)
+        assertEquals(ModelEnd.COMPLETED, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a truncated tool call surfaces a dangling delta and never a terminal call`() {
+        // A stream that dies mid-call must not look like a successful empty turn: the delta without a terminal item is
+        // what `ModelClientGateway` reads as TOOL_CALL_DELIVERY_INCOMPLETE.
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"ci"}}]}}]}"""))
+        val events = decoder.endOfInput()
+        assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), "no terminal call from a partial one")
+        assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
 }

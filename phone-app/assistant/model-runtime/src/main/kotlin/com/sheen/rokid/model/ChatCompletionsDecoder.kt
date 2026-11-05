@@ -44,10 +44,23 @@ class ChatCompletionsDecoder(private val requestId: String) {
     private var pendingEnd: ModelEnd? = null
     private var pendingCode: String? = null
 
+    /**
+     * 0.53 Task 9 prerequisite: the tool calls this stream is assembling. Chat has no item id of its own, so a call is
+     * keyed by its `tool_calls[].index`, and the stable `chat:<index>` identity is used for both the delta and the
+     * terminal event (the gateway fails a turn whose delta identity never gets a terminal one).
+     */
+    private class StreamingCall(val index: Int) {
+        var callId: String? = null
+        var name: String? = null
+        val arguments = StringBuilder()
+        var terminalEmitted = false
+    }
+    private val calls = linkedMapOf<Int, StreamingCall>()
+
     fun accept(frame: SseFrame): List<ModelStreamEvent> {
         if (ended) return emptyList()
         // "[DONE]" sentinel ends the stream — treat as COMPLETED if we received content
-        if (frame.data.trim() == "[DONE]") return finishAtStreamEnd()
+        if (frame.data.trim() == "[DONE]") return finishAtStreamEnd(providerSaidDone = true)
         val size = frame.data.toByteArray(Charsets.UTF_8).size
         if (bytes + size > limit) return terminal(ModelEnd.FAILED, null, "RESPONSE_LIMIT")
         bytes += size
@@ -77,6 +90,25 @@ class ChatCompletionsDecoder(private val requestId: String) {
                     receivedContent = true
                     events += ModelStreamEvent.TextDelta(requestId, content)
                 }
+                // 0.53 Task 9 prerequisite: Chat streams a call across chunks; assemble it here.
+                delta?.get("tool_calls")?.let { toolCalls ->
+                    val array = toolCalls as? JsonArray ?: return@let
+                    for (element in array) {
+                        val fragment = element as? JsonObject ?: continue
+                        val index = fragment["index"]?.jsonPrimitive?.intOrNull ?: continue
+                        val call = calls.getOrPut(index) { StreamingCall(index) }
+                        fragment["id"]?.jsonPrimitive?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }?.let { call.callId = it }
+                        val function = fragment["function"] as? JsonObject
+                        function?.get("name")?.jsonPrimitive?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }?.let { call.name = it }
+                        val arguments = function?.get("arguments")?.jsonPrimitive?.contentOrNull
+                        if (!arguments.isNullOrEmpty()) {
+                            call.arguments.append(arguments)
+                            events += ModelStreamEvent.ToolCallDelta(requestId, itemId(call), call.name, arguments)
+                        }
+                    }
+                }
                 // The response's verdict: the first finish_reason wins; a second choice cannot add a second terminal.
                 val finishReason = obj["finish_reason"]?.jsonPrimitive?.contentOrNull
                 if (finishReason != null && finishEnd == null) {
@@ -91,6 +123,10 @@ class ChatCompletionsDecoder(private val requestId: String) {
                     finishCode = if (finishEnd == ModelEnd.FAILED) "PROVIDER_FAILED" else null
                 }
             }
+            // 0.53: the finish chunk is the point at which every assembled call is complete, so its terminals go out
+            // before the turn's own terminal. `[DONE]`/EOF without a finish_reason completes them in
+            // [finishAtStreamEnd] instead, so an omitted verdict still hands the loop its calls.
+            if (finishEnd != null) events += callTerminals()
             val heldEnd = pendingEnd
             val heldCode = pendingCode
             when {
@@ -110,15 +146,46 @@ class ChatCompletionsDecoder(private val requestId: String) {
         }
     }
 
-    fun endOfInput(): List<ModelStreamEvent> = finishAtStreamEnd()
+    /** `chat:<index>`: the stable identity shared by a call's deltas and its terminal (Chat has no item id). */
+    private fun itemId(call: StreamingCall) = "chat:${call.index}"
 
-    /** One terminal for either `[DONE]` or EOF: the held finish when there is one, else the old content-based verdict. */
-    private fun finishAtStreamEnd(): List<ModelStreamEvent> {
+    /**
+     * 0.53: the terminal event of every call whose id and name are known and whose terminal has not gone out yet.
+     * A call missing either stays a dangling delta instead of being invented, so a truncated stream cannot read as a
+     * successful turn.
+     */
+    private fun callTerminals(): List<ModelStreamEvent> {
+        val terminals = mutableListOf<ModelStreamEvent>()
+        for (call in calls.values) {
+            if (call.terminalEmitted) continue
+            val callId = call.callId ?: continue
+            val name = call.name ?: continue
+            call.terminalEmitted = true
+            terminals += ModelStreamEvent.ToolCallTerminal(requestId, itemId(call), callId, name, call.arguments.toString())
+        }
+        return terminals
+    }
+
+    fun endOfInput(): List<ModelStreamEvent> = finishAtStreamEnd(providerSaidDone = false)
+
+    /**
+     * One terminal for either `[DONE]` or EOF: the held finish when there is one, else the old content-based verdict.
+     *
+     * 0.53: a tool call only completes when the provider itself said the turn ended — a `finish_reason` chunk or the
+     * `[DONE]` sentinel. Bare EOF after a half-streamed call is a truncated delivery: completing it would hand the
+     * loop a call whose arguments were cut off, so it stays a dangling delta (`TOOL_CALL_DELIVERY_INCOMPLETE` above).
+     */
+    private fun finishAtStreamEnd(providerSaidDone: Boolean): List<ModelStreamEvent> {
         if (ended) return emptyList()
-        pendingEnd?.let { end -> return terminal(end, reportedUsage, pendingCode) }
-        // If we received content but no finish_reason/[DONE], treat as completed (some providers omit it)
-        return if (receivedContent) terminal(ModelEnd.COMPLETED, reportedUsage, null)
-        else terminal(ModelEnd.INCOMPLETE, reportedUsage, "EOF_INCOMPLETE")
+        val completedCalls = if (providerSaidDone) callTerminals() else emptyList()
+        pendingEnd?.let { end -> return completedCalls + terminal(end, reportedUsage, pendingCode) }
+        // If we received content but no finish_reason/[DONE], treat as completed (some providers omit it). 0.53: a
+        // completed tool call is a payload too, so a call-only stream the provider ended is accepted the same way.
+        return completedCalls + if (receivedContent || completedCalls.isNotEmpty()) {
+            terminal(ModelEnd.COMPLETED, reportedUsage, null)
+        } else {
+            terminal(ModelEnd.INCOMPLETE, reportedUsage, "EOF_INCOMPLETE")
+        }
     }
 
     /**
