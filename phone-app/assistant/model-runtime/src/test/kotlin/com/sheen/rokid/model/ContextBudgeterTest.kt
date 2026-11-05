@@ -390,4 +390,29 @@ class ContextBudgeterTest {
         val disabled = budgeter.prepare(profile.copy(thinkingEnabled = false), request)
         assertEquals(37_606, disabled.estimatedInputTokens)
     }
+
+    @Test fun `a 131072 window with MAX effort still leaves the named minimum input room`() {
+        // Review round 1: reserving the full official MAX default (131 072) on a 131 072-token window makes the limit
+        // negative, so every thinking request would fail locally. The reservation is capped by
+        // `usableWindow − safety − MIN_INPUT_TOKENS` = 131 072 − 1 000 − 8 192 = **121 880**, leaving 8 192.
+        val profile = profileFixture().copy(
+            usableWindowTokens = 131_072,
+            inputBudgetTokens = 60_000,
+            maxOutputTokens = 1_024,
+            safetyTokens = 1_000,
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.MAX,
+        )
+        assertTrue(ThoughtBudget.active(profile))
+        assertEquals(121_880, ThoughtBudget.reserve(profile))
+        assertTrue(ThoughtBudget.MIN_INPUT_TOKENS == 8_192)
+
+        // A normal request is still sendable: the limit is min(60 000, 8 192) = 8 192, not negative.
+        val fits = budgeter.prepare(profile, required())
+        assertTrue(fits.removedIds.isEmpty())
+        assertEquals(121, fits.estimatedInputTokens)
+
+        val overLimit = requestFixture(listOf(InputPart.Text("q".repeat(40_000)))).copy(instructions = "i".repeat(40))
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(profile, overLimit) }
+    }
 }

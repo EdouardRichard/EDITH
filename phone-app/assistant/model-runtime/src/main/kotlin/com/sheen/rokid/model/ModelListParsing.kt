@@ -115,7 +115,11 @@ private fun JsonArray.toModalities(): Set<InputModality> {
     return result
 }
 
-/** Design §5.7: the id, the `owned_by` family marker or an `effort` declaration marks the DeepSeek family. */
+/**
+ * 0.53 design (revised) §T8: only the **gateway's own** reasoning metadata marks a model as thinking-capable. The
+ * system does not infer a DeepSeek family from the id or `owned_by` (owner ruling A); those are reported gateway fields
+ * and nothing else. `thinkingSupported` also no longer decides any request: the user's switch does.
+ */
 private fun JsonObject.declaresReasoningEffort(): Boolean =
     this["effort"] is JsonObject ||
         objectAt("reasoning")?.get("supported_efforts") is JsonArray

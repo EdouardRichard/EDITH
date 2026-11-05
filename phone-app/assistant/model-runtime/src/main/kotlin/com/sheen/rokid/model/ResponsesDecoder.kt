@@ -245,7 +245,9 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
      */
     private fun reasoningDelta(root: JsonObject): List<ModelStreamEvent> {
         val value = string(root, "delta", required = true)!!
-        return if (value.isEmpty()) emptyList() else listOf(ModelStreamEvent.ReasoningDelta(request, value))
+        // A whitespace-only fragment is not a chain of thought; emitting it would throw in ReasoningDelta's
+        // constructor (non-blank required) and the outer catch would report MALFORMED_JSON for a valid turn.
+        return if (value.isBlank()) emptyList() else listOf(ModelStreamEvent.ReasoningDelta(request, value))
     }
 
     private fun validateText(key: ContentId, final: String): Boolean = final == (text[key]?.toString() ?: "")

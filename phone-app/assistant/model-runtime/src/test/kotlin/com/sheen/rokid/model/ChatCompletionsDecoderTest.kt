@@ -259,4 +259,48 @@ class ChatCompletionsDecoderTest {
         assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), "no terminal call from a partial one")
         assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
     }
+
+    // ------------------------------------------------------------ review round 1 fixes
+
+    @Test fun `a whitespace-only reasoning fragment is ignored and the turn survives`() {
+        // `ReasoningDelta` requires a non-blank text. Treating a whitespace chunk as an event made its constructor throw
+        // inside the decoder, which the outer catch turned into FAILED/MALFORMED_JSON — a valid turn lost.
+        val decoder = ChatCompletionsDecoder("q")
+
+        assertTrue(decoder.accept(reasoning(" ")).isEmpty(), "a space is not a reasoning fragment")
+        assertTrue(decoder.accept(reasoning("\\n")).isEmpty(), "a newline is not a reasoning fragment")
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "想")), decoder.accept(reasoning("想")))
+        assertEquals(listOf(ModelStreamEvent.TextDelta("q", "好")), decoder.accept(content("好")))
+        assertEquals(ModelEnd.COMPLETED, terminal(decoder.accept(finishWith("stop"))).end)
+    }
+
+    @Test fun `a length-truncated tool call stays dangling and never becomes callable`() {
+        // `finish_reason="length"` means the provider cut the call off, not that it completed it. Emitting a terminal
+        // would hand the loop a call whose arguments the provider never finished.
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\""}}]}}]}"""))
+
+        val events = decoder.accept(finishWith("length"))
+        assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), "a length-cut call is not callable")
+        assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a tool call missing its identity refuses the turn instead of completing silently`() {
+        // The id and name are what pair a call with its tool output. A call missing either must never read as success:
+        // a completed turn with text would otherwise let the gateway's dangling-delta check miss it entirely.
+        for ((label, fragment) in listOf(
+            "missing id" to """{"index":0,"function":{"name":"lookup","arguments":"{}"}}""",
+            "missing name" to """{"index":0,"id":"call_1","function":{"arguments":"{}"}}""",
+        )) {
+            val decoder = ChatCompletionsDecoder("q")
+            decoder.accept(content("partial answer"))
+            decoder.accept(SseFrame(null, """{"choices":[{"delta":{"tool_calls":[$fragment]},"index":0}]}"""))
+            val events = decoder.accept(finishWith("tool_calls"))
+            assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), label)
+            val terminal = events.filterIsInstance<ModelStreamEvent.Terminal>().single()
+            assertEquals(ModelEnd.INCOMPLETE, terminal.end, label)
+            assertEquals("TOOL_CALL_DELIVERY_INCOMPLETE", terminal.safeCode, label)
+        }
+    }
 }

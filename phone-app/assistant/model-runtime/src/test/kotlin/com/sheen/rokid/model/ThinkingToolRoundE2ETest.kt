@@ -78,6 +78,16 @@ class ThinkingToolRoundE2ETest {
             "data: [DONE]\n\n",
     )
 
+    /** A second tool round of the same run, so the multi-round case exercises a second replayed reasoning. */
+    private fun chatSecondToolRound(reasoning: String? = "second thought") = sse(
+        (reasoning?.let { "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$it\"},\"index\":0}]}\n\n" } ?: "") +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\"," +
+            "\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"beijing\\\"}\"}}]},\"index\":0}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":30," +
+            "\"completion_tokens\":4}}\n\n" +
+            "data: [DONE]\n\n",
+    )
+
     private fun responsesRoundOne(reasoning: String? = "need lookup") = sse(
         "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n" +
             (reasoning?.let {
@@ -242,10 +252,8 @@ class ThinkingToolRoundE2ETest {
             )
         }
 
-        fun bodies(): List<JsonObject> = listOf(
-            json(assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).body.readUtf8()),
-            json(assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).body.readUtf8()),
-        )
+        fun bodies(count: Int = 2): List<JsonObject> =
+            (0 until count).map { json(assertNotNull(server.takeRequest(5, TimeUnit.SECONDS)).body.readUtf8()) }
 
         override fun close() {
             client.close()
@@ -422,6 +430,105 @@ class ThinkingToolRoundE2ETest {
                         "no reasoning item may appear when nothing was captured: ${second.inputItems()}",
                     )
                     assertTrue(first.inputItems().none { it.typeOf() == "reasoning" }, "round one carries no reasoning item")
+                }
+        }
+    }
+
+    @Test fun `a thinking-off responses profile replays server-returned reasoning without sending a thinking field`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            // The switch was off, yet the server reasoned anyway (DeepSeek defaults thinking on). The reasoning must be
+            // captured and replayed as an input item on the tool-bearing continuation, while the request itself stays a
+            // switch-off request: no `reasoning` field and a normal `max_output_tokens`.
+            server.enqueue(responsesRoundOne())
+            server.enqueue(responsesRoundTwo())
+            Rig(server, "DEEPSEEK_RESPONSES", thinkingEnabled = false, model = "deepseek-flash")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertEquals("sunny 25C", run.finalText)
+                    assertEquals("done thinking", run.finalReasoning, "server-returned reasoning is captured with the switch off")
+                    assertEquals(2, server.requestCount)
+
+                    val (first, second) = rig.bodies()
+                    for ((path, body) in listOf("first" to first, "second" to second)) {
+                        assertFalse("reasoning" in body, "$path must not request thinking with the switch off")
+                        assertEquals(6_000, body.getValue("max_output_tokens").jsonPrimitive.int, "$path keeps the generic cap")
+                    }
+                    val input = second.inputItems()
+                    val reasoningIndex = input.indexOfFirst { it.typeOf() == "reasoning" }
+                    assertTrue(reasoningIndex >= 0, "the second request replays the captured reasoning: $input")
+                    assertEquals(reasoningIndex + 1, input.indexOfFirst { it.roleOf() == "assistant" })
+                    assertEquals(
+                        "need lookup",
+                        input[reasoningIndex].getValue("content").jsonArray.single().jsonObject
+                            .getValue("text").jsonPrimitive.content,
+                    )
+                }
+        }
+    }
+
+    @Test fun `a thinking-off chat profile with a silent server sends the generic pre-0_53 bodies`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            // Nothing was requested and nothing was returned: both bodies must be the generic OpenAI shape, with the
+            // existing cap and no reasoning_content anywhere.
+            server.enqueue(chatRoundOne(reasoning = null))
+            server.enqueue(chatRoundTwo(reasoning = null))
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingEnabled = false, model = "deepseek-flash")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertNull(run.finalReasoning, "the server returned no reasoning and none was invented")
+                    assertEquals(2, server.requestCount)
+
+                    val (first, second) = rig.bodies()
+                    val genericKeys = setOf(
+                        "model", "stream", "stream_options", "modalities", "max_tokens", "tools", "tool_choice", "messages",
+                    )
+                    for ((path, body) in listOf("first" to first, "second" to second)) {
+                        assertEquals(genericKeys, body.keys, "$path must be the pre-0.5.3 generic body")
+                        assertEquals(6_000, body.getValue("max_tokens").jsonPrimitive.int, "$path keeps the generic cap")
+                        assertTrue(
+                            body.messages().none { "reasoning_content" in it },
+                            "$path carries no reasoning_content: ${body.messages()}",
+                        )
+                    }
+                }
+        }
+    }
+
+    @Test fun `two tool rounds replay every captured reasoning on the third request`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            server.enqueue(chatRoundOne())
+            server.enqueue(chatSecondToolRound())
+            server.enqueue(chatRoundTwo("done thinking"))
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingEnabled = false, model = "deepseek-flash")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertEquals("sunny 25C", run.finalText)
+                    assertEquals("done thinking", run.finalReasoning)
+                    assertEquals(3, server.requestCount, "two tool rounds are three model requests")
+
+                    val (first, second, third) = rig.bodies(count = 3)
+                    // Round 2 replays the first round's reasoning already.
+                    assertEquals(
+                        listOf("need lookup"),
+                        second.messages().filter { "tool_calls" in it }.map {
+                            it.getValue("reasoning_content").jsonPrimitive.content
+                        },
+                    )
+                    // Round 3 must replay **both** earlier turns' reasoning, in order, on their own messages.
+                    assertEquals(
+                        listOf("need lookup", "second thought"),
+                        third.messages().filter { "tool_calls" in it }.map {
+                            it.getValue("reasoning_content").jsonPrimitive.content
+                        },
+                        "every captured reasoning rides its own assistant message on the third request",
+                    )
+                    assertTrue(first.messages().none { "reasoning_content" in it }, "round 1 has no reasoning history yet")
                 }
         }
     }

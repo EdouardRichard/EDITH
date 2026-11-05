@@ -131,9 +131,8 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
                 put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
-                // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
-                // back `incomplete/max_output_tokens`: the deliberation is charged against the output budget and the
-                // call never arrives. `tool_choice` is `auto` only — the endpoint answered HTTP 400 to `required`.
+                // `tool_choice` is `auto` only — the endpoint answered HTTP 400 to `required`. The effort decision is
+                // made above by the user switch alone; a tool request is no longer forced to `none`.
                 put("tool_choice", "auto")
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }

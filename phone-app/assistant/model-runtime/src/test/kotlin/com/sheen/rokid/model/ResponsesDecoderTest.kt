@@ -161,6 +161,22 @@ class ResponsesDecoderTest {
         )
     }
 
+    @Test fun `a whitespace-only reasoning fragment is ignored and the turn survives`() {
+        // `ReasoningDelta` requires a non-blank text; a whitespace chunk used to throw inside the decoder and become
+        // FAILED/MALFORMED_JSON. It must simply be ignored like an empty fragment.
+        val decoder = ResponsesDecoder("q")
+        assertTrue(decoder.accept(frame("response.reasoning_text.delta", "1",
+            ", \"item_id\":\"rs_1\",\"delta\":\" \"")).isEmpty(), "a space is not a fragment")
+        assertTrue(decoder.accept(frame("response.reasoning_text.delta", "2",
+            ", \"item_id\":\"rs_1\",\"delta\":\"\\n\"")).isEmpty(), "a newline is not a fragment")
+        decoder.accept(frame("response.reasoning_text.delta", "3", ", \"item_id\":\"rs_1\",\"delta\":\"想\""))
+        assertEquals(listOf("好"), texts(decoder.accept(delta("4", "好"))))
+        assertEquals(
+            ModelEnd.COMPLETED,
+            ends(decoder.accept(terminal("completed", "5", """{"id":"r","status":"completed"}"""))).single().end,
+        )
+    }
+
     @Test fun `multiple items and content indices validate done separately`() {
         val decoder = ResponsesDecoder("q")
         val events = decoder.accept(delta("9", "A", "i", 0)) + decoder.accept(delta("13", "B", "j", 0)) +

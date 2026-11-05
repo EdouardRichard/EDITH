@@ -21,6 +21,13 @@ object ThoughtBudget {
     /** Official default output allowance for a MAX thinking turn. */
     const val DEFAULT_MAX_EFFORT_TOKENS = 131_072
 
+    /**
+     * Review round 1: the prompt room the send-time reservation must never eat. A 131 072-token window with the MAX
+     * official default would otherwise leave a negative input limit, so **every** thinking request would fail locally
+     * before the provider ever saw it. The reservation is capped by `usableWindow - safety - MIN_INPUT_TOKENS`.
+     */
+    const val MIN_INPUT_TOKENS = 8_192
+
     /** True when the user asked for thinking. No capability or family inference is applied. */
     fun active(profile: ModelProfile): Boolean = profile.thinkingEnabled
 
@@ -33,7 +40,15 @@ object ThoughtBudget {
     /**
      * The output reservation the send-time budget uses: the official default when the switch is on (the adapters send
      * no cap, so the provider applies it), otherwise the profile's declared allowance — the pre-0.53 behaviour.
+     *
+     * The official value is capped so at least [MIN_INPUT_TOKENS] worth of prompt fits in the profile's window, and the
+     * profile's own allowance stays the floor: the guarantee is "never reserve more than the window can spare", never
+     * "reserve less than the profile declared".
      */
-    fun reserve(profile: ModelProfile): Int =
-        if (active(profile)) officialDefault(profile.thinkingEffort) else profile.maxOutputTokens
+    fun reserve(profile: ModelProfile): Int {
+        if (!active(profile)) return profile.maxOutputTokens
+        val spare = profile.usableWindowTokens.toLong() - profile.safetyTokens - MIN_INPUT_TOKENS
+        val capped = minOf(officialDefault(profile.thinkingEffort).toLong(), spare).toInt()
+        return maxOf(profile.maxOutputTokens, capped)
+    }
 }

@@ -518,6 +518,21 @@ class ControlledModelClientTest {
         }
     }
 
+    @Test fun `the responses decoder's reasoning events are forwarded too`() {
+        // Review round 1: the client test only drove the Chat protocol. The Responses decoder's ReasoningDelta must pass
+        // through the same way — no protocol-specific filtering exists any more.
+        Rig().use { rig ->
+            rig.server.enqueue(sse(REASONING_BODY))
+            rig.start(); rig.awaitTerminal()
+            assertEquals(
+                listOf("think"),
+                rig.events.filterIsInstance<ModelStreamEvent.ReasoningDelta>().map { it.text },
+            )
+            assertEquals(listOf("hi"), rig.events.filterIsInstance<ModelStreamEvent.TextDelta>().map { it.text })
+            assertEquals(listOf(ModelEnd.COMPLETED), rig.ends())
+        }
+    }
+
     private fun assertProbeFailureDeniesOrdinaryRequest(rig: Rig) {
         assertEquals(1, rig.server.requestCount)
         assertEquals(1, rig.resolutions.get())

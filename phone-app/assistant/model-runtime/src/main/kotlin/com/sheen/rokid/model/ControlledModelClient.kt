@@ -159,7 +159,18 @@ class ControlledModelClient(
                         for (frame in frames) {
                             if (!pending.active()) break
                             if (chatDecoder != null) {
-                                chatDecoder.accept(frame).forEach(pending::deliver)
+                                chatDecoder.accept(frame).forEach { event ->
+                                    // Review round 1: the retry gate is "has this turn already delivered payload?".
+                                    // Chat answer text and call fragments count; reasoning never does (it is not the
+                                    // answer). Before this, only the Responses path set the flag.
+                                    when (event) {
+                                        is ModelStreamEvent.TextDelta,
+                                        is ModelStreamEvent.ToolCallDelta,
+                                        is ModelStreamEvent.ToolCallTerminal -> pending.delta.set(true)
+                                        else -> Unit
+                                    }
+                                    pending.deliver(event)
+                                }
                             } else {
                                 val type = try { (Json.parseToJsonElement(frame.data) as? JsonObject)?.get("type")?.jsonPrimitive?.content }
                                     catch (_: Exception) { null }
