@@ -116,8 +116,25 @@ data class ImageRef(
  * be echoed back beside its result.
  */
 sealed interface ModelHistoryItem {
-    data class Text(val role: MessageRole, val text: String) : ModelHistoryItem {
-        init { require(text.isNotBlank()) }
+    /**
+     * 0.53: DeepSeek thinking mode returns a chain of thought beside the answer. The reasoning belongs to the
+     * assistant message that produced it, so it rides on this item instead of a sibling variant: a trimmer or a store
+     * that drops the message drops its reasoning with it, which is the only pairing DeepSeek's replay rule accepts.
+     * It is provider-native, never translated across protocols, kept in session memory only, and never rendered in
+     * `toString()` or any log line.
+     */
+    data class Text(
+        val role: MessageRole,
+        val text: String,
+        val reasoning: String? = null,
+    ) : ModelHistoryItem {
+        init {
+            require(text.isNotBlank())
+            require(reasoning == null || reasoning.isNotBlank())
+            require(reasoning == null || role == MessageRole.ASSISTANT) {
+                "only an assistant turn can carry reasoning"
+            }
+        }
         override fun toString() = "Text(role=$role, redacted)"
     }
     data class ToolCall(val callId: String, val name: String, val argsJson: String,
@@ -203,6 +220,15 @@ sealed interface ModelStreamEvent {
     data class TextDelta(val requestId: String, val text: String) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
         override fun toString() = "TextDelta(redacted)"
+    }
+    /**
+     * 0.53: one chunk of DeepSeek's chain of thought. It is internal state, not answer text: the display never renders
+     * it, the agent loop stores it beside the assistant turn and the adapter replays it with the next request that
+     * carries tools. Redacted in diagnostics like every other event.
+     */
+    data class ReasoningDelta(val requestId: String, val text: String) : ModelStreamEvent {
+        init { require(requestId.isNotBlank() && text.isNotBlank()) }
+        override fun toString() = "ReasoningDelta(redacted)"
     }
     data class Terminal(val requestId: String, val end: ModelEnd, val usage: ModelUsage?, val safeCode: String?) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
