@@ -55,6 +55,9 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
                     "response.content_part.added", "response.content_part.done" -> trackPart(root)
                     "response.output_text.delta" -> delta(root)
                     "response.output_text.done" -> done(root)
+                    // 0.53 design §5.3: the streamed chain of thought is its own event family. It is parsed
+                    // independently of the answer text so it can never be mistaken for, or validated as, output text.
+                    "response.reasoning_text.delta" -> reasoningDelta(root)
                     "response.function_call_arguments.delta" -> toolDelta(root)
                     "response.completed", "response.incomplete", "response.failed" -> finish(type, root)
                     else -> emptyList()
@@ -230,6 +233,19 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         val value = string(root, "delta", required = true)!!
         text.getOrPut(key) { StringBuilder() }.append(value)
         return if (value.isEmpty()) emptyList() else listOf(ModelStreamEvent.TextDelta(request, value))
+    }
+
+    /**
+     * 0.53 design §5.3: one streamed reasoning fragment.
+     *
+     * The reasoning event family is deliberately **not** routed through [identity]/[textIdentity]: it must never bind
+     * the item or part identity the answer text is validated against, so a reasoning fragment cannot make the answer
+     * look delivered (or vice versa). Only the fragment itself is read; an empty one is not an event. The terminal
+     * `response.reasoning_text.done` and the `reasoning_summary_text.*` family stay ignored.
+     */
+    private fun reasoningDelta(root: JsonObject): List<ModelStreamEvent> {
+        val value = string(root, "delta", required = true)!!
+        return if (value.isEmpty()) emptyList() else listOf(ModelStreamEvent.ReasoningDelta(request, value))
     }
 
     private fun validateText(key: ContentId, final: String): Boolean = final == (text[key]?.toString() ?: "")
