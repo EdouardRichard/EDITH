@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.actions.a11y
 import kotlinx.serialization.json.JsonObject
 import com.sheen.rokid.phone.actions.ExecutionBackend
+import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
@@ -250,6 +251,9 @@ class AccessibilityExecutionBackend(
 
     private fun executeTap(argsJson: String): ActionResult {
         val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
+        // 0.5.4 Task 8 (§6.2.2): the count-only action line starts with the targeting mode this class really has -
+        // index. Task 11's coordinate taps extend the same token; the index itself never rides the line.
+        P3Log.line("P3_ACT via=index")
         val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
@@ -264,6 +268,8 @@ class AccessibilityExecutionBackend(
 
     private fun executeLongPress(argsJson: String): ActionResult {
         val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
+        // 0.5.4 Task 8: same index token as `tap`; the action kind is already named by the tool result.
+        P3Log.line("P3_ACT via=index")
         val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
@@ -303,6 +309,8 @@ class AccessibilityExecutionBackend(
             ?: return refused(ARGUMENTS_INVALID)
         val index = (args["index"] as? JsonPrimitive)?.intOrNull ?: return refused(ARGUMENTS_INVALID)
         val text = (args["text"] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull ?: return refused(ARGUMENTS_INVALID)
+        // 0.5.4 Task 8: `input_text` is index-targeted too, so it reports the same via token; the typed text never does.
+        P3Log.line("P3_ACT via=index")
         val trimmed = text.trim()
         if (trimmed.isEmpty() || trimmed.length > MAX_TEXT_CHARS) return refused(ARGUMENTS_INVALID)
         if (trimmed.any { it == '\n' || it == '\r' }) return refused(ARGUMENTS_INVALID)

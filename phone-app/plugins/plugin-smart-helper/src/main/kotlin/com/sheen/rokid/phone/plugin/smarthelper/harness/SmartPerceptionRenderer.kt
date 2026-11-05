@@ -26,6 +26,12 @@ import com.sheen.rokid.plugin.PerceptionSnapshot
  */
 object SmartPerceptionRenderer {
 
+    /** 0.5.4 Task 8: the `P3_PERCEPTION include=` token for the opening request's full read. */
+    const val INCLUDE_ALL = "all"
+
+    /** The token for a continuation, which deliberately asks only for the ambient sources (spec §7.5). */
+    const val INCLUDE_AMBIENT = "ambient"
+
     /** The renderer default cap, kept as the lower bound: a perception slot may legitimately exceed it. */
     private const val DEFAULT_VALUE_CODE_POINTS = 500
 
@@ -208,7 +214,13 @@ object SmartPerceptionRenderer {
     }
 
     /**
-     * The one `P3_PERCEPTION` line: counts, a snapshot prefix, the rendered block's size and the coverage tokens.
+     * The one `P3_PERCEPTION` line: the requested sources and request index, then counts, a snapshot prefix, the
+     * rendered block's size and the coverage tokens.
+     *
+     * 0.5.4 Task 8 (§6.2.2) adds [include] (which sources this request asked the host for) and [request] (0 is the
+     * opening read, later numbers are continuations). Without them an `elements=0` line cannot say whether the screen
+     * was even requested or whether a continuation deliberately asked only for the ambient sources. Both are ASCII
+     * tokens/counts; the `-` default is the honest answer for a direct call that has no request context.
      *
      * It never carries a title, text, package, activity, calendar title or clipboard value — only the fields named in
      * the shape, all of which are numbers, booleans, an ASCII token or the coverage vocabulary. `images=0` because
@@ -223,8 +235,12 @@ object SmartPerceptionRenderer {
         renderedText: String,
         truncated: Boolean = snapshot.truncated,
         coverage: PerceptionCoverage = snapshot.coverage,
+        include: String = "-",
+        request: Int? = null,
     ): String = buildString {
-        append("P3_PERCEPTION snap=")
+        append("P3_PERCEPTION include=").append(include)
+        append(" request=").append(request?.toString() ?: "-")
+        append(" snap=")
         append(snapshot.snapshotId.take(8).replace(UNSAFE_SNAPSHOT_CHARS, "").ifBlank { "-" })
         append(" elements=").append(snapshot.elements.size)
         append(" notifications=").append(snapshot.notifications.size)

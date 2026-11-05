@@ -14,6 +14,7 @@ import com.sheen.rokid.device.ScreenFilter
 import com.sheen.rokid.device.Timing
 import com.sheen.rokid.output.CompactSnapshotRenderer
 import com.sheen.rokid.output.PerceptionCoverageRenderer
+import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
@@ -414,6 +415,9 @@ class DeviceTool(
      * behind). `changed` is derived from the envelope this call actually returns - never assumed from the dispatch.
      */
     private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?, partial: Boolean = false): ActionResult {
+        // 0.5.4 Task 8 (§6.2.2): `settleMs` is the kernel's post-action observation/settle window, which it already
+        // measures (`observeMs` starts right after the write). Task 13 appends `rebind=` to this same count-only line.
+        P3Log.line("P3_ACT settleMs=${envelope.timing.observeMs}")
         val snapshot = perception?.afterAction()
         val projected = project(envelope, lastFilter)
         // Task 3: the capture follows `afterAction()`, so the image is the screen the action produced. `scrollToText`

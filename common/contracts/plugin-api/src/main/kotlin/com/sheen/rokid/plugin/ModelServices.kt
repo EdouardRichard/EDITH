@@ -215,6 +215,27 @@ data class ModelUsage(
     }
 }
 
+/**
+ * 0.5.4 Task 8 (§6.2.2): the count-only latency of **one** model request, measured by the client that owns the
+ * request's three stages.
+ *
+ * All three are milliseconds from the moment the request was actually sent, and `null` means the stage was never
+ * reached — a request that a watchdog killed before the provider answered has no first byte and must not report a
+ * fabricated `0`. [streamMillis] is the whole request from send to its terminal, so it covers [ttfbMillis] and
+ * [firstTokenMillis]. No text, URL, profile id or provider body ever rides on this type.
+ */
+data class ModelRequestTiming(
+    val ttfbMillis: Long? = null,
+    val firstTokenMillis: Long? = null,
+    val streamMillis: Long? = null,
+) {
+    init {
+        require(ttfbMillis == null || ttfbMillis >= 0)
+        require(firstTokenMillis == null || firstTokenMillis >= 0)
+        require(streamMillis == null || streamMillis >= 0)
+    }
+}
+
 sealed interface ModelStreamEvent {
     data class TextDelta(val requestId: String, val text: String) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
@@ -229,7 +250,17 @@ sealed interface ModelStreamEvent {
         init { require(requestId.isNotBlank() && text.isNotBlank()) }
         override fun toString() = "ReasoningDelta(redacted)"
     }
-    data class Terminal(val requestId: String, val end: ModelEnd, val usage: ModelUsage?, val safeCode: String?) : ModelStreamEvent {
+    /**
+     * The request's last word. [timing] is the client's own count-only latency (0.5.4 Task 8), or `null` for a
+     * composition that does not measure it — the default keeps every pre-Task-8 producer and test unchanged.
+     */
+    data class Terminal(
+        val requestId: String,
+        val end: ModelEnd,
+        val usage: ModelUsage?,
+        val safeCode: String?,
+        val timing: ModelRequestTiming? = null,
+    ) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
     }
     /** A fragment of the arguments document of the call the model is currently emitting. */

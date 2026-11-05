@@ -257,6 +257,21 @@ class PromptTelemetryTest {
     }
 
     @Test
+    fun `each request's perception line names its include set and request index`() {
+        // 0.5.4 Task 8 (§6.2.2): request 0 is the full opening read, a continuation asks only for the ambient sources.
+        // The plugin, not the renderer, knows which request it is building, so the wiring is pinned here.
+        val rig = tailsRig("body")
+        notifyThenAnswer(rig)
+
+        val lines = withLines { rig.wakeAndFinal("现在几点了") }
+
+        val perceptions = lines.filter { it.startsWith("P3_PERCEPTION ") }
+        assertEquals(2, perceptions.size, "one line per rendered block: $lines")
+        assertTrue("include=all request=0" in perceptions[0], perceptions[0])
+        assertTrue("include=ambient request=1" in perceptions[1], perceptions[1])
+    }
+
+    @Test
     fun `P3_PROMPT carries the pinned skill catalog hash and the frame's static size`() {
         // The SKILL catalog is part of the cacheable system slot, so its provenance rides the same line as the plan's.
         // Only the digest and the path-free counts may appear - never a SKILL name or body.

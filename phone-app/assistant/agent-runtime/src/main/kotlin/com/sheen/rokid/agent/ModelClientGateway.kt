@@ -12,6 +12,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelRequestTiming
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
@@ -254,6 +255,8 @@ class ModelClientGateway(
                         // The provider's own overflow verdict is the last attempt; the chain of thought it streamed
                         // before that verdict is diagnosis state, not answer text, and must survive the final reply.
                         reasoning = reply.reasoning,
+                        // Task 8: the last attempt's latency is the one this verdict belongs to.
+                        timing = reply.timing,
                     )
                 }
                 recoveries++
@@ -283,9 +286,12 @@ class ModelClientGateway(
         usage: ModelUsage? = null,
         recoveries: Int = 0,
         reasoning: String? = null,
+        timing: ModelRequestTiming? = null,
     ): GatewayReply {
         overflowFailures++
-        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries, reasoning)
+        return GatewayReply(
+            emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries, reasoning, timing,
+        )
     }
 
     /** Builds the one stateless request shape every model call of this gateway uses. */
@@ -333,9 +339,30 @@ class ModelClientGateway(
         sentFrame: RequestFrame? = request.frame,
     ): GatewayReply {
         val reply = sendTurnOnce(request, modelRequest)
+        emitModelRequestMetric(reply)
         emitCacheMetric(request, reply, sentFrame)
         emitThinkingMetric(request, reply, modelRequest)
         return reply
+    }
+
+    /**
+     * 0.5.4 Task 8 (§6.2.2): the count-only `P3_MODEL_REQ` line of one model request.
+     *
+     * Latency comes from the client's own [com.sheen.rokid.plugin.ModelRequestTiming] (it owns the request's three
+     * stages), so an unreported stage is `-`, never a fabricated `0`. `reasoningChars` counts the chain of thought only,
+     * never answer text. `outcome` is the terminal verdict, with the transport's stable stage code appended when it sent
+     * one (`DEADLINE:FIRST_TOKEN_TIMEOUT`): that is what lets a log attribute a failure to one request and one stage.
+     * Emitted for every request that reached the transport, including each deterministic overflow re-send.
+     */
+    private fun emitModelRequestMetric(reply: GatewayReply) {
+        val timing = reply.timing
+        val verdict = reply.terminal?.name ?: ModelEnd.FAILED.name
+        val outcome = reply.safeCode?.let { "$verdict:$it" } ?: verdict
+        val line = "P3_MODEL_REQ ttfbMs=${timing?.ttfbMillis ?: "-"} " +
+            "firstTokenMs=${timing?.firstTokenMillis ?: "-"} streamMs=${timing?.streamMillis ?: "-"} " +
+            "reasoningChars=${reply.reasoning?.length ?: 0} outcome=$outcome"
+        // Observability is never a verdict: a throwing sink must not turn a delivered reply into a failed turn.
+        runCatching { metricLine(line) }
     }
 
     /**
@@ -426,6 +453,7 @@ class ModelClientGateway(
                 return GatewayReply(
                     emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL,
                     reasoning = accumulated.reasoningText(),
+                    timing = accumulated.terminal?.timing,
                 )
             }
             while (true) {
@@ -436,6 +464,7 @@ class ModelClientGateway(
                     return GatewayReply(
                         emptyList(), accumulated.text(), ModelEnd.DEADLINE, DEADLINE,
                         reasoning = accumulated.reasoningText(),
+                        timing = accumulated.terminal?.timing,
                     )
                 }
                 accumulated.waitForStep(WAIT_STEP_MILLIS)
@@ -457,6 +486,7 @@ class ModelClientGateway(
         return GatewayReply(
             emptyList(), accumulated.text(), ModelEnd.CANCELLED, CANCELLED, accumulated.terminal?.usage,
             reasoning = accumulated.reasoningText(),
+            timing = accumulated.terminal?.timing,
         )
     }
 
@@ -480,11 +510,13 @@ class ModelClientGateway(
             GatewayReply(
                 emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage,
                 reasoning = accumulated.reasoningText(),
+                timing = terminal.timing,
             )
         } else {
             GatewayReply(
                 calls, text, terminal.end, terminal.safeCode, terminal.usage,
                 reasoning = accumulated.reasoningText(),
+                timing = terminal.timing,
             )
         }
     }

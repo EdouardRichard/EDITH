@@ -9,6 +9,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelRequestTiming
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ToolSpec
@@ -674,6 +675,63 @@ class ModelClientGatewayTest {
         assertEquals(
             "P3_THINKING active=false effort=- reasoningChars=0 replayChars=0",
             disabled.single { it.startsWith("P3_THINKING") },
+        )
+    }
+
+    @Test fun `a completed request reports only counts and the latency the client measured`() {
+        // 0.5.4 Task 8 (§6.2.2): one count-only line per model request, with the client's own timing. The line must
+        // never carry the answer text or the chain of thought it counts.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal(
+                "turn-7", ModelEnd.COMPLETED, null, null,
+                ModelRequestTiming(ttfbMillis = 120, firstTokenMillis = 350, streamMillis = 900),
+            ),
+        )
+
+        gateway(client, metricLine = { lines += it }).turn(turn())
+
+        val line = lines.single { it.startsWith("P3_MODEL_REQ") }
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=120 firstTokenMs=350 streamMs=900 reasoningChars=1 outcome=COMPLETED",
+            line,
+        )
+        assertFalse(line.contains("想") || line.contains("答"), "no model text may ride the request line: $line")
+    }
+
+    @Test fun `a request without client timing reports unavailable stages instead of zero`() {
+        // A client that measures nothing (a pre-Task-8 composition or a scripted double) is `-`, never a fabricated 0.
+        val lines = mutableListOf<String>()
+        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
+
+        gateway(client, metricLine = { lines += it }).turn(turn())
+
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=COMPLETED",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `a timed out request keeps its stage code inside outcome`() {
+        // 0.5.4 Task 6: FIRST_TOKEN_TIMEOUT / STREAM_IDLE_TIMEOUT / REQUEST_DEADLINE all end as DEADLINE. The
+        // per-request line must keep the stage, or a log cannot attribute the failure to one request.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.Terminal(
+                "turn-7", ModelEnd.DEADLINE, null, "FIRST_TOKEN_TIMEOUT",
+                ModelRequestTiming(streamMillis = 90_000),
+            ),
+        )
+
+        val reply = gateway(client, metricLine = { lines += it }).turn(turn(deadlineNanos = 120_000_000_000L))
+
+        assertEquals(ModelEnd.DEADLINE, reply.terminal)
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=90000 reasoningChars=0 " +
+                "outcome=DEADLINE:FIRST_TOKEN_TIMEOUT",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
         )
     }
 

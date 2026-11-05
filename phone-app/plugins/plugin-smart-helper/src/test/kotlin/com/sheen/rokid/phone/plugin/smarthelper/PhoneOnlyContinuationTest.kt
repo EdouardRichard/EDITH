@@ -128,8 +128,10 @@ class PhoneOnlyContinuationTest {
         try {
             rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
             assertTrue(
-                lines.any { it.startsWith("P3_CONV queue route=WAKE") },
-                "the stored switch still queues a post-ACK final: $lines",
+                lines.any {
+                    it.startsWith("P3_CONV queue_kept route=WAKE reason=continuation_pending")
+                },
+                "the stored switch still queues a post-ACK final, and the line names why it was kept: $lines",
             )
             assertFalse(
                 rig.plugin.canAcceptTypedMessage(),
@@ -285,7 +287,9 @@ class PhoneOnlyContinuationTest {
             rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
 
             assertTrue(
-                lines.any { it.startsWith("P3_CONV queue route=WAKE") },
+                lines.any {
+                    it.startsWith("P3_CONV queue_kept route=WAKE reason=continuation_pending")
+                },
                 "a sentence in the idle gap must still be queued while the stored switch is on: $lines",
             )
 
@@ -467,6 +471,10 @@ class PhoneOnlyContinuationTest {
             lines.any { it.contains("P3_CONV close route=WAKE reason=continue_off") },
             "the stale slot closes on the ordinary continue-off reason: $lines",
         )
+        assertTrue(
+            lines.any { it.contains("P3_CONV queue_drop route=WAKE reason=cycle_close") },
+            "the close that clears an unconsumed sentence names the drop, so a lost utterance is attributable: $lines",
+        )
         assertFalse(
             lines.any { it.contains("P3_CONV queue_consumed") },
             "a dropped sentence must never be reported as consumed: $lines",
@@ -474,6 +482,48 @@ class PhoneOnlyContinuationTest {
         assertTrue(
             rig.plugin.canAcceptTypedMessage(),
             "the close cleared the stale slot; a live one would still keep the typed/BALL path busy",
+        )
+    }
+
+    /**
+     * 0.5.4 Task 8 (§6.1.3): a queue slot is one sentence, latest wins.
+     *
+     * That replacement is existing behaviour, but it is a real loss of the earlier sentence. The count-only line must
+     * name it (`queue_drop reason=superseded`), or a device log cannot tell "the answer never came" from "the wearer
+     * said three things and two were replaced".
+     */
+    @Test
+    fun `a newer queued sentence names the one it replaced`() {
+        val (rig, _) = rig(continueDialogue = true, continueAfterAnswer = false, phoneOnly = true)
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "第一轮回答。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第一句", turnId = "asr-1")))
+        rig.tick()
+        assertEquals("第一轮回答。", rig.output.hints.single().text, "the first answer is on screen")
+
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            // Idle gap before the display ACK: each final is queued for the continuation that has not opened yet.
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第三句", turnId = "asr-3", revision = 3)))
+        } finally {
+            P3Log.sink = previous
+        }
+
+        assertTrue(
+            lines.count { it.startsWith("P3_CONV queue_kept route=WAKE reason=continuation_pending") } == 2,
+            "both finals were kept while the continuation was pending: $lines",
+        )
+        assertTrue(
+            lines.any { it == "P3_CONV queue_drop route=WAKE reason=superseded" },
+            "replacing the queued sentence is a drop and must be named: $lines",
+        )
+        assertTrue(
+            lines.none { it.contains("第二句") || it.contains("第三句") },
+            "the queue evidence carries counts only, never the wearer's words: $lines",
         )
     }
 }

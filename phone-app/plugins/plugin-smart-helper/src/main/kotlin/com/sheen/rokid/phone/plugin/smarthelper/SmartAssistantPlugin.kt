@@ -2329,7 +2329,7 @@ class SmartAssistantPlugin(
                     if (turnMatches) {
                         cancelledTurn = detachFollowup()
                         followupBusy = false
-                        clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
+                        clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE, "cycle_close")
                     }
                     true
                 }
@@ -2352,7 +2352,7 @@ class SmartAssistantPlugin(
         synchronized(gate) {
             if (turn?.turnId != expectedTurnId) return
             wakeBusy = false
-            clearQueuedUtteranceLocked(AssistantRoute.WAKE)
+            clearQueuedUtteranceLocked(AssistantRoute.WAKE, "cycle_close")
             stopped = detach()
         }
         teardown(stopped)
@@ -3132,9 +3132,16 @@ class SmartAssistantPlugin(
         }
         val text = revision.text.trim()
         if (!isUsableUtterance(text)) return
+        // 0.5.4 Task 8 (spec §6.1.3): the slot is one sentence, latest wins. That replacement is existing behaviour, but
+        // it really loses the earlier sentence, so the count-only line names it instead of letting it vanish. The route
+        // is the dropped sentence's own, which is the sibling route when a final replaced it.
+        queuedUtterance?.let { dropped ->
+            P3Log.line("P3_CONV queue_drop route=${dropped.route.name} reason=superseded")
+        }
         queuedUtterance = QueuedUtterance(route, text, revision.turnId, clock.nowNanos())
-        // Counts only: the wearer's words are display content and never reach the log.
-        P3Log.line("P3_CONV queue route=${route.name} chars=${text.length}")
+        // Counts only: the wearer's words are display content and never reach the log. `reason` says why the sentence
+        // was kept rather than answered now: its answer/continuation is still pending.
+        P3Log.line("P3_CONV queue_kept route=${route.name} reason=continuation_pending chars=${text.length}")
     }
 
     /**
@@ -3160,8 +3167,13 @@ class SmartAssistantPlugin(
     }
 
     /** Must hold [gate]: drops a queued sentence only when it belongs to [route] (the two routes stay independent). */
-    private fun clearQueuedUtteranceLocked(route: AssistantRoute) {
-        if (queuedUtterance?.route == route) queuedUtterance = null
+    private fun clearQueuedUtteranceLocked(route: AssistantRoute, reason: String) {
+        val queued = queuedUtterance ?: return
+        if (queued.route != route) return
+        queuedUtterance = null
+        // 0.5.4 Task 8 (spec §6.1.3): a closed round that still held a sentence is a real loss; naming the close reason
+        // is what makes "continue_off kept the queue" and "a close dropped it" separable in one device log.
+        P3Log.line("P3_CONV queue_drop route=${route.name} reason=$reason")
     }
 
     /** Whether a trimmed final can be the utterance: not empty, and not the wake segment's own echo of the word. */
@@ -3779,7 +3791,10 @@ class SmartAssistantPlugin(
         requests: AtomicInteger,
         visionSupported: Boolean?,
     ): String? {
-        val full = requests.getAndIncrement() == 0
+        // 0.5.4 Task 8: the index is part of the telemetry, not just the full/ambient decision — an `elements=0` line
+        // must say which request it described and which sources that request actually asked for.
+        val request = requests.getAndIncrement()
+        val full = request == 0
         val snapshot = if (full) {
             initialSnapshot ?: runCatching {
                 provider.snapshot(PerceptionSource.entries.toSet(), PerceptionFilter.ALL, null)
@@ -3805,6 +3820,12 @@ class SmartAssistantPlugin(
                 rendered.text,
                 rendered.truncated,
                 rendered.coverage,
+                include = if (full) {
+                    SmartPerceptionRenderer.INCLUDE_ALL
+                } else {
+                    SmartPerceptionRenderer.INCLUDE_AMBIENT
+                },
+                request = request,
             ),
         )
         return rendered.text
@@ -5383,7 +5404,7 @@ class SmartAssistantPlugin(
             val had = proactiveFollowup != null || followupTurnRequest != null || followupTurn != null
             proactiveFollowup = null
             followupTurnRequest = null
-            clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
+            clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE, "followup_close")
             cancelledTurn = detachFollowup()
             had
         }

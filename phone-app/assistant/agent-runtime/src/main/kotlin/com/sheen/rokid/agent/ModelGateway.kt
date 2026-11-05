@@ -2,6 +2,7 @@ package com.sheen.rokid.agent
 
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelRequestTiming
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.ToolSpec
 
@@ -122,6 +123,12 @@ data class GatewayReply(
      * renders it, and only the DeepSeek adapters replay it. Redacted by every `toString()` in the contract.
      */
     val reasoning: String? = null,
+    /**
+     * 0.5.4 Task 8: the client's count-only latency for this one request, or `null` when the transport did not measure
+     * it (a pre-Task-8 client, a scripted double, or a turn the gateway refused before sending). The gateway forwards it
+     * to its `P3_MODEL_REQ` line and never derives a value from it.
+     */
+    val timing: ModelRequestTiming? = null,
 ) {
     /**
      * Content-free by construction: the call count and the verdict only. The generated `toString()` of a data class

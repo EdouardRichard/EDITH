@@ -688,6 +688,63 @@ class ControlledModelClientTest {
         assertFailsWith<ContractError.ConfigurationRejected> { ModelEndpoint.responses("http://127.0.0.1") }
     }
 
+    @Test fun `request timing is measured from the send instant`() {
+        // 0.5.4 Task 8 (§6.2.2): the client owns the three stages, so it also owns their count-only measurement.
+        assertEquals(
+            ModelRequestTiming(ttfbMillis = 120, firstTokenMillis = 350, streamMillis = 900),
+            requestTiming(
+                sentAtNanos = 1_000_000_000L,
+                firstByteAtNanos = 1_120_000_000L,
+                firstTokenAtNanos = 1_350_000_000L,
+                endedAtNanos = 1_900_000_000L,
+            ),
+        )
+    }
+
+    @Test fun `an unreached timing stage is unavailable instead of a fabricated zero`() {
+        assertEquals(
+            ModelRequestTiming(ttfbMillis = null, firstTokenMillis = null, streamMillis = null),
+            requestTiming(
+                sentAtNanos = null,
+                firstByteAtNanos = null,
+                firstTokenAtNanos = null,
+                endedAtNanos = 5_000_000_000L,
+            ),
+            "a request that never left admission has no latency to report",
+        )
+        assertEquals(
+            ModelRequestTiming(ttfbMillis = null, firstTokenMillis = null, streamMillis = 500),
+            requestTiming(
+                sentAtNanos = 1_000_000_000L,
+                firstByteAtNanos = null,
+                firstTokenAtNanos = null,
+                endedAtNanos = 1_500_000_000L,
+            ),
+            "a failed request still reports how long it ran, but never an invented first byte",
+        )
+    }
+
+    @Test fun `the terminal carries the latency the client measured`() = Rig().use { rig ->
+        // The provider answers 400 ms after the request was sent; the client must report that as TTFB/stream, not zero.
+        rig.server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                rig.advance(400_000_000L)
+                return sse(CREATED + DELTA + COMPLETED)
+            }
+        }
+        rig.start()
+        rig.awaitTerminal()
+
+        val timing = assertNotNull(rig.terminal().timing)
+        val ttfb = assertNotNull(timing.ttfbMillis)
+        assertTrue(ttfb >= 400, "the first byte cannot have arrived before the provider answered: $timing")
+        assertNotNull(timing.firstTokenMillis, "the stream carried an answer delta: $timing")
+        assertTrue(
+            assertNotNull(timing.streamMillis) >= ttfb,
+            "the whole request covers the time to its first byte: $timing",
+        )
+    }
+
     private class Rig(authenticator: Authenticator = Authenticator.NONE,
         proxyAuthenticator: Authenticator = Authenticator.NONE, useProxy: Boolean = false) : AutoCloseable {
         val server = MockWebServer().apply { start(java.net.InetAddress.getByName("127.0.0.1"), 0) }

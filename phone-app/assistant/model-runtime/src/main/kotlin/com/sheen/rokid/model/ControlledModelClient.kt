@@ -49,6 +49,31 @@ private const val FIRST_TOKEN_TIMEOUT = "FIRST_TOKEN_TIMEOUT"
 private const val STREAM_IDLE_TIMEOUT = "STREAM_IDLE_TIMEOUT"
 private const val REQUEST_DEADLINE = "REQUEST_DEADLINE"
 
+/**
+ * 0.5.4 Task 8 (§6.2.2): one request's count-only latency from the instant it was actually sent.
+ *
+ * [firstByteAtNanos] is the first body read (true TTFB), [firstTokenAtNanos] the first liveness delta and
+ * [endedAtNanos] the terminal. A stage whose instant is missing is `null` — the request never got there — and the
+ * arithmetic never invents a zero. A null [sentAtNanos] means nothing left admission, so every field is unavailable.
+ */
+internal fun requestTiming(
+    sentAtNanos: Long?,
+    firstByteAtNanos: Long?,
+    firstTokenAtNanos: Long?,
+    endedAtNanos: Long,
+): ModelRequestTiming {
+    fun millisBetween(start: Long?, at: Long?): Long? {
+        if (start == null || at == null) return null
+        return ((at - start).coerceAtLeast(0L)) / 1_000_000L
+    }
+    val streamMillis = sentAtNanos?.let { ((endedAtNanos - it).coerceAtLeast(0L)) / 1_000_000L }
+    return ModelRequestTiming(
+        ttfbMillis = millisBetween(sentAtNanos, firstByteAtNanos),
+        firstTokenMillis = millisBetween(sentAtNanos, firstTokenAtNanos),
+        streamMillis = streamMillis,
+    )
+}
+
 class ControlledModelClient(
     http: OkHttpClient, private val repository: ProfileRepository, private val resolver: SecretResolver,
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
@@ -171,6 +196,9 @@ class ControlledModelClient(
         try { executor.execute {
             try {
                 if (!pending.active()) return@execute
+                // Task 8: the request really leaves here; the retry scheduler re-enters this method, so a second
+                // attempt restarts the measurement instead of inheriting the failed attempt's wait.
+                pending.noteSent()
                 call.execute().use { response ->
                     if (!pending.active()) return@use
                     if (!response.isSuccessful) {
@@ -234,6 +262,9 @@ class ControlledModelClient(
                                 if (pending.active()) (chatDecoder?.endOfInput() ?: responsesDecoder!!.endOfInput()).forEach(pending::deliver)
                                 break
                             }
+                            // Task 8: the first body byte is the true TTFB, which a metadata-only SSE frame precedes
+                            // the first token by; measured before the frame is decoded.
+                            pending.noteFirstByte()
                             total += count
                             if (total > 1048576L) { pending.end(ModelEnd.FAILED, "RESPONSE_LIMIT"); break }
                             frames(framing.feed(bytes.copyOf(count)))
@@ -275,10 +306,29 @@ class ControlledModelClient(
         val delta = AtomicBoolean(false)
         /** Task 6: true once the first liveness delta arrived; disarms the first-token grace. */
         private val firstToken = AtomicBoolean(false)
+        /** Task 8: the instant this attempt left the socket, and the first body byte/first liveness delta it reached. */
+        @Volatile private var sentAtNanos: Long? = null
+        @Volatile private var firstByteAtNanos: Long? = null
+        @Volatile private var firstTokenAtNanos: Long? = null
         private var firstTokenTimer: CancellationHandle? = null
         private var idleTimer: CancellationHandle? = null
         private var call: Call? = null
         private val timers = mutableListOf<CancellationHandle>()
+        /**
+         * Task 8: this attempt was really dispatched; the latency stages are measured from here.
+         *
+         * The retry scheduler re-enters `execute`, and a retry is only possible while no answer payload has been
+         * delivered (`delta` is still false), so the first byte/token cannot exist yet and only the start moves.
+         */
+        fun noteSent() {
+            sentAtNanos = clock.nowNanos()
+        }
+
+        /** Task 8: the first body byte of the current attempt. Idempotent; a later read never moves it. */
+        fun noteFirstByte() {
+            if (firstByteAtNanos == null) firstByteAtNanos = clock.nowNanos()
+        }
+
         fun active(): Boolean {
             if (done.get()) return false
             if (repository.get(input.profileId)?.revision != revision) { end(ModelEnd.CANCELLED, "PROFILE_CHANGED"); return false }
@@ -317,6 +367,9 @@ class ControlledModelClient(
         private fun noteFirstToken(event: ModelStreamEvent) {
             if (!isLiveness(event)) return
             if (!firstToken.compareAndSet(false, true)) return
+            // Task 8: the first-token stage is exactly this instant; it is recorded before the grace is disarmed so a
+            // racing terminal can never read a half-updated timing.
+            firstTokenAtNanos = clock.nowNanos()
             val grace = synchronized(lock) { val armed = firstTokenTimer; firstTokenTimer = null; armed }
             grace?.cancel()
         }
@@ -357,7 +410,10 @@ class ControlledModelClient(
         fun end(end: ModelEnd, code: String?, usage: ModelUsage? = null) {
             if (!done.compareAndSet(false, true)) return
             release()
-            try { listener(ModelStreamEvent.Terminal(input.requestId, end, usage, code)) } catch (_: Exception) { }
+            // Task 8: the terminal closes the third stage. Every exit (provider, watchdog, cancel) reports the latency
+            // it really reached; a stage that was never reached stays null.
+            val timing = requestTiming(sentAtNanos, firstByteAtNanos, firstTokenAtNanos, clock.nowNanos())
+            try { listener(ModelStreamEvent.Terminal(input.requestId, end, usage, code, timing)) } catch (_: Exception) { }
         }
         fun discard() { if (done.compareAndSet(false, true)) release() }
         private fun release() {

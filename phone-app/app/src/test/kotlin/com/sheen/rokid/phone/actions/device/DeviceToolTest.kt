@@ -20,6 +20,7 @@ import com.sheen.rokid.device.ScreenFilter
 import com.sheen.rokid.device.Screenshot
 import com.sheen.rokid.device.Timing
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
+import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.DeviceProfile
@@ -270,6 +271,23 @@ class DeviceToolTest {
         assertEquals("DEVICE_SCREEN_OFF", execution.code)
         assertTrue(execution.recoverable)
         assertEquals(ToolOutcome.Refused, execution.outcome)
+    }
+
+    @Test
+    fun `a dispatched act reports the kernel's settle milliseconds`() {
+        // 0.5.4 Task 8 (§6.2.2): `settleMs` is the post-action observe/settle time the kernel already measures. `rebind`
+        // does not exist yet (Task 13); the line is structured to append it without changing this shape.
+        val operations = FakeDeviceOperations(observation())
+        operations.actEnvelope = DeviceEnvelope.success(
+            "act", "accessibility", true, null, null, Timing(actMs = 4, observeMs = 9, totalMs = 20),
+        )
+
+        val acts = withP3Sink { captured ->
+            tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertEquals(listOf("P3_ACT settleMs=9"), acts)
     }
 
     @Test

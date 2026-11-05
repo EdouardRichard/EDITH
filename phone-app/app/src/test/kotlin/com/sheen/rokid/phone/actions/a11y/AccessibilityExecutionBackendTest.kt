@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.actions.a11y
 import com.sheen.rokid.phone.storage.unavailable
+import com.sheen.rokid.phone.withP3Sink
 
 import com.sheen.rokid.phone.actions.ExecutionRouter
 import com.sheen.rokid.plugin.ActionOutcome
@@ -181,6 +182,30 @@ class AccessibilityExecutionBackendTest {
         val ui = FakeUi()
 
         assertEquals(ActionOutcome.Refused, backend(ui).execute("tap_anything", "{}").outcome)
+    }
+
+    @Test fun `index actions report only their via token`() {
+        // 0.5.4 Task 8 (§6.2.2): `P3_ACT` starts with the targeting mode this task really has — index. Coordinate taps
+        // arrive in Task 11 and extend the same token vocabulary; the line must never carry screen text or the index.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        val acts = withP3Sink { captured ->
+            fun readAnd(action: String, args: String) {
+                b.execute("read_screen", "{}")
+                b.execute(action, args)
+            }
+            readAnd("tap", """{"index":0}""")
+            readAnd("long_press", """{"index":0}""")
+            readAnd("input_text", """{"index":0,"text":"hello"}""")
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertEquals(listOf("P3_ACT via=index", "P3_ACT via=index", "P3_ACT via=index"), acts)
+        assertTrue(
+            "no screen or typed text may ride it: $acts",
+            acts.none { it.contains("WLAN") || it.contains("hello") },
+        )
     }
 
     @Test fun `the click result alone is not the verdict`() {
