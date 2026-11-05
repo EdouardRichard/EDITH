@@ -12,7 +12,7 @@ package com.sheen.rokid.agent
  * event titles one snapshot may carry.
  */
 data class PerceptionPolicy(
-    val elementLimit: Int = 60,
+    val elementLimit: Int = 120,
     val notificationLimit: Int = 3,
     val refTtlMillis: Long = 20_000L,
     val includeClipboard: Boolean = true,
