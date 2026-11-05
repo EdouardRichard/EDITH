@@ -302,6 +302,13 @@ data class AgentRun(
      * A default instance keeps every pre-0.25 `AgentRun` comparison and construction unchanged.
      */
     val metrics: AgentMetrics = AgentMetrics(),
+    /**
+     * 0.53: the chain of thought of the model turn that ended this run, or `null` when it produced none (thinking off,
+     * a non-DeepSeek profile, or the run ended before any reply). The plugin writes it onto the store's closing
+     * assistant message ([ConversationStore.appendAssistant]/`closeStoreTurnWithReply`) so the next tool-bearing request
+     * can replay it; it is memory-only and never logged.
+     */
+    val finalReasoning: String? = null,
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -750,7 +757,9 @@ class AgentLoop(
             metricOverflows += reply.overflowRecoveries
             if (reply.terminal == ModelEnd.FAILED && reply.safeCode == CONTEXT_OVERFLOW) metricOverflows++
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
-            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+            if (cancelled) {
+                return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+            }
 
             // Only an INCOMPLETE turn with no call is an unproductive turn: a cut-off turn that still carries calls
             // produced real steps, so they run below instead of being retried away.
@@ -766,19 +775,23 @@ class AgentLoop(
                             history,
                             reply.text,
                             spentSteps,
+                            reply.reasoning,
                         )
                     }
-                    appendRetry(history, reply.text)
+                    appendRetry(history, reply.text, reply.reasoning)
                     continue
                 }
                 ModelEnd.FAILED -> return finish(
                     AgentOutcome.FAILED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
                 )
                 ModelEnd.DEADLINE -> return finish(
                     AgentOutcome.DEADLINE, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
                 )
                 ModelEnd.CANCELLED -> return finish(
                     AgentOutcome.CANCELLED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
                 )
                 ModelEnd.COMPLETED, null -> Unit
             }
@@ -787,9 +800,12 @@ class AgentLoop(
                 if (reply.text.isBlank()) {
                     unproductiveTurns++
                     if (unproductiveTurns >= maxEmptyTurns) {
-                        return finish(AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text, spentSteps)
+                        return finish(
+                            AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text, spentSteps,
+                            reply.reasoning,
+                        )
                     }
-                    appendRetry(history, reply.text)
+                    appendRetry(history, reply.text, reply.reasoning)
                     continue
                 }
                 // R58: a text-only plan while the run has already acted is not an answer. Nudge it back into action
@@ -798,19 +814,29 @@ class AgentLoop(
                     if (nudges < MAX_PLAN_NUDGES && reply.text != lastNudgedText) {
                         lastNudgedText = reply.text
                         nudges++
-                        appendPlanNudge(history, reply.text)
+                        appendPlanNudge(history, reply.text, reply.reasoning)
                         continue
                     }
                     if (nudges >= MAX_PLAN_NUDGES) planNudgeCap = 1
-                    return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
+                    return finish(
+                        AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps,
+                        reply.reasoning,
+                    )
                 }
-                return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
+                return finish(
+                    AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
+                )
             }
 
             unproductiveTurns = 0
             // The assistant's text opens the round, then its calls are echoed before any output, so a call never
             // arrives orphaned and a tool run never starts a history group on its own.
-            history += ModelHistoryItem.Text(MessageRole.ASSISTANT, reply.text.ifBlank { TOOL_CALL_TEXT })
+            history += ModelHistoryItem.Text(
+                MessageRole.ASSISTANT,
+                reply.text.ifBlank { TOOL_CALL_TEXT },
+                reply.reasoning,
+            )
             reply.toolCalls.forEach { call ->
                 history += ModelHistoryItem.ToolCall(
                     callId = call.id,
@@ -820,11 +846,15 @@ class AgentLoop(
                 )
             }
             for (call in reply.toolCalls) {
-                if (spentSteps >= maxSteps) return finish(AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps)
+                if (spentSteps >= maxSteps) {
+                    return finish(
+                        AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps, reply.reasoning,
+                    )
+                }
                 // R60: the per-call cap is min(descriptor timeout, deadline - now); an already-expired deadline must not
                 // start another tool at all.
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 val registered = registry.resolve(call.name)
                 // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
@@ -856,14 +886,17 @@ class AgentLoop(
                             // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
                             // fingerprint, no guard feed, no global no-progress count, no error streak. It is also the
                             // "not attempted" null: the call never executed, so no failure observation is taken here.
-                            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                            if (cancelled) {
+                                return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+                            }
                             if (spentObservations >= maxObservations) {
                                 return finish(
                                     AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps,
+                                    reply.reasoning,
                                 )
                             }
                             if (clock.nowNanos() >= turnDeadlineNanos) {
-                                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
                             }
                             continue
                         }
@@ -871,7 +904,7 @@ class AgentLoop(
                             val code = decision.pattern.safeCode
                             steps += AgentStep(steps.size + 1, call.name, code, executed = false)
                             appendToolOutput(history, call.id, code)
-                            return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps)
+                            return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps, reply.reasoning)
                         }
                         LoopDecision.Allow -> Unit
                     }
@@ -1027,7 +1060,7 @@ class AgentLoop(
                 // A cancel that arrived while the tool was running is not a tool failure: no output is appended for the
                 // unfinished call (R61), so the model never sees a half-finished step as if it had completed.
                 if (execution.cancelled) {
-                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 // edith-0.3 Phase 2.2 Task 3: every non-Done screen-tool result gets the same best-effort observation
                 // treatment, whether it came back from the executor (a throw or a tool's own failure), from a
@@ -1059,7 +1092,10 @@ class AgentLoop(
                         result.images,
                         nonPersistent = mustRedact(result),
                     )
-                    return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
                 }
                 // R97: the re-arm above is exactly-once per confirmed timeout, and only a confirmed stop gets it: a STOP,
                 // a cancel and a teardown stay cancelled, so those paths never reach it.
@@ -1108,25 +1144,34 @@ class AgentLoop(
                     nonPersistent = mustRedact(result),
                 )
                 if (execution.executed && result.ok) successfulToolExecutions++
-                if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
+                if (guard.tripped) {
+                    return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps, reply.reasoning)
+                }
                 if (errorsSeen.repeatTerminated) {
-                    return finish(AgentOutcome.FAILED, REPEATED_ERROR, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.FAILED, REPEATED_ERROR, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 if (after.critical) {
                     return finish(
                         AgentOutcome.NO_PROGRESS, LoopPattern.GLOBAL_CIRCUIT_BREAKER.safeCode,
-                        null, steps, history, "", spentSteps,
+                        null, steps, history, "", spentSteps, reply.reasoning,
                     )
                 }
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
-                    return finish(AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps, reply.reasoning,
+                    )
                 }
-                if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                if (cancelled) {
+                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+                }
                 if (spentObservations >= maxObservations) {
-                    return finish(AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
                 }
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
                 }
             }
         }
@@ -1487,8 +1532,8 @@ class AgentLoop(
      * stateless and a lone user instruction would be an unpaired turn); the user half is loop scaffolding and
      * [withoutRetryScaffolding] strips the pair before a caller stores the transcript.
      */
-    private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String) {
-        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
+    private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String, reasoning: String? = null) {
+        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT }, reasoning)
         history += ModelHistoryItem.Text(MessageRole.USER, planNudgeInstruction)
     }
 
@@ -1577,10 +1622,19 @@ class AgentLoop(
         history: MutableList<ModelHistoryItem>,
         closingText: String,
         spentSteps: Int,
+        /**
+         * 0.53: the current model turn's reasoning. A closing assistant text added here is the same turn's assistant
+         * half, so it carries that turn's reasoning; a path with no reply passes `null` and nothing is fabricated.
+         */
+        closingReasoning: String? = null,
     ): AgentRun {
         val last = history.lastOrNull()
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
-            history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
+            history += ModelHistoryItem.Text(
+                MessageRole.ASSISTANT,
+                closingText.ifBlank { CLOSED_TURN_TEXT },
+                closingReasoning,
+            )
         }
         lastTranscript = transcriptForStorage(history, runHistoryStart)
         val metrics = AgentMetrics(
@@ -1600,7 +1654,7 @@ class AgentLoop(
         runCatching { metricLine(renderMetric(metrics)) }
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
-            spentObservations, planNudgeCap, metrics,
+            spentObservations, planNudgeCap, metrics, closingReasoning,
         )
     }
 
@@ -1763,8 +1817,8 @@ class AgentLoop(
      * stateless and the transcript alternates, so a lone user instruction would be an unpaired turn. An empty turn
      * gets a placeholder because `ModelHistoryItem.Text` refuses blank text.
      */
-    private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String) {
-        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
+    private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String, reasoning: String? = null) {
+        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT }, reasoning)
         history += ModelHistoryItem.Text(MessageRole.USER, retryInstruction)
     }
 

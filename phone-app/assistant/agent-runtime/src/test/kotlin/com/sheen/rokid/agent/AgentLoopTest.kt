@@ -1531,6 +1531,66 @@ class AgentLoopTest {
         )
     }
 
+    // ------------------------------------------------------------ 0.53: reasoning stays with its assistant turn
+
+    @Test fun `a tool round keeps the reply reasoning in history`() {
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(text = "先查", calls = listOf(call("c1", "lookup")), reasoning = "想"),
+                reply(text = "答案"),
+            ),
+        )
+        val executor = executorOf("lookup").apply { outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") } }
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        val second = gateway.requests[1].history
+        val opener = second.filterIsInstance<ModelHistoryItem.Text>().single { it.role == MessageRole.ASSISTANT }
+        assertEquals("想", opener.reasoning, "the tool-round assistant text must keep its reasoning: $second")
+        assertEquals("先查", opener.text)
+    }
+
+    @Test fun `the final answer reasoning reaches the run`() {
+        val gateway = ScriptedGateway(listOf(reply(text = "答案", reasoning = "想")))
+
+        val run = newLoop(gateway).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("答案", run.finalText)
+        assertEquals("想", run.finalReasoning, "the closing answer's reasoning must ride the run")
+    }
+
+    @Test fun `a retry scaffold keeps the reasoning of the empty turn`() {
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(text = "半句", terminal = ModelEnd.INCOMPLETE, reasoning = "想"),
+                reply(text = "答案"),
+            ),
+        )
+
+        newLoop(gateway).run(request())
+
+        val retried = gateway.requests[1].history
+        val assistant = retried.filterIsInstance<ModelHistoryItem.Text>()
+            .filter { it.role == MessageRole.ASSISTANT }
+        assertEquals("想", assistant.single().reasoning, "the retried assistant half must keep its reasoning: $retried")
+    }
+
+    @Test fun `the closing text added by finish carries the reasoning of the failed turn`() {
+        // The failed turn produced reasoning but no text, so the loop's own closing placeholder is the assistant half
+        // that reaches the transcript; it must keep the reasoning the model did stream.
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "", terminal = ModelEnd.FAILED, safeCode = "provider_error", reasoning = "想")),
+        )
+
+        val run = newLoop(gateway).run(request())
+
+        val closing = run.transcript.last()
+        assertIs<ModelHistoryItem.Text>(closing, "the run must close on assistant text: ${run.transcript}")
+        assertEquals("想", closing.reasoning)
+        assertEquals("想", run.finalReasoning)
+    }
+
     // ------------------------------------------------- the confirmation wait is not the turn's budget (D49)
 
     /** A confirmation channel that spends the **user's** time: the clock moves while it waits. */

@@ -398,6 +398,53 @@ class TurnTranscriptRecordTest {
         )
     }
 
+    // ------------------------------------------------------------ 0.53: reasoning rides the assistant turn
+
+    @Test
+    fun `an assistant reply keeps its reasoning in the store`() {
+        val stores = stores()
+        val rig = rig(stores)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, "想"))
+            streamText(request, listener, "现在九点。")
+        }
+
+        rig.wakeAndFinal("现在几点了")
+
+        val closing = stores.getValue(ContextRoute.WAKE).history().last()
+        val text = assertIs<ModelHistoryItem.Text>(closing, "the turn must close on assistant text")
+        assertEquals("现在九点。", text.text)
+        assertEquals("想", text.reasoning, "the store's closing replacement must keep the run's final reasoning")
+    }
+
+    @Test
+    fun `a tool round and its closing reply keep their own reasoning`() {
+        val stores = stores()
+        val rig = rig(stores)
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(ModelStreamEvent.ReasoningDelta(modelRequest.requestId, "想1"))
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                listener(ModelStreamEvent.ReasoningDelta(modelRequest.requestId, "想2"))
+                streamText(modelRequest, listener, "看到了。")
+            }
+        }
+
+        rig.wakeAndFinal("看一下屏幕")
+
+        val assistantTexts = stores.getValue(ContextRoute.WAKE).history()
+            .filterIsInstance<ModelHistoryItem.Text>()
+            .filter { it.role == MessageRole.ASSISTANT }
+        assertEquals(listOf("想1", "想2"), assistantTexts.map { it.reasoning }, assistantTexts.toString())
+        assertEquals("看到了。", assistantTexts.last().text)
+    }
+
     // ------------------------------------------------------------ the fallback path
 
     @Test

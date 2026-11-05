@@ -23,7 +23,9 @@ internal fun reply(
     terminal: ModelEnd? = ModelEnd.COMPLETED,
     safeCode: String? = null,
     calls: List<ToolCall> = emptyList(),
-) = GatewayReply(toolCalls = calls, text = text, terminal = terminal, safeCode = safeCode)
+    /** 0.53: the chain of thought this turn's reply carries, when the fixture is a DeepSeek thinking turn. */
+    reasoning: String? = null,
+) = GatewayReply(toolCalls = calls, text = text, terminal = terminal, safeCode = safeCode, reasoning = reasoning)
 
 /** A tool call fixture; [argsJson] is the model's own string and is never rewritten. */
 internal fun call(id: String, name: String, argsJson: String = "{}", itemId: String = id) =

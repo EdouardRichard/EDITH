@@ -93,9 +93,10 @@ class ProactiveContextWiringTest {
 
         fun arm() = rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
 
-        /** A proactive request that answers with a `propose_hint` call. */
-        fun propose(text: String) {
+        /** A proactive request that answers with a `propose_hint` call, optionally after streaming [reasoning]. */
+        fun propose(text: String, reasoning: String? = null) {
             rig.model.onRequest = { request, listener ->
+                reasoning?.let { listener(ModelStreamEvent.ReasoningDelta(request.requestId, it)) }
                 listener(smartToolCall("c1", "propose_hint", """{"text":"$text"}""", request.requestId))
                 listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
             }
@@ -144,6 +145,24 @@ class ProactiveContextWiringTest {
             f.compressor.storesCompressed.any { it === f.stores.getValue(ContextRoute.WAKE) },
             "the wake route was compressed by a proactive turn",
         )
+    }
+
+    @Test
+    fun `a proactive hint keeps its reasoning in the proactive transcript`() {
+        // 0.53: the hint turn's history carries the reasoning of the `propose_hint` call. Recording the spoken hint
+        // without it would make the next proactive tool-bearing request replay an assistant turn with no reasoning —
+        // exactly the shape DeepSeek rejects with 400.
+        val f = Fixture()
+        f.propose("主动提示B", reasoning = "想")
+        f.arm()
+
+        f.rig.plugin.handle(TranscriptEvent(f.rig.transcript("现在几点了")))
+
+        val stored = f.stores.getValue(ContextRoute.PROACTIVE).history()
+        val hint = stored.filterIsInstance<ModelHistoryItem.Text>()
+            .single { it.role == MessageRole.ASSISTANT }
+        assertEquals("主动提示B", hint.text)
+        assertEquals("想", hint.reasoning, "the proactive transcript must keep the hint's reasoning: $stored")
     }
 
     private companion object {

@@ -568,7 +568,17 @@ class ModelClientGateway(
                         history += items
                     }
                 }
-                else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
+                else -> {
+                    // 0.53: a TRANSCRIPT assistant segment carries the turn's reasoning beside its text. It is restored
+                    // onto the `Text` item — the one history shape that can replay it — and only for an assistant turn;
+                    // a summary (folded into the leading user text above) never carries a chain of thought.
+                    val role = roleOf(segment)
+                    history += ModelHistoryItem.Text(
+                        role,
+                        segment.text,
+                        if (role == MessageRole.ASSISTANT) segment.reasoning else null,
+                    )
+                }
             }
         }
         val summaryText = summaries.joinToString("\n\n")

@@ -3838,6 +3838,8 @@ class SmartAssistantPlugin(
         }
         val context = contexts.context(route)
         context.appendUser(userText)
+        // 0.53: the legacy `ConversationContext` path carries no reasoning (it is not the live frame path; its history
+        // never reaches a DeepSeek tool-bearing request through this wiring). The store path above is the one that must.
         contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context)
     }
@@ -3895,10 +3897,10 @@ class SmartAssistantPlugin(
         )
         if (conversation.isEmpty()) {
             store.appendUser(userText)
-            store.appendAssistant(reply)
+            store.appendAssistant(reply, run.finalReasoning)
             return
         }
-        store.appendTranscript(closeStoreTurnWithReply(conversation, reply))
+        store.appendTranscript(closeStoreTurnWithReply(conversation, reply, run.finalReasoning))
     }
 
     /**
@@ -3913,10 +3915,12 @@ class SmartAssistantPlugin(
     private fun closeStoreTurnWithReply(
         turn: List<ModelHistoryItem>,
         reply: String,
+        /** 0.53: the run's `finalReasoning`; it rides the replacement assistant text so the next request can replay it. */
+        reasoning: String? = null,
     ): List<ModelHistoryItem> {
         val last = turn.lastOrNull()
         val kept = if (last is ModelHistoryItem.Text && last.role == MessageRole.ASSISTANT) turn.dropLast(1) else turn
-        return kept + ModelHistoryItem.Text(MessageRole.ASSISTANT, reply)
+        return kept + ModelHistoryItem.Text(MessageRole.ASSISTANT, reply, reasoning)
     }
 
     /**
@@ -4850,7 +4854,14 @@ class SmartAssistantPlugin(
             // against the same budget, **before** the hint is submitted. The order is the submission's, not the
             // compressor's: the compressor's truncation is what writes the dropped messages to memory, and the trigger
             // belongs to the conversation whether or not the display accepted it.
-            recordProactiveTurn(trigger.transcript, hintText, hint.hintId, hint.turnId, gateway.lastTrim)
+            recordProactiveTurn(
+                trigger.transcript,
+                hintText,
+                hint.hintId,
+                hint.turnId,
+                gateway.lastTrim,
+                reasoning = run.finalReasoning,
+            )
             submitProactiveHint(hint, hintText)
         } finally {
             // Every exit - a hint, silence, a cancellation, a throw - closes the perception boundary it opened.
@@ -4925,6 +4936,12 @@ class SmartAssistantPlugin(
         hintId: String,
         turnId: String,
         trim: TrimCounts?,
+        /**
+         * 0.53: the hint turn's `AgentRun.finalReasoning`. A later proactive request carries `propose_hint` (tools), so
+         * the transcript's assistant hint must replay its reasoning or DeepSeek rejects the request with 400. `null`
+         * when the turn produced none — never fabricated.
+         */
+        reasoning: String? = null,
     ) {
         if (triggerTranscript.isBlank()) return
         // Phase C: the trigger is what this route records as its user side (see this method's note above), so it is also
@@ -4934,7 +4951,7 @@ class SmartAssistantPlugin(
         recordTurnAndCompress(
             ContextRoute.PROACTIVE,
             triggerTranscript,
-            AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList()),
+            AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList(), finalReasoning = reasoning),
             trim = trim,
         )
     }
@@ -5920,6 +5937,9 @@ internal fun ModelHistoryItem.toSegment(): Segment = when (this) {
         trusted = true,
         text = text,
         role = if (role == MessageRole.USER) SegmentRole.USER else SegmentRole.ASSISTANT,
+        // 0.53: reasoning rides its assistant text through the frame renderer. `Text` guarantees it is null for a user
+        // turn, and `Segment` re-checks the role, so a malformed value cannot become a user segment's reasoning.
+        reasoning = reasoning,
     )
     is ModelHistoryItem.ToolCall -> Segment(
         origin = SegmentOrigin.TOOL_ROUND,

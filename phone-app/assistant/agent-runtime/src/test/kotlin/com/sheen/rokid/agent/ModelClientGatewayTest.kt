@@ -959,6 +959,23 @@ class ModelClientGatewayTest {
         )
     }
 
+    @Test fun `a frame's assistant transcript keeps its reasoning into the request history`() {
+        // 0.53: the store hands the next turn a `TRANSCRIPT` assistant segment carrying the reasoning; frameToTranscript
+        // is the one renderer that must put it back on the `Text` item, or the adapter has nothing to replay.
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧问题", SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧回答", SegmentRole.ASSISTANT, reasoning = "旧想"),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+        )
+
+        val request = captureRequest(frame(*flow.toTypedArray()))
+
+        val assistant = request.history.filterIsInstance<ModelHistoryItem.Text>()
+            .single { it.role == MessageRole.ASSISTANT }
+        assertEquals("旧回答", assistant.text)
+        assertEquals("旧想", assistant.reasoning, "the frame renderer must not drop the reasoning: ${request.history}")
+    }
+
     @Test fun `without a frame the gateway behaves exactly as before`() {
         // 旧通路回归：既有 15 个 GatewayTurn 调用点的形状不能被这次改动影响。
         val client = terminalClient()

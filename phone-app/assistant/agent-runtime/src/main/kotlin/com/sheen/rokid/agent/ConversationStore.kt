@@ -57,10 +57,18 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
 
     /**
      * Appends an assistant message as a TRANSCRIPT item trusted=true, with [SegmentRole.ASSISTANT].
+     *
+     * [reasoning] is the turn's chain of thought (0.53). It rides the stored [ModelHistoryItem.Text] so it can be
+     * replayed on the next DeepSeek request, but it is never part of [snapshot]'s rendered [Segment.text] and never
+     * enters a summary: the two travel together, the visible text does not include it.
      */
     @Synchronized
-    fun appendAssistant(text: String) =
-        add(ModelHistoryItem.Text(MessageRole.ASSISTANT, text), SegmentOrigin.TRANSCRIPT, SegmentRole.ASSISTANT)
+    fun appendAssistant(text: String, reasoning: String? = null) =
+        add(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, text, reasoning),
+            SegmentOrigin.TRANSCRIPT,
+            SegmentRole.ASSISTANT,
+        )
 
     /**
      * Appends a tool call as a TOOL_ROUND item trusted=true. A tool call is not conversation-flow text,
@@ -179,6 +187,7 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
             trusted = it.origin == SegmentOrigin.TRANSCRIPT || it.origin == SegmentOrigin.TOOL_ROUND,
             text = textOf(it.item),
             role = it.role,
+            reasoning = reasoningOf(it.item),
         )
     }
 
@@ -370,6 +379,15 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      */
     private fun boundedBody(text: String): String =
         if (SummaryBoundary.isRendered(text)) text else SummaryBoundary.render(text)
+
+    /**
+     * The reasoning a stored item carries (0.53). Only an assistant [ModelHistoryItem.Text] can hold one — the contract
+     * forbids it elsewhere — so every other item answers `null` rather than a fabricated value.
+     *
+     * This is the store's one bridge from the wire shape to [Segment.reasoning]; [textOf] is deliberately left alone so
+     * the rendered text never grows a chain of thought.
+     */
+    private fun reasoningOf(item: ModelHistoryItem): String? = (item as? ModelHistoryItem.Text)?.reasoning
 
     /**
      * The text of a stored item. `estimatedText()` is `internal` to `plugins-smart`'s `ContextTextMeasure.kt`
