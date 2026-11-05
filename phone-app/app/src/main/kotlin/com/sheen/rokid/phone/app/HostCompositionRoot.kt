@@ -3859,7 +3859,16 @@ class HostCompositionRoot internal constructor(
                 // 0.52: the live catalog projection. Read through the root holder because the composition instance is
                 // built after this wiring; the host's own `activeCatalogProfile()` is the single answer to "which
                 // model is active now", so a provider/model switch needs no re-assembly.
-                activeProfile = { rootHolder[0]?.activeCatalogProfile() })
+                activeProfile = { rootHolder[0]?.activeCatalogProfile() },
+                // Debug-only model trace (debug/0.5.4-model-trace): one JSON line per finished agent run, appended to
+                // the App-private `filesDir/edith-model-trace.jsonl` for `adb exec-out run-as ... cat`. `BuildConfig.DEBUG`
+                // is a compile-time constant, so a release build folds this to the plugin's no-op default and never
+                // writes a model body, transcript or observation to disk.
+                traceLine = if (BuildConfig.DEBUG) {
+                    com.sheen.rokid.phone.plugin.smarthelper.trace.ModelTraceFile.writer(context.filesDir)
+                } else {
+                    {}
+                })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
             // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed

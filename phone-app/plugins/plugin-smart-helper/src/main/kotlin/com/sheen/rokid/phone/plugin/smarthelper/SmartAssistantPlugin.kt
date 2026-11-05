@@ -151,6 +151,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillManager
 import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirectory
+import com.sheen.rokid.phone.plugin.smarthelper.trace.ModelTrace
 import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
@@ -593,6 +594,16 @@ class SmartAssistantPlugin(
      * switch is meant to be global and live. The `{ false }` default keeps every pre-4B caller in normal mode.
      */
     private val noInterception: () -> Boolean = { false },
+    /**
+     * Debug-only model trace sink: one JSON line per finished agent run, or the `{}` no-op default.
+     *
+     * The plugin itself never writes a file or a log here — it only formats the run it just completed. A **release**
+     * build keeps this default (the App's wiring gates its file writer behind `BuildConfig.DEBUG`), so no model body,
+     * transcript or observation can leave the device from a delivery APK. This is deliberately separate from `P3Log`:
+     * `P3Log`'s count-and-code contract is pinned and must not grow bodies. A throwing sink is swallowed for the same
+     * reason it is separate: tracing an observation must never fail the turn it describes.
+     */
+    private val traceLine: (String) -> Unit = {},
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -1532,6 +1543,20 @@ class SmartAssistantPlugin(
                 "staticChars=${frame.systemText.length} " +
                 "dynamicChars=$dynamicChars",
         )
+    }
+
+    /**
+     * Debug-only: hands one finished run to [traceLine] as a single JSON line.
+     *
+     * Formatting and the sink are both guarded. A trace is an observation of the turn, never a participant in it, and a
+     * sink wired to a broken file must not turn a delivered answer into `PLUGIN_RUN_THREW`. The timestamp is wall time
+     * because the trace file is read later, off-device; the plugin's own monotonic clock answers relative ordering.
+     */
+    private fun emitModelTrace(turnId: String, route: AssistantRoute, run: AgentRun, sentFrame: RequestFrame?) {
+        val line = runCatching {
+            ModelTrace.line(turnId, route.name, run, sentFrame, System.currentTimeMillis())
+        }.getOrNull() ?: return
+        runCatching { traceLine(line) }
     }
 
     override fun activate(context: PluginContext) {
@@ -3528,6 +3553,9 @@ class SmartAssistantPlugin(
         // unsupported, so only a real profile that omits `IMAGE` turns the rendered coverage into
         // `unavailable(no_image_profile)`. The host's gate-off token (`disabled`) always wins over this.
         val profileAcceptsImages = turnProfile?.let { InputModality.IMAGE in it.inputs }
+        // Debug trace: the last assembled frame is the only place the observation the model actually read survives,
+        // because `AgentRun.transcript` replaces perception-bearing tool outputs with a marker at finish.
+        var traceFrame: RequestFrame? = null
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -3609,7 +3637,10 @@ class SmartAssistantPlugin(
                     // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
                     // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no
                     // frame and therefore emits no prompt line.
-                    onRequestBuilt = { frame -> logPromptRequest(promptRoute, frame) },
+                    onRequestBuilt = { frame ->
+                        logPromptRequest(promptRoute, frame)
+                        traceFrame = frame
+                    },
                 ),
             )
         } catch (failure: Throwable) {
@@ -3653,6 +3684,9 @@ class SmartAssistantPlugin(
             "P3_TURN end turn=${owned.turnId} outcome=${run.outcome} code=${run.safeCode ?: "-"} " +
                 "steps=${run.steps.size}${routeField(owned.route)}",
         )
+        // Debug-only trace: exactly one line per finished run, emitted after the run's own counts are reported. It
+        // runs on the detached path too (that is why it sits before the `stillOurs` return): the run did happen.
+        emitModelTrace(owned.turnId, owned.route, run, traceFrame)
         // Phase 6 (obligations 2 and 5): close the turn that `beginSkillTurn()` opened. This runs before the outcome
         // is submitted **and** on the detached path below, so every ending pairs with its opening: an unclosed turn
         // would let the following turn fold into this one as a single observation, and a body pulled here would still
@@ -4751,6 +4785,8 @@ class SmartAssistantPlugin(
             // unsupported, so only a real profile that omits `IMAGE` downgrades the rendered coverage.
             val profileAcceptsImages = proactiveProfile?.let { InputModality.IMAGE in it.inputs }
             val tool = ProposeHintTool()
+            // Debug trace: same seam as the share turn engine — the last assembled frame carries the unredacted round.
+            var traceFrame: RequestFrame? = null
             val loop = AgentLoop(
                 gateway = gateway,
                 registry = ToolRegistry(listOf(tool)),
@@ -4808,7 +4844,10 @@ class SmartAssistantPlugin(
                                 )
                             }
                         },
-                        onRequestBuilt = { frame -> logPromptRequest(PromptRoute.PROACTIVE_HINT, frame) },
+                        onRequestBuilt = { frame ->
+                            logPromptRequest(PromptRoute.PROACTIVE_HINT, frame)
+                            traceFrame = frame
+                        },
                         // The hint turn never executes a screen tool; the loop's failure observation has no subject.
                         observationSource = null,
                     ),
@@ -4825,6 +4864,8 @@ class SmartAssistantPlugin(
                 synchronized(gate) { if (request.loop === loop) request.loop = null }
             }
             val elapsed = elapsedMillis(started)
+            // Debug-only trace: the hint turn is its own `AgentLoop`, so it needs its own line (one per run).
+            emitModelTrace(request.turnId, AssistantRoute.PROACTIVE, run, traceFrame)
             val decision = hintDecision(run, tool, request)
             val hintText = decision.text
             if (hintText == null) {

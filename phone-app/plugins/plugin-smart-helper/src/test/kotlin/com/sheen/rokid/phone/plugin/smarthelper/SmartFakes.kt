@@ -660,6 +660,11 @@ internal class SmartTestRig(
      * (`services.deviceState()` inside `activate`) under test.
      */
     deviceState: DeviceStateProvider? = null,
+    /**
+     * Debug-only model trace sink. The `{}` default is the plugin's own no-op default, so every pre-trace rig keeps
+     * writing nothing; the trace tests pass a collector and assert one line per finished run.
+     */
+    traceLine: (String) -> Unit = {},
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -702,6 +707,7 @@ internal class SmartTestRig(
             phoneOnly = { phoneOnly },
             noInterception = { noInterception },
             deviceState = deviceState,
+            traceLine = traceLine,
         )
         // 0.3 Phase 3: the seam is an internal property (a public constructor must not expose the internal
         // `PromptRoute`); a test that pins a catalog sets it here, before any activation.

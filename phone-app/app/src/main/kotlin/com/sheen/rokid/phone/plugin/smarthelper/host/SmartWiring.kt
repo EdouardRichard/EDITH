@@ -75,6 +75,15 @@ internal class SmartWiring(
      * **Appended last** so every existing positional construction of this class stays valid.
      */
     activeProfile: () -> ModelProfile? = { null },
+    /**
+     * Debug-only model trace sink (App-private `filesDir/edith-model-trace.jsonl`), or the `{}` no-op default.
+     *
+     * This is the wiring's only debug-only channel: `HostCompositionRoot.create` passes the file writer **only** when
+     * `BuildConfig.DEBUG`, so a release build keeps the plugin's own no-op default and writes nothing. A stand-alone
+     * wiring (tests, harnesses) also writes nothing. **Appended last** so every existing positional construction of this
+     * class stays valid.
+     */
+    traceLine: (String) -> Unit = {},
 ) {
     /** The word list the plugin declares on activation; also the `Capability.WakeWord` provider's content. */
     val wakeWords: SmartWakeWordRegistry = SmartWakeWordRegistry(settings.wakeWords)
@@ -140,6 +149,9 @@ internal class SmartWiring(
         // 0.3 Phase 4B (`D189`): the live 「不拦截」 gate. A provider (not a snapshot) is what lets a settings save take
         // effect from the next tool call; the plugin passes it to both the policy and the command-level precheck wrapper.
         noInterception = noInterception,
+        // Debug-only: one JSON line per finished agent run. The no-op default keeps a release APK and every stand-alone
+        // wiring from writing anything; only `HostCompositionRoot.create` injects the file writer, behind BuildConfig.DEBUG.
+        traceLine = traceLine,
     )
 
     companion object {
