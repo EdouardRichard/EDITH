@@ -735,6 +735,9 @@ class DeviceTool(
                 // and make a broken artifact store indistinguishable from a normal pending reference.
                 put(DIAGNOSTIC_KEY, kernelDiagnostic
                     ?: "screenshot is an artifact reference; bytes are not inlined")
+                // 0.5.4 T11: the picture is a scaled JPEG, so the model needs both pixel spaces to turn a screenshot
+                // point into a coordinate the a11y `tap` accepts.
+                screenshotDimensions(envelope).forEach { (key, value) -> put(key, value) }
             }
         } else {
             buildJsonObject {
@@ -765,6 +768,28 @@ class DeviceTool(
             }
         }
         return result(envelope, data, observation = observation)
+    }
+
+    /**
+     * 0.5.4 T11 (§6.3.3): the two pixel spaces a screenshot spans.
+     *
+     * `image*` is the encoded (scaled) JPEG carried by the artifact reference; `screen*` is the display the a11y bounds
+     * and coordinate taps use. A dimension the host cannot prove is **omitted**, never defaulted: a fabricated screen
+     * size would make a model convert a screenshot point into a wrong tap. `deviceState` is the production source of
+     * the profile (the same instance the device profile is rendered from); a throwing or blank profile answers nothing.
+     */
+    private fun screenshotDimensions(envelope: DeviceEnvelope): Map<String, Int> = buildMap {
+        envelope.images.firstOrNull()?.let { image ->
+            if (image.width > 0 && image.height > 0) {
+                put(IMAGE_WIDTH_KEY, image.width)
+                put(IMAGE_HEIGHT_KEY, image.height)
+            }
+        }
+        val profile = deviceState?.let { runCatching { it.profile() }.getOrNull() }
+        if (profile != null && profile.screenWidthPx > 0 && profile.screenHeightPx > 0) {
+            put(SCREEN_WIDTH_KEY, profile.screenWidthPx)
+            put(SCREEN_HEIGHT_KEY, profile.screenHeightPx)
+        }
     }
 
     /**
@@ -1391,6 +1416,12 @@ class DeviceTool(
         private const val CLIPBOARD_KEY = "clipboard"
         private const val LIMIT_KEY = "limit"
         private const val INCLUDE_ALL = "all"
+
+        // 0.5.4 T11 screenshot pixel spaces.
+        private const val IMAGE_WIDTH_KEY = "imageWidth"
+        private const val IMAGE_HEIGHT_KEY = "imageHeight"
+        private const val SCREEN_WIDTH_KEY = "screenWidth"
+        private const val SCREEN_HEIGHT_KEY = "screenHeight"
 
         private val OBSERVE_SOURCES: Set<PerceptionSource> = PerceptionSource.entries.toSet()
 

@@ -231,8 +231,8 @@ class ToolContractTest {
         /** The argument names each schema declares, which its model-facing prose has to bound. */
         val ARGUMENT_NAMES: Map<String, List<String>> = linkedMapOf(
             "read_screen" to listOf("filter", "offset"),
-            "tap" to listOf("index"),
-            "long_press" to listOf("index"),
+            "tap" to listOf("index", "x", "y"),
+            "long_press" to listOf("index", "x", "y"),
             "scroll" to listOf("direction"),
             "input_text" to listOf("index", "text"),
             "open_app" to listOf("name"),
@@ -262,8 +262,8 @@ class ToolContractTest {
          */
         val FAILURE_BEHAVIOUR: Map<String, List<String>> = linkedMapOf(
             "read_screen" to listOf("ACTION_CHANNEL_UNAVAILABLE", "ARGUMENTS_INVALID"),
-            "tap" to listOf("NODE_NOT_CLICKABLE"),
-            "long_press" to listOf("NODE_NOT_CLICKABLE"),
+            "tap" to listOf("NODE_NOT_CLICKABLE", "MISSING_POINT", "COORD_REFUSED_SYSTEM_UI", "COORD_REFUSED_KEYGUARD"),
+            "long_press" to listOf("NODE_NOT_CLICKABLE", "MISSING_POINT", "COORD_REFUSED_SYSTEM_UI", "COORD_REFUSED_KEYGUARD"),
             "scroll" to listOf("NO_SCREEN_CHANGE"),
             "input_text" to listOf("ARGUMENTS_INVALID"),
             "open_app" to listOf("APP_NOT_FOUND", "APP_AMBIGUOUS"),

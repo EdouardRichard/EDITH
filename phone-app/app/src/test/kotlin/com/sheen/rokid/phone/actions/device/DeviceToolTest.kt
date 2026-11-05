@@ -530,6 +530,57 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `screenshot data carries image and screen dimensions`() {
+        // 0.5.4 T11 (§6.3.3): the image is a scaled JPEG, so the model needs both spaces to turn a screenshot pixel
+        // into a coordinate the a11y `tap` accepts. image* is the encoded image, screen* is the device display.
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            images = listOf(ImageRef("pending", "image/jpeg", 768, 1664, "")),
+        )
+
+        val result = tool(operations, deviceState = FakeDeviceState(deviceState()))
+            .execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val data = body(result)
+        assertEquals(768, data["imageWidth"]!!.jsonPrimitive.int)
+        assertEquals(1664, data["imageHeight"]!!.jsonPrimitive.int)
+        assertEquals(1080, data["screenWidth"]!!.jsonPrimitive.int)
+        assertEquals(2400, data["screenHeight"]!!.jsonPrimitive.int)
+    }
+
+    @Test
+    fun `screenshot omits the screen dimensions when the profile cannot supply them`() {
+        // The image dimensions are still known from the artifact reference; a missing device profile must not be
+        // turned into a fabricated screen size (the model can still see that only the image space is known).
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            images = listOf(ImageRef("pending", "image/jpeg", 768, 1664, "")),
+        )
+
+        val result = tool(operations).execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val data = body(result)
+        assertEquals(768, data["imageWidth"]!!.jsonPrimitive.int)
+        assertEquals(1664, data["imageHeight"]!!.jsonPrimitive.int)
+        assertFalse("no device profile means no screen size, not a guess", data.containsKey("screenWidth"))
+        assertFalse("no device profile means no screen size, not a guess", data.containsKey("screenHeight"))
+    }
+
+    @Test
     fun `screenshot preserves the kernel artifact diagnostic instead of a generic line`() {
         // R131: the kernel writes `diagnostic=screenshot_artifact_pending; reason=...` when the bytes were captured but
         // the store failed. Replacing it with "screenshot is an artifact reference" makes a broken store look like a

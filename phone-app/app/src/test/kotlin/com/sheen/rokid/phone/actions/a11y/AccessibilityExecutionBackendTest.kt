@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.actions.a11y
 import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.withP3Sink
 
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.phone.actions.ExecutionRouter
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
@@ -45,9 +46,17 @@ class AccessibilityExecutionBackendTest {
          * three different trees - e.g. a new turn must re-read even when the filter still matches (T9 fix round 2).
          */
         private val thirdNodes: List<RawSnapshotNode>? = null,
+        // 0.5.4 T11 coordinate gating: the existing accessibility port answers these probes in production. The defaults
+        // describe a normal unlocked app screen; a test that wants a refusal scripts the fact that causes it.
+        private val foregroundPackage: String? = "com.example.app",
+        private val keyguardLocked: Boolean = false,
+        private val screen: ScreenBounds? = ScreenBounds(0, 0, 1080, 2400),
+        private val gestureAccepted: Boolean = true,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
         val setTextByIndexCalls = mutableListOf<Triple<String, Int, String>>()
+        val clickAtCalls = mutableListOf<Pair<Int, Int>>()
+        val longPressAtCalls = mutableListOf<Pair<Int, Int>>()
         var fingerprints = 0
         var snapshotCalls = 0
         private var currentSnapshot: ScreenSnapshot? = null
@@ -57,6 +66,22 @@ class AccessibilityExecutionBackendTest {
         override fun screenFingerprint(): String {
             fingerprints++
             return if (fingerprints == 1) fingerprintBefore else fingerprintAfter
+        }
+
+        override fun foreground(): Foreground? = foregroundPackage?.let { Foreground(it, null) }
+
+        override fun isKeyguardLocked(): Boolean = keyguardLocked
+
+        override fun screenBounds(): ScreenBounds? = screen
+
+        override fun clickAt(x: Int, y: Int): Boolean {
+            clickAtCalls += x to y
+            return gestureAccepted
+        }
+
+        override fun longPressAt(x: Int, y: Int): Boolean {
+            longPressAtCalls += x to y
+            return gestureAccepted
         }
 
         override fun snapshot(filter: ScreenFilter): ScreenSnapshot {
@@ -515,5 +540,197 @@ class AccessibilityExecutionBackendTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("NODE_NOT_CLICKABLE", result.detail)
         assertFalse(result.detail == "NO_SCREEN_CHANGE")
+    }
+
+    // ── coordinate targets (0.5.4 T11) ──────────────────────────────────────
+
+    @Test fun `tap refuses an ambiguous target shape`() {
+        // Spec §6.3.3: index and x,y are mutually exclusive, and at least one target must be present. Both and neither
+        // are caller errors, so the call is refused before any gate or UI read - a malformed target must never be
+        // guessed into a nearby index or point.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        listOf(
+            "{}",
+            """{"index":0,"x":540,"y":400}""",
+            """{"index":0,"x":540}""",
+            """{"index":0,"y":400}""",
+            """{"x":"mid","y":400}""",
+            """{"x":540,"y":null}""",
+        ).forEach { args ->
+            val result = b.execute("tap", args)
+            assertEquals("refused: $args", ActionOutcome.Refused, result.outcome)
+            assertEquals("refused: $args", "ARGUMENTS_INVALID", result.detail)
+        }
+        assertTrue("no ambiguous target may reach the UI: ${ui.clickAtCalls}", ui.clickAtCalls.isEmpty())
+        assertTrue("no ambiguous target may reach the UI: ${ui.clickByIndexCalls}", ui.clickByIndexCalls.isEmpty())
+    }
+
+    @Test fun `a half given point is MISSING_POINT`() {
+        // One coordinate is not a point: x alone or y alone can only mean the caller lost half of its target.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        listOf("""{"x":540}""", """{"y":400}""").forEach { args ->
+            listOf("tap", "long_press").forEach { action ->
+                val result = b.execute(action, args)
+                assertEquals("$action $args", ActionOutcome.Refused, result.outcome)
+                assertEquals("$action $args", "MISSING_POINT", result.detail)
+            }
+        }
+        assertTrue(ui.clickAtCalls.isEmpty())
+        assertTrue(ui.longPressAtCalls.isEmpty())
+    }
+
+    @Test fun `a coordinate tap dispatches one gesture at the screen point`() {
+        val ui = FakeUi()
+
+        val result = backend(ui).execute("tap", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf(540 to 400), ui.clickAtCalls)
+        assertTrue("a coordinate tap never resolves an index", ui.clickByIndexCalls.isEmpty())
+    }
+
+    @Test fun `a coordinate long press dispatches one long press at the screen point`() {
+        val ui = FakeUi()
+
+        val result = backend(ui).execute("long_press", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf(540 to 400), ui.longPressAtCalls)
+        assertTrue("a coordinate long press never resolves an index", ui.clickByIndexCalls.isEmpty())
+    }
+
+    @Test fun `coordinate actions are refused while the keyguard is up`() {
+        // Spec §109/§6.3.3: a coordinate gesture is injected blindly, so the channel must prove the screen is unlocked
+        // first. Both actions fail closed with the code that names the lock, and nothing is dispatched.
+        val ui = FakeUi(keyguardLocked = true)
+        val b = backend(ui)
+
+        listOf("tap" to ui.clickAtCalls, "long_press" to ui.longPressAtCalls).forEach { (action, calls) ->
+            val result = b.execute(action, """{"x":540,"y":400}""")
+            assertEquals("$action is refused when locked", ActionOutcome.Refused, result.outcome)
+            assertEquals("$action refusal", "COORD_REFUSED_KEYGUARD", result.detail)
+            assertTrue("$action dispatches nothing when locked", calls.isEmpty())
+        }
+    }
+
+    @Test fun `coordinate actions are refused on system ui and permission dialogs`() {
+        // The foreground app is the only witness this port has. A system surface - the status/nav bar owner, a
+        // permission controller, an installer, or an unknown foreground - is not a target app, so a blind gesture is
+        // refused instead of clicking through a dialog the user did not ask EDITH to touch.
+        listOf(
+            "com.android.systemui",
+            "com.google.android.permissioncontroller",
+            "com.android.packageinstaller",
+            "com.miui.packageinstaller",
+            null,
+        ).forEach { packageName ->
+            val ui = FakeUi(foregroundPackage = packageName)
+            val result = backend(ui).execute("tap", """{"x":540,"y":400}""")
+            assertEquals("foreground=$packageName", ActionOutcome.Refused, result.outcome)
+            assertEquals("foreground=$packageName", "COORD_REFUSED_SYSTEM_UI", result.detail)
+            assertTrue("foreground=$packageName dispatches nothing", ui.clickAtCalls.isEmpty())
+        }
+    }
+
+    @Test fun `a coordinate action refuses a point outside the screen`() {
+        // Fail closed on out-of-screen points: they are not a usable on-screen point, so MISSING_POINT (the same code a
+        // half-given point uses) answers and no gesture is dispatched.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        listOf(
+            """{"x":-1,"y":400}""",
+            """{"x":1080,"y":400}""",
+            """{"x":540,"y":2400}""",
+            """{"x":540,"y":-1}""",
+        ).forEach { args ->
+            val result = b.execute("tap", args)
+            assertEquals("refused: $args", ActionOutcome.Refused, result.outcome)
+            assertEquals("refused: $args", "MISSING_POINT", result.detail)
+        }
+        assertTrue(ui.clickAtCalls.isEmpty())
+    }
+
+    @Test fun `an unreadable screen size fails closed`() {
+        // Without a screen rectangle the backend cannot prove the point is inside the display; guessing 0..Int.MAX
+        // would dispatch a blind gesture.
+        val ui = FakeUi(screen = null)
+
+        val result = backend(ui).execute("long_press", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("MISSING_POINT", result.detail)
+        assertTrue(ui.longPressAtCalls.isEmpty())
+    }
+
+    @Test fun `a coordinate action is judged by the screen change like an index action`() {
+        // The gesture was dispatched, so the verdict is still "did the screen change": accepted is not success.
+        val ui = FakeUi(fingerprintAfter = "screen-a")
+
+        val result = backend(ui).execute("tap", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("NO_SCREEN_CHANGE", result.detail)
+        assertEquals("the gesture really was dispatched once", 1, ui.clickAtCalls.size)
+    }
+
+    @Test fun `a gesture the platform refused is not a success`() {
+        // `dispatchGesture` can answer false (cancelled/refused). There is no node to blame, so the model gets the same
+        // observable verdict as an unchanged screen rather than a fabricated success.
+        val ui = FakeUi(gestureAccepted = false)
+
+        val result = backend(ui).execute("long_press", """{"x":540,"y":400}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("NO_SCREEN_CHANGE", result.detail)
+    }
+
+    @Test fun `coordinate actions report via=coord while index actions keep via=index`() {
+        // R2: the same count-only P3_ACT line carries the targeting mode that actually reached the device. The index
+        // and the point never ride it, and a refusal emits no line at all.
+        val ui = FakeUi()
+        val b = backend(ui)
+
+        val acts = withP3Sink { captured ->
+            b.execute("tap", """{"x":540,"y":400}""")
+            b.execute("long_press", """{"x":540,"y":400}""")
+            b.execute("read_screen", "{}")
+            b.execute("tap", """{"index":0}""")
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertEquals(listOf("P3_ACT via=coord", "P3_ACT via=coord", "P3_ACT via=index"), acts)
+        assertTrue("neither a point nor an index may ride the line: $acts", acts.none { it.contains("540") || it.contains("400") })
+    }
+
+    @Test fun `a refused coordinate action emits no act line`() {
+        val ui = FakeUi(keyguardLocked = true)
+
+        val acts = withP3Sink { captured ->
+            backend(ui).execute("tap", """{"x":540,"y":400}""")
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertTrue("a refused coordinate action was never dispatched: $acts", acts.isEmpty())
+    }
+
+    @Test fun `a dispatched coordinate action invalidates the snapshot`() {
+        // A blind gesture can move the screen just like an index click. A later `offset` page must not continue the
+        // pre-gesture tree, exactly as Task 9's mutation rule already requires for index actions.
+        val ui = FakeUi(nodes = textNodes(150, prefix = "A"), laterNodes = textNodes(150, prefix = "B"))
+        val b = backend(ui)
+        b.execute("read_screen", """{"filter":"all"}""")
+
+        val tap = b.execute("tap", """{"x":540,"y":400}""")
+        assertEquals(ActionOutcome.Done, tap.outcome)
+
+        val page = b.execute("read_screen", """{"filter":"all","offset":100}""").detail
+        assertTrue("a page after a coordinate tap shows the mutated screen: $page", """[100] "B 100"""" in page)
+        assertFalse("a coordinate tap must not leave the old tree pageable: $page", "A 100" in page)
+        assertEquals("a page after a coordinate tap reads the screen again", 2, ui.snapshotCalls)
     }
 }

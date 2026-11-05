@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.actions.a11y
 import kotlinx.serialization.json.JsonObject
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.phone.actions.ExecutionBackend
 import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -22,6 +23,37 @@ private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
 private const val NODE_NOT_CLICKABLE = "NODE_NOT_CLICKABLE"
 private const val NO_SCREEN_CHANGE = "NO_SCREEN_CHANGE"
 private const val ACTION_CHANNEL_UNAVAILABLE = "ACTION_CHANNEL_UNAVAILABLE"
+
+/**
+ * 0.5.4 T11 coordinate codes.
+ *
+ * [MISSING_POINT] means "the request does not designate a usable on-screen point": one coordinate without the other,
+ * a point outside the display, or a display rectangle the channel cannot read. [ARGUMENTS_INVALID] stays the shape
+ * error (both targets or neither), exactly as the spec's "两者都缺/都给" rule says.
+ */
+private const val MISSING_POINT = "MISSING_POINT"
+private const val COORD_REFUSED_SYSTEM_UI = "COORD_REFUSED_SYSTEM_UI"
+private const val COORD_REFUSED_KEYGUARD = "COORD_REFUSED_KEYGUARD"
+
+/**
+ * Foreground packages that are system surfaces, not a target app (0.5.4 T11).
+ *
+ * A coordinate gesture lands wherever the finger point is; unlike an index click it cannot be attributed to a node, so
+ * the channel must prove the app in front is a normal app before injecting it (spec §6.3.3/§8). The status/navigation
+ * bar owner, the permission controllers and the package installers are the surfaces the spec names. This list is the
+ * package-level witness the existing `AccessibilityPort.foreground()` probe can supply; a system window that does not
+ * raise a window-state event is not detectable through this probe and stays out of scope here.
+ */
+private val SYSTEM_FOREGROUND_PACKAGES: Set<String> = setOf(
+    "android",
+    "com.android.systemui",
+    "com.android.permissioncontroller",
+    "com.google.android.permissioncontroller",
+    "com.android.packageinstaller",
+    "com.google.android.packageinstaller",
+    "com.miui.packageinstaller",
+    "com.lbe.security.miui",
+)
 
 /** Bounded on purpose: this moves another app's UI, not a document-typing service. */
 private const val MAX_TEXT_CHARS = 100
@@ -51,9 +83,9 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ),
     ActionDescriptor(
         name = TAP,
-        title = "点击指定索引的元素",
-        description = "点击最近一次 read_screen 列表中的第 index 个元素（index 必须来自本回合上一次 read_screen；滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
-        parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
+        title = "点击指定索引的元素或屏幕坐标",
+        description = "点击最近一次 read_screen 列表中的第 index 个元素，或点击屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT。index 必须来自本回合上一次 read_screen（滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可点击节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
         idempotent = false,
@@ -63,9 +95,9 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ),
     ActionDescriptor(
         name = LONG_PRESS,
-        title = "长按指定索引的元素",
-        description = "长按最近一次 read_screen 列表中的第 index 个元素（index 来自本回合上一次 read_screen；滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
-        parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
+        title = "长按指定索引的元素或屏幕坐标",
+        description = "长按最近一次 read_screen 列表中的第 index 个元素，或长按屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT（index 来自本回合上一次 read_screen，滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可长按节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
         idempotent = false,
@@ -140,6 +172,28 @@ interface AccessibilityUi {
 
     /** Structural fingerprint with node counts and truncation flag. */
     fun structuralFingerprint(): ScreenFingerprint
+
+    // ── Coordinate actions (0.5.4 T11) ───────────────────────────────────────
+    //
+    // The probes below are the existing accessibility channel's own facts, reused rather than re-invented: the Android
+    // production answer is the service's `AccessibilityPort.foreground()` / `isKeyguardLocked()` / display metrics.
+    // They are defaulted to the **fail-closed** answers on purpose - an implementation that cannot prove a normal
+    // unlocked app is in front must never dispatch a blind gesture at a coordinate.
+
+    /** The app in front, as the channel reports it; `null` when unknown (coordinates then fail closed). */
+    fun foreground(): Foreground? = null
+
+    /** Keyguard state; the default `true` (locked) keeps a channel that cannot answer from guessing "unlocked". */
+    fun isKeyguardLocked(): Boolean = true
+
+    /** The display rectangle in screen pixels, matching [ScreenBounds]; `null` when the channel cannot tell. */
+    fun screenBounds(): ScreenBounds? = null
+
+    /** Dispatches one tap gesture at the screen-pixel point [x],[y]. `false` when no gesture completed. */
+    fun clickAt(x: Int, y: Int): Boolean = false
+
+    /** Dispatches one long-press gesture at the screen-pixel point [x],[y]. `false` when no gesture completed. */
+    fun longPressAt(x: Int, y: Int): Boolean = false
 }
 
 /**
@@ -321,44 +375,112 @@ class AccessibilityExecutionBackend(
         return sb.toString().trimEnd()
     }
 
-    // ── tap ──────────────────────────────────────────────────────────────────
+    // ── tap / long_press (index or coordinate target) ────────────────────────
 
-    private fun executeTap(argsJson: String): ActionResult {
-        val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
+    private fun executeTap(argsJson: String): ActionResult = executeClickTarget(argsJson, longPress = false)
+
+    private fun executeLongPress(argsJson: String): ActionResult = executeClickTarget(argsJson, longPress = true)
+
+    /**
+     * 0.5.4 T11 (§6.3.3): `tap`/`long_press` take an index **or** a screen-pixel point, mutually exclusive.
+     *
+     * The shape is settled before any UI call, because a malformed target is a caller error, not something to guess at:
+     * both targets or neither is [ARGUMENTS_INVALID] (the spec pins that case verbatim), while a half-given point or an
+     * unusable point is [MISSING_POINT]. Index dispatch stays byte-for-byte the pre-T11 path; the coordinate branch adds
+     * the foreground/keyguard/on-screen gate and reports `via=coord` on the count-only action line.
+     */
+    private fun executeClickTarget(argsJson: String, longPress: Boolean): ActionResult =
+        when (val target = parseClickTarget(argsJson)) {
+            is ClickTarget.Index -> executeIndexClick(target.index, longPress)
+            is ClickTarget.Point -> executePointClick(target.x, target.y, longPress)
+            is ClickTarget.Refused -> refused(target.code)
+        }
+
+    private sealed interface ClickTarget {
+        data class Index(val index: Int) : ClickTarget
+        data class Point(val x: Int, val y: Int) : ClickTarget
+        data class Refused(val code: String) : ClickTarget
+    }
+
+    private fun parseClickTarget(argsJson: String): ClickTarget {
+        val args = runCatching { argumentsJson.parseToJsonElement(argsJson) as? JsonObject }.getOrNull()
+            ?: return ClickTarget.Refused(ARGUMENTS_INVALID)
+        val hasIndex = args.containsKey("index")
+        val hasX = args.containsKey("x")
+        val hasY = args.containsKey("y")
+        if (hasIndex && (hasX || hasY)) return ClickTarget.Refused(ARGUMENTS_INVALID)
+        if (!hasIndex && !hasX && !hasY) return ClickTarget.Refused(ARGUMENTS_INVALID)
+        if (hasIndex) {
+            val index = (args["index"] as? JsonPrimitive)?.intOrNull
+                ?: return ClickTarget.Refused(ARGUMENTS_INVALID)
+            return ClickTarget.Index(index)
+        }
+        // x without y (or the reverse) cannot name a point at all, even before the display is read.
+        if (hasX != hasY) return ClickTarget.Refused(MISSING_POINT)
+        val x = (args["x"] as? JsonPrimitive)?.intOrNull ?: return ClickTarget.Refused(ARGUMENTS_INVALID)
+        val y = (args["y"] as? JsonPrimitive)?.intOrNull ?: return ClickTarget.Refused(ARGUMENTS_INVALID)
+        return ClickTarget.Point(x, y)
+    }
+
+    private fun executeIndexClick(index: Int, longPress: Boolean): ActionResult {
         val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
         // 0.5.4 Task 8 (§6.2.2), fix round: the count-only action line starts with the targeting mode this class really
         // has - index - and it names a **dispatched** action only. Placed after every validation and immediately before
-        // the dispatch, so a refusal is never counted as an act (Task 11's coordinate taps extend the same token; the
-        // index itself never rides the line).
+        // the dispatch, so a refusal is never counted as an act. The index itself never rides the line.
         P3Log.line("P3_ACT via=index")
-        val accepted = ui.clickByIndex(snapshot.snapshotId, index)
+        val accepted = if (longPress) {
+            ui.longPressByIndex(snapshot.snapshotId, index)
+        } else {
+            ui.clickByIndex(snapshot.snapshotId, index)
+        }
         // Dispatched means the screen may already have changed: the snapshot goes with the action, whatever it returned.
         invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after != before) done("tapped index $index") else refused(NO_SCREEN_CHANGE)
+        return if (after != before) {
+            done(if (longPress) "long pressed index $index" else "tapped index $index")
+        } else {
+            refused(NO_SCREEN_CHANGE)
+        }
     }
 
-    // ── long_press ───────────────────────────────────────────────────────────
-
-    private fun executeLongPress(argsJson: String): ActionResult {
-        val index = parseIndex(argsJson) ?: return refused(ARGUMENTS_INVALID)
-        val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
-        if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
-
+    private fun executePointClick(x: Int, y: Int, longPress: Boolean): ActionResult {
+        coordinateRefusal(x, y)?.let { return refused(it) }
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        // 0.5.4 Task 8, same index token as `tap` and the same dispatch position: the action kind is already named by
-        // the tool result, and a refused long press has no device line.
-        P3Log.line("P3_ACT via=index")
-        val accepted = ui.longPressByIndex(snapshot.snapshotId, index)
-        // Same invalidation rule as `tap`: the snapshot is consumed by the dispatch, not by its success.
+        // R2: the same P3_ACT line carries the targeting mode that really reached the device. It is emitted only for a
+        // dispatched action, and the point never rides it (count-only, no screen content).
+        P3Log.line("P3_ACT via=coord")
+        val accepted = if (longPress) ui.longPressAt(x, y) else ui.clickAt(x, y)
+        // A dispatched blind gesture may have changed the screen: the snapshot goes with it, whatever it returned.
         invalidateSnapshot()
-        if (!accepted) return refused(NODE_NOT_CLICKABLE)
+        if (!accepted) return refused(NO_SCREEN_CHANGE)
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after != before) done("long pressed index $index") else refused(NO_SCREEN_CHANGE)
+        return if (after != before) {
+            done(if (longPress) "long pressed ($x,$y)" else "tapped ($x,$y)")
+        } else {
+            refused(NO_SCREEN_CHANGE)
+        }
+    }
+
+    /**
+     * The coordinate eligibility gate (spec §6.3.3), or `null` when the point may be injected.
+     *
+     * Every probe fails closed: a probe that throws is the same as a probe that answers "unknown". Keyguard first (the
+     * dominant fact), then the foreground app, then the display rectangle. There is no "no answer" branch that permits
+     * the gesture; an unknown foreground is grouped with [COORD_REFUSED_SYSTEM_UI] because both mean "the channel cannot
+     * prove a normal target app is in front".
+     */
+    private fun coordinateRefusal(x: Int, y: Int): String? {
+        if (runCatching { ui.isKeyguardLocked() }.getOrDefault(true)) return COORD_REFUSED_KEYGUARD
+        val foreground = runCatching { ui.foreground() }.getOrNull()?.packageName
+        if (foreground.isNullOrBlank() || foreground in SYSTEM_FOREGROUND_PACKAGES) return COORD_REFUSED_SYSTEM_UI
+        val bounds = runCatching { ui.screenBounds() }.getOrNull() ?: return MISSING_POINT
+        // The rectangle is half-open: right/bottom are one past the last addressable pixel.
+        if (x < bounds.left || x >= bounds.right || y < bounds.top || y >= bounds.bottom) return MISSING_POINT
+        return null
     }
 
     // ── scroll ───────────────────────────────────────────────────────────────
@@ -410,12 +532,6 @@ class AccessibilityExecutionBackend(
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-
-    private fun parseIndex(argsJson: String): Int? {
-        val args = runCatching { argumentsJson.parseToJsonElement(argsJson) as? JsonObject }.getOrNull()
-            ?: return null
-        return (args["index"] as? JsonPrimitive)?.intOrNull
-    }
 
     private fun done(detail: String) = ActionResult(ActionOutcome.Done, detail)
     private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)

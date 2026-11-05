@@ -157,6 +157,7 @@ import com.sheen.rokid.phone.actions.UnlockGatedActions
 import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
 import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
 import com.sheen.rokid.phone.actions.a11y.ScreenFilter as A11yScreenFilter
+import com.sheen.rokid.phone.actions.a11y.ScreenBounds
 import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
 import com.sheen.rokid.phone.actions.a11y.ScreenSnapshot
 import com.sheen.rokid.phone.actions.a11y.ScrollDirection
@@ -4147,6 +4148,13 @@ class HostCompositionRoot internal constructor(
                 override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean =
                     live().setTextByIndex(snapshotId, index, text)
                 override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
+                // 0.5.4 T11: coordinate actions are the live service's own gesture and gate probes. The defaults on
+                // `AccessibilityUi` fail closed, so the wrapper must delegate or production would never tap a point.
+                override fun foreground(): Foreground? = live().foreground()
+                override fun isKeyguardLocked(): Boolean = live().isKeyguardLocked()
+                override fun screenBounds(): ScreenBounds? = live().screenBounds()
+                override fun clickAt(x: Int, y: Int): Boolean = live().clickAt(x, y)
+                override fun longPressAt(x: Int, y: Int): Boolean = live().longPressAt(x, y)
             }
             // `list_apps` and the umbrella `open` resolve spoken names against the same `appCatalog` instance.
             // `open_app` (intent) resolves through its own executor's package catalog over the same package manager,

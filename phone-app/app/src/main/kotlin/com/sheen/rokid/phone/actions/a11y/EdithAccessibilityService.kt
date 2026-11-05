@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.view.Display
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -18,9 +19,11 @@ import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.Observation
+import com.sheen.rokid.device.Point
 import com.sheen.rokid.device.Ref
 import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.Screenshot
+import com.sheen.rokid.device.Stroke
 import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
@@ -325,6 +328,44 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         return snap.fingerprint
     }
 
+    // ── Coordinate gestures (0.5.4 T11) ──────────────────────────────────────
+
+    /**
+     * A coordinate tap is one real gesture, not a platform node action: there is no node to receive it.
+     *
+     * `dispatchGesture` is the same synthetic-gesture path the adapter already uses for a double tap and for a
+     * non-clickable node's centre fallback; the completion callback is what makes `true` mean "the platform completed
+     * it", not "the platform accepted the request".
+     */
+    override fun clickAt(x: Int, y: Int): Boolean = dispatchPointGesture(x, y, COORD_TAP_DURATION_MILLIS)
+
+    /** One long stroke at the point; longer than the platform's ~500 ms long-press threshold. */
+    override fun longPressAt(x: Int, y: Int): Boolean = dispatchPointGesture(x, y, COORD_LONG_PRESS_DURATION_MILLIS)
+
+    private fun dispatchPointGesture(x: Int, y: Int, durationMillis: Long): Boolean =
+        adapter.dispatchGesture(Gesture(listOf(Stroke(listOf(Point(x, y)), 0L, durationMillis))))
+
+    /**
+     * The display rectangle in the same screen-pixel space as the accessibility bounds.
+     *
+     * `currentWindowMetrics` is preferred on API 30+ (the same source [com.sheen.rokid.phone.context.AndroidDeviceStateProvider]
+     * uses for the device profile); display metrics is the always-present fallback for a vendor build that refuses it.
+     * `null` means "cannot tell", which the backend treats as fail-closed rather than as a 0-sized screen.
+     */
+    override fun screenBounds(): ScreenBounds? = runCatching {
+        val bounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getSystemService(WindowManager::class.java)?.currentWindowMetrics?.bounds
+        } else {
+            null
+        }
+        if (bounds != null) {
+            ScreenBounds(bounds.left, bounds.top, bounds.right, bounds.bottom)
+        } else {
+            val metrics = resources.displayMetrics
+            ScreenBounds(0, 0, metrics.widthPixels, metrics.heightPixels)
+        }
+    }.getOrNull()
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /** Bounded breadth-first walk: the fingerprint only has to be stable, not complete. */
@@ -535,6 +576,10 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 /** Five seconds is the whole budget for one screenshot or one synthetic gesture. */
 private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
 private const val GESTURE_TIMEOUT_MILLIS = 5_000L
+
+/** Coordinate gesture durations: a tap is a short stroke, a long press holds past the platform's ~500 ms threshold. */
+private const val COORD_TAP_DURATION_MILLIS = 50L
+private const val COORD_LONG_PRESS_DURATION_MILLIS = 600L
 
 /**
  * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).
