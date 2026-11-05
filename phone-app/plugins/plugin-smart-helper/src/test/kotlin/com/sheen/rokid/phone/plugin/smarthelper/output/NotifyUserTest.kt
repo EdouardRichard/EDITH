@@ -257,6 +257,25 @@ class NotifyUserTest {
     }
 
     @Test
+    fun `an awaiting reply cannot be silent because the wearer would never see the question`() {
+        // 0.5.4 Task 3 review minor: `silent` + `awaiting_reply=true` would pause the turn for an answer to a question
+        // nothing ever displayed - the wearer cannot answer what they never saw, and the turn would wait forever. It is
+        // a contradictory call, so it is refused like any other invalid argument and nothing is notified.
+        val seen = mutableListOf<Pair<NotifyChannel, String>>()
+        val recorder = NotifyUserTool(onNotify = { channel, text -> seen += channel to text })
+
+        val result = recorder.execute(
+            "notify_user",
+            """{"text":"要现在做吗？","channel":"silent","awaiting_reply":true}""",
+        )
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(NotifyUserTool.NOTIFY_ARGUMENTS_INVALID, result.detail)
+        assertFalse(result.awaitingUser)
+        assertTrue(seen.isEmpty(), "a refused question must not reach the output path either")
+    }
+
+    @Test
     fun `DESCRIPTOR includes final parameter for task completion signal`() {
         val schema = tool.descriptors().single().parametersJson
         assertTrue(schema.contains("\"final\""), "schema must contain final field: $schema")

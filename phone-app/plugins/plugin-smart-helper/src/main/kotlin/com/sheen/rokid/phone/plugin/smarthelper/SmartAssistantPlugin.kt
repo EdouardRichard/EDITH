@@ -3718,7 +3718,14 @@ class SmartAssistantPlugin(
         // whether it was a mid-run `notify_user` or the closing fallback the assembler is about to emit. This is where
         // the displayed/rejected/silent decision is made, not in `emit`'s phase check (a `notify_user` answer is
         // emitted while the run is still `Running`).
-        settleAnswerAfterRun(owned, fallbackExpected = ledger.calls == 0 && !ledger.suppressed)
+        //
+        // 0.5.4 Task 4: `AWAITING_USER` never schedules a closing fallback (`submitOutcome` submits nothing for it), so
+        // waiting one second for one would turn "waiting for the wearer" into a phantom pending deadline. A question
+        // that did reach the wearer was emitted mid-run and is settled by its own `answerEmitId` regardless.
+        settleAnswerAfterRun(
+            owned,
+            fallbackExpected = ledger.calls == 0 && !ledger.suppressed && run.outcome != AgentOutcome.AWAITING_USER,
+        )
         // 0.3 Phase 3 Task 7 fix (controller ruling): only a **WAKE** turn may release the proactive work it made wait
         // (spec §4.6). `runTurnBody` is shared with the FOLLOWUP_TURN, and releasing from a follow-up's end resumed a
         // trigger parked during the follow-up as a HINT_TURN right after the follow-up answer. That hint's `Displayed`
@@ -3853,6 +3860,15 @@ class SmartAssistantPlugin(
         // Recording only `finalText` dropped every notification from the conversation (review M1's "没有任何地方把
         // 通知内容记进上下文"), so both halves are recorded here, in the order they happened.
         val closingText = run.finalText?.takeIf { it.isNotBlank() }
+        // 0.5.4 Task 4: an awaiting-user run that reached nobody has no assistant half to record. `AWAITING_USER` is
+        // not a failure, so the `FAILURE_HINTS` fallback below must not be written; and recording the wearer's half
+        // alone would leave the route's transcript ending on a one-item user group, the exact shape `ContextBudgeter`
+        // refuses (one such turn used to brick every later turn until a restart). The notification shape - a question
+        // emitted by `notify_user` - takes the `notifications` branch above and is recorded as usual.
+        if (run.outcome == AgentOutcome.AWAITING_USER && notifications.isEmpty() && closingText == null) {
+            P3Log.line("P3_CONTEXT record=skipped reason=AWAITING_USER")
+            return
+        }
         val reply = when {
             notifications.isNotEmpty() -> (notifications + listOfNotNull(closingText)).joinToString("\n")
             closingText != null -> closingText
@@ -5380,6 +5396,15 @@ class SmartAssistantPlugin(
         }
         if (ledger.suppressed) {
             P3Log.line("P3_NOTIFY reply=suppressed reason=SILENT")
+            return
+        }
+        // 0.5.4 Task 4: a run stopped to wait for the wearer's answer is neither a completed answer nor a failure.
+        // When a question reached them, `notify_user` emitted it during the run and `ledger.calls > 0` already
+        // returned above; this branch is the "nothing was said" shape (a successful tool that only awaits the user).
+        // Appending FAILURE_HINTS would tell the wearer the assistant failed, and `ModelEnd.FAILED` would close an
+        // answer that never existed. Nothing is submitted; `settleAnswerAfterRun` closes the round as `no_display`.
+        if (run.outcome == AgentOutcome.AWAITING_USER) {
+            P3Log.line("P3_NOTIFY reply=none reason=AWAITING_USER")
             return
         }
         if (run.outcome == AgentOutcome.COMPLETED && !finalText.isNullOrBlank()) {
