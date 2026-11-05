@@ -35,8 +35,9 @@ enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCEL
  * [utterance] is the user's own text for this turn and opens the model history. [profileId] rides along for the wiring
  * that owns a model profile — the loop never reads one itself. [deadlineNanos] is a wall-clock boundary on the same
  * [MonotonicClock] the loop is given, not a capability budget; it bounds **machine** time only, because time spent
- * waiting on a confirmation is shifted out of it (D49). [requestTimeoutNanos] bounds **one model request** instead, so
- * a caller may keep them separate.
+ * waiting on a confirmation is shifted out of it (D49). Expiry ends the run as [AgentOutcome.DEADLINE] with the loop's
+ * own `TURN_BUDGET` safe code, distinct from a provider's request-timeout code. [requestTimeoutNanos] bounds **one model
+ * request** instead, so a caller may keep them separate.
  */
 data class AgentRequest(
     val turnId: String,
@@ -230,8 +231,11 @@ data class AgentMetrics(
  * The terminal result of one run.
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
- * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED] (the
- * model's answer); [AgentOutcome.AWAITING_USER] leaves it `null` — that outcome has no model answer, and the awaiting
+ * `STEP_LIMIT` / `TURN_BUDGET`) and is `null` when nothing meaningful applies. `TURN_BUDGET` means this run spent its
+ * whole `AgentRequest.deadlineNanos` (a `DEADLINE` outcome), which is how it stays distinguishable from the per-request
+ * `REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT` codes the provider reports. [finalText] is set
+ * only for [AgentOutcome.COMPLETED] (the model's answer); [AgentOutcome.AWAITING_USER] leaves it `null` — that outcome
+ * has no model answer, and the awaiting
  * tool's text is its own notification emit, not a final answer — and every failure outcome leaves it `null` too.
  *
  * [humanWaitNanos] is the wall clock this run spent waiting for a **person** — the confirmation port and the bounded
@@ -328,6 +332,16 @@ private const val EMPTY_TURN = "EMPTY_TURN"
 private const val INCOMPLETE_TURNS = "INCOMPLETE_TURNS"
 private const val NO_PROGRESS = "NO_PROGRESS"
 private const val STEP_LIMIT = "STEP_LIMIT"
+
+/**
+ * 0.5.4 Task 7: the stable code for the run spending its **whole turn budget** (its `AgentRequest.deadlineNanos`).
+ *
+ * The outcome stays [AgentOutcome.DEADLINE] - the wearer-facing sentence is the same "回答超时了" - but a turn-budget
+ * expiry is not a provider/request timeout: `REQUEST_DEADLINE`, `FIRST_TOKEN_TIMEOUT` and `STREAM_IDLE_TIMEOUT` come
+ * from `ControlledModelClient`/`ModelClientGateway` and travel as that provider's `safeCode`. Giving the loop's own
+ * budget its own code keeps the two distinguishable in `P3_TURN` without inventing a seventh outcome.
+ */
+private const val TURN_BUDGET = "TURN_BUDGET"
 private const val EMPTY_TURN_TEXT = "(empty turn)"
 private const val TOOL_CALL_TEXT = "(tool call)"
 private const val CLOSED_TURN_TEXT = "(no reply)"
@@ -721,7 +735,7 @@ class AgentLoop(
         while (true) {
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
             if (clock.nowNanos() >= turnDeadlineNanos) {
-                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps)
             }
 
             // Assemble the RequestFrame through TurnRunner; the gateway still receives a plain instructions string.
@@ -878,7 +892,7 @@ class AgentLoop(
                 // R60: the per-call cap is min(descriptor timeout, deadline - now); an already-expired deadline must not
                 // start another tool at all.
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
+                    return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 val registered = registry.resolve(call.name)
                 // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
@@ -920,7 +934,7 @@ class AgentLoop(
                                 )
                             }
                             if (clock.nowNanos() >= turnDeadlineNanos) {
-                                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
+                                return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                             }
                             continue
                         }
@@ -1209,7 +1223,7 @@ class AgentLoop(
                     )
                 }
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps, reply.reasoning)
+                    return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                 }
             }
         }

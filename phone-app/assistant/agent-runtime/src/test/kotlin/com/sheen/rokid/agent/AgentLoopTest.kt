@@ -1140,6 +1140,7 @@ class AgentLoopTest {
         val run = newLoop(gateway, clock = FakeClock(nowNanos = 100)).run(request(deadlineNanos = 100))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "the loop's own budget must not read as a request deadline")
         assertTrue(gateway.requests.isEmpty())
     }
 
@@ -1156,6 +1157,7 @@ class AgentLoopTest {
             .run(request(deadlineNanos = 5))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "a step over the turn budget is TURN_BUDGET, not REQUEST_DEADLINE")
         assertEquals(1, run.steps.size)
         assertEquals(1, gateway.requests.size)
     }
@@ -1821,6 +1823,7 @@ class AgentLoopTest {
             .run(request(deadlineNanos = 1_000_000_000L))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome, "只有等人的时间被排除，机器的时间仍要计入预算")
+        assertEquals("TURN_BUDGET", run.safeCode, "机器时间耗尽的是回合预算，不是某一次请求的期限")
         assertEquals(1, gateway.requests.size)
     }
 

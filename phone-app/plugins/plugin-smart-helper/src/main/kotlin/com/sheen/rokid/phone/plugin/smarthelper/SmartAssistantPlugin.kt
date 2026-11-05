@@ -186,19 +186,20 @@ private const val SKILL_HASH_NONE = "none"
 private const val FALLBACK_EMIT_WAIT_MILLIS = 1_000L
 
 /**
- * The agent run's wall-clock budget: effectively **none** (2026-10-22, D197).
+ * The agent run's **machine** budget: five minutes (0.5.4 Task 7).
  *
- * Mainstream agents bound a run with per-request/per-tool timeouts plus step and no-progress guards, not with a total
- * duration: Claude's Agent SDK leaves `maxTurns`/`maxBudgetUsd` off unless the caller sets them, OpenAI's Agents SDK
- * uses a turn count (10), and LangGraph uses a recursion limit. The old 180 s total cap cut a **working** 22-step
- * proactive follow-up at exactly 180 s (K70 acceptance 2026-10-22: `modelMs=120997` + `toolMs=56056`) and surfaced
- * the cut as "回答超时了，稍后再试"; the run was making progress.
+ * It bounds one turn's own work — model requests, tool calls, assembly — and deliberately **not** the time a person
+ * spends deciding: `AgentLoop` shifts its deadline by the confirmation/`mayAskHuman` wait it measures (D49), and the
+ * plugin moves the turn's hint window with the same measurement (`SmartTurn.extendDeadline`), so a considered approval
+ * never eats the budget or expires the answer.
  *
- * The guards that remain describe "stuck", not "slow": `AgentLoop.maxSteps` (24), `ProgressGuard`, the error streak,
- * the observation budget, the profile's per-request timeout, and the user's STOP/panel close. 24 h is a sanity
- * ceiling for arithmetic/schedulers, not a product limit; a real run ends long before it on the step guard.
+ * Five minutes replaces the 24 h sanity ceiling used since 2026-10-22 (D197). The guards that describe "stuck" remain
+ * (`AgentLoop.maxSteps`, `ProgressGuard`, the error streak, the observation budget); this one describes "slow", and it
+ * is distinct from the per-request timeout split of 0.5.4 Task 6 (45 s first token, 20 s stream idle, 90 s hard cap).
+ * Expiry ends the run as `DEADLINE` with the loop's own `TURN_BUDGET` safe code, so `P3_TURN` can tell it apart from a
+ * provider request timeout (`REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT`).
  */
-private const val AGENT_TURN_BUDGET_NANOS = 24L * 60L * 60L * 1_000_000_000L
+private const val AGENT_TURN_BUDGET_NANOS = 5L * 60L * 1_000_000_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
@@ -727,10 +728,11 @@ class SmartAssistantPlugin(
         }.compressionBudgetTokens()
 
     /**
-     * Test-only: the wall-clock budget the next agent turn receives.
+     * Test-only: the machine-time budget the next agent turn receives.
      *
-     * Since 2026-10-22 (D197) this is the effectively unbounded [AGENT_TURN_BUDGET_NANOS], not the old 180 s product
-     * cap. The behavioral guards are `AgentLoop.maxSteps`, `ProgressGuard` and the per-request profile timeout.
+     * 0.5.4 Task 7: five minutes. It is **machine** time only; a confirmation wait is shifted out of it by the loop
+     * (D49) and out of the hint window by `extendDeadline`. Expiry surfaces as `DEADLINE` + `TURN_BUDGET`, distinct
+     * from a request timeout.
      */
     internal fun agentTurnBudgetNanosForTest(): Long = turnBudgetNanos()
 
@@ -3051,14 +3053,14 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The agent run's **machine budget** (2026-10-22, D197): none.
+     * The agent run's **machine budget**: five minutes (0.5.4 Task 7).
      *
-     * The profile timeout still bounds each **provider request** (`requestTimeoutNanos`), and the loop still stops on
-     * the step guard, `ProgressGuard`, the error streak and the observation budget. A total wall-clock cap is what the
-     * mainstream harnesses do not use, and it cut a working multi-step proactive follow-up at 180 s.
+     * It bounds the turn's own work, not the time a person spends answering a confirmation: `AgentLoop` shifts its
+     * deadline by the measured human wait, and [SmartTurn.extendDeadline] moves this turn's hint window by the same
+     * amount. Expiry ends the run as `DEADLINE` with the distinct `TURN_BUDGET` safe code.
      *
      * This is deliberately not the official 10 s listening window: since 0.24 S3 that window belongs to
-     * [conversationCycle] and starts at `PANEL_SHOWN`; this number no longer bounds the run at all.
+     * [conversationCycle] and starts at `PANEL_SHOWN`; this number does not bound listening at all.
      */
     private fun turnBudgetNanos(): Long = AGENT_TURN_BUDGET_NANOS
 
