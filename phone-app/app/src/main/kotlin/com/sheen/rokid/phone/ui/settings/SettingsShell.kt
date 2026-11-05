@@ -12,6 +12,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -41,9 +42,20 @@ import com.sheen.rokid.phone.ui.PhoneDetailPage
  *
  * Task 7 ships placeholder bodies for every secondary page except About; Tasks 9-14 fill them through the same routes
  * and stack, without changing the home or the shell's navigation contract.
+ *
+ * Task 13 adds the three catalog pages through the [SettingsShellContent.modelCatalog] slot. The slot owns one
+ * [com.sheen.rokid.phone.ui.settings.ModelCatalogViewModel] for as long as any catalog route is open: `leave()` cancels
+ * in-flight work when the group closes and a re-entry composes a fresh view model that re-reads the catalog. The home
+ * snapshot is re-read whenever that view model publishes a catalog, so the 模型服务 summary is never stale after a save.
+ * [initialRoute] is the first-run prompt's 「去配置」 hand-off (PhoneScreen sets the settings tab and asks for 模型服务).
  */
 @Composable
-internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
+internal fun SettingsShell(
+    root: HostCompositionRoot,
+    state: SessionUiState,
+    initialRoute: SettingsRoute? = null,
+    onInitialRouteConsumed: () -> Unit = {},
+) {
     val detached by root.detachGate.enabled.collectAsStateWithLifecycle()
     val appearance by root.phoneOnlyAppearance.collectAsStateWithLifecycle()
     val speechEnabled by root.speechEnabled.collectAsStateWithLifecycle()
@@ -54,9 +66,13 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     // permission. `startFailure` is mapped to the short Chinese reason before it reaches the host-free page.
     val phoneOnlyRunning by PhoneOnlyOverlayService.isRunning.collectAsStateWithLifecycle()
     val phoneOnlyStartFailure by PhoneOnlyOverlayService.startFailure.collectAsStateWithLifecycle()
-    // The catalog read is a single snapshot per shell composition. Task 13 replaces it with the catalog view model's
-    // observable state; until then nothing in this task can mutate the catalog while the settings tab is on screen.
-    val catalog = remember { runCatching { root.modelCatalogRepository?.catalog() }.getOrNull() }
+    // The catalog read is a single snapshot per shell composition, re-read whenever the model-service view model
+    // publishes a new catalog (T13): without the tick the home row would keep showing 未配置 after the first provider
+    // was saved. The page group stays composed only while a catalog route is open, so this is the only writer path.
+    var homeCatalogTick by remember { mutableIntStateOf(0) }
+    val catalog = remember(homeCatalogTick) {
+        runCatching { root.modelCatalogRepository?.catalog() }.getOrNull()
+    }
     val textVerified = remember(catalog) {
         runCatching { root.activeCatalogProfile() }.getOrNull()?.let { profile ->
             SettingsSummaries.latestVerified(
@@ -214,6 +230,81 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
                 help = rememberHelpState(),
             )
         },
+        initialRoute = initialRoute,
+        onInitialRouteConsumed = onInitialRouteConsumed,
+        modelCatalog = { route, openRoute, requestPop, registerBackGuard ->
+            // One view model per catalog-page session (design §4.4). Leaving the catalog page group disposes it and
+            // `leave()` cancels in-flight work; re-entering composes a fresh view model whose `enter()` re-reads the
+            // catalog, so a fetch in flight when the user left can never land on the page afterwards.
+            val catalogViewModel = remember { root.modelCatalogViewModel() }
+            if (catalogViewModel == null) {
+                ModelCatalogUnavailableScreen()
+            } else {
+                val catalogState by catalogViewModel.state.collectAsStateWithLifecycle()
+                // Keep the always-composed settings home in step with the catalog the page just wrote.
+                LaunchedEffect(catalogState.catalog) {
+                    if (catalogState.catalog != null) homeCatalogTick++
+                }
+                DisposableEffect(catalogViewModel) {
+                    catalogViewModel.enter()
+                    onDispose { catalogViewModel.leave() }
+                }
+                val actions = remember(catalogViewModel) {
+                    ModelCatalogActions(
+                        refresh = catalogViewModel::refresh,
+                        saveProvider = catalogViewModel::saveProvider,
+                        deleteProvider = { providerId -> catalogViewModel.deleteProvider(providerId, null) },
+                        setActiveProvider = catalogViewModel::setActiveProvider,
+                        addManualModel = catalogViewModel::addManualModel,
+                        updateModel = catalogViewModel::updateModel,
+                        deleteModel = catalogViewModel::deleteModel,
+                        selectModel = catalogViewModel::selectModel,
+                        restoreDefaults = catalogViewModel::restoreDefaults,
+                        testModel = catalogViewModel::testModel,
+                        resetCatalog = catalogViewModel::resetCatalog,
+                        dismissNotice = catalogViewModel::dismissNotice,
+                        dismissRefreshSummary = catalogViewModel::dismissRefreshSummary,
+                        confirmPending = catalogViewModel::confirmPending,
+                        cancelPending = catalogViewModel::cancelPending,
+                        consumeSaved = catalogViewModel::consumeSaved,
+                    )
+                }
+                when (route) {
+                    SettingsRoute.ModelService -> ModelServiceScreen(
+                        state = catalogState,
+                        actions = actions,
+                        help = rememberHelpState(),
+                        onAddProvider = { openRoute(SettingsRoute.AddProvider) },
+                        onOpenProviders = { openRoute(SettingsRoute.Providers) },
+                        onOpenModel = { openRoute(SettingsRoute.ModelDetail(it)) },
+                    )
+                    SettingsRoute.Providers -> ProviderListScreen(
+                        state = catalogState,
+                        actions = actions,
+                        help = rememberHelpState(),
+                        onAddProvider = { openRoute(SettingsRoute.AddProvider) },
+                        onEditProvider = { openRoute(SettingsRoute.ProviderEditor(it)) },
+                    )
+                    SettingsRoute.AddProvider -> ProviderEditorScreen(
+                        state = catalogState,
+                        actions = actions,
+                        help = rememberHelpState(),
+                        providerId = null,
+                        requestPop = requestPop,
+                        registerBackGuard = registerBackGuard,
+                    )
+                    is SettingsRoute.ProviderEditor -> ProviderEditorScreen(
+                        state = catalogState,
+                        actions = actions,
+                        help = rememberHelpState(),
+                        providerId = route.providerId,
+                        requestPop = requestPop,
+                        registerBackGuard = registerBackGuard,
+                    )
+                    else -> Unit
+                }
+            }
+        },
     )
 }
 
@@ -283,23 +374,49 @@ internal fun SettingsShellContent(
     runtimeAppearance: (@Composable () -> Unit)? = null,
     permissionsSecurity: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
     localCapabilities: (@Composable () -> Unit)? = null,
+    initialRoute: SettingsRoute? = null,
+    onInitialRouteConsumed: () -> Unit = {},
+    modelCatalog: (@Composable (
+        route: SettingsRoute,
+        openRoute: (SettingsRoute) -> Unit,
+        requestPop: () -> Unit,
+        registerBackGuard: (() -> Unit) -> Unit,
+    ) -> Unit)? = null,
 ) {
     val stack = remember { mutableStateListOf<SettingsRoute>() }
     var pageBackGuard by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    // 0.52 first-run upgrade: PhoneScreen asks for the model service page after cleaning the old payloads. The route is
+    // pushed once and the request is consumed, so leaving/re-entering the settings tab does not re-open it.
+    LaunchedEffect(initialRoute) {
+        val requested = initialRoute ?: return@LaunchedEffect
+        if (stack.none { it == requested }) stack.add(requested)
+        onInitialRouteConsumed()
+    }
 
     fun closePage() {
         pageBackGuard = null
         if (stack.isNotEmpty()) stack.removeAt(stack.lastIndex)
     }
 
+    /** Pushing a new route must not inherit the previous page's back guard (T9 review Minor). */
+    fun openRoute(route: SettingsRoute) {
+        pageBackGuard = null
+        stack.add(route)
+    }
+
     SettingsHomeScreen(
         model = homeModel,
-        onOpen = { stack.add(it) },
+        onOpen = { openRoute(it) },
         auditLines = auditLines,
         scrollState = homeScrollState,
     )
 
     val route = stack.lastOrNull() ?: return
+    val catalogRoute = route is SettingsRoute.ProviderEditor || when (route) {
+        SettingsRoute.ModelService, SettingsRoute.Providers, SettingsRoute.AddProvider -> true
+        else -> false
+    }
     PhoneDetailPage(
         title = route.title,
         // One guarded exit for the arrow and for the dialog's own system-back dismissal. The page registers the
@@ -308,35 +425,43 @@ internal fun SettingsShellContent(
         // A form page must not wrap its controls in the detail page's text-selection container.
         selectionEnabled = route != SettingsRoute.AssistantBehavior &&
             route != SettingsRoute.RuntimeAppearance &&
-            route != SettingsRoute.PermissionsSecurity,
+            route != SettingsRoute.PermissionsSecurity &&
+            !catalogRoute,
     ) {
-        when (route) {
-            SettingsRoute.About -> AboutScreen(
-                onOpenModelService = { stack.add(SettingsRoute.ModelService) },
+        when {
+            catalogRoute -> {
+                if (modelCatalog == null) {
+                    PlaceholderPage(route)
+                } else {
+                    modelCatalog(route, ::openRoute, { closePage() }) { guard -> pageBackGuard = guard }
+                }
+            }
+            route == SettingsRoute.About -> AboutScreen(
+                onOpenModelService = { openRoute(SettingsRoute.ModelService) },
             )
-            SettingsRoute.AssistantBehavior -> {
+            route == SettingsRoute.AssistantBehavior -> {
                 if (assistantBehavior == null) {
                     PlaceholderPage(route)
                 } else {
                     assistantBehavior({ closePage() }) { guard -> pageBackGuard = guard }
                 }
             }
-            SettingsRoute.RuntimeAppearance -> {
+            route == SettingsRoute.RuntimeAppearance -> {
                 if (runtimeAppearance == null) PlaceholderPage(route) else runtimeAppearance()
             }
-            SettingsRoute.PermissionsSecurity -> {
+            route == SettingsRoute.PermissionsSecurity -> {
                 if (permissionsSecurity == null) {
                     PlaceholderPage(route)
                 } else {
                     permissionsSecurity({ closePage() }) { guard -> pageBackGuard = guard }
                 }
             }
-            SettingsRoute.LocalCapabilities -> {
+            route == SettingsRoute.LocalCapabilities -> {
                 if (localCapabilities == null) PlaceholderPage(route) else localCapabilities()
             }
             // The audit page is composed only while this route is on the stack, so its `remember(revision)` read below
             // never runs for the home or for any other route. The loader is the same lambda the home was handed.
-            SettingsRoute.Audit -> AuditScreen(loadLines = auditLines, onClear = auditClear)
+            route == SettingsRoute.Audit -> AuditScreen(loadLines = auditLines, onClear = auditClear)
             else -> PlaceholderPage(route)
         }
     }

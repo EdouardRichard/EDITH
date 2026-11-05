@@ -36,6 +36,8 @@ import com.sheen.rokid.phone.model.ModelAssetSource
 import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.model.ModelStartGate
 import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
+import com.sheen.rokid.phone.model.catalog.ModelCatalogService
+import com.sheen.rokid.phone.ui.settings.ModelCatalogViewModel
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
@@ -202,6 +204,9 @@ import com.sheen.rokid.phone.model.ProfileProbeGate
 import com.sheen.rokid.phone.model.profileStartupError
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
 import com.sheen.rokid.phone.model.ArtifactMediaSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -408,6 +413,21 @@ class HostCompositionRoot internal constructor(
      * does not wire one leaves the refresh unavailable rather than fabricating a model list.
      */
     val modelListSource: ModelListSource? = null,
+    /**
+     * 0.52 (design §5.5): the refresh/restore orchestration over [modelCatalog] and [modelListSource].
+     *
+     * Production [create] constructs `ModelCatalogService(catalog, modelListSource)` and passes it; a hand-built
+     * composition that does not wire one leaves the model-service page unavailable instead of pretending a refresh
+     * exists. Task 13's [modelCatalogViewModel] is the only consumer.
+     */
+    private val modelCatalogService: ModelCatalogService? = null,
+    /**
+     * 0.52 (design §5.3): the one-shot pre-catalog upgrade detector, or null for hand-built compositions.
+     *
+     * Production [create] builds it over the same encrypted blob store and the `edith_model_upgrade` SharedPreferences
+     * flag. `PhoneScreen` asks it at first composition; the dialog is the only caller.
+     */
+    internal val legacyModelConfig: LegacyModelConfig? = null,
     /**
      * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
      * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
@@ -1123,6 +1143,36 @@ class HostCompositionRoot internal constructor(
      * the Compose form; the settings shell only calls [ModelCatalogRepository.catalog].
      */
     internal val modelCatalogRepository: ModelCatalogRepository? get() = modelCatalog
+
+    /**
+     * 0.52 design §5.10: builds the model-service page's view model, or null when this composition has no catalog or no
+     * refresh service - the page then says 「模型服务不可用」 rather than fabricating an empty catalog.
+     *
+     * One call = one page session. The shell composes it inside `remember` for the catalog route group and calls
+     * `leave()` when the group leaves composition; that cancels in-flight fetches/writes. Re-entering the group composes a
+     * new view model whose `enter()` re-reads the catalog, which is the design §4.4 state rule.
+     *
+     * The selection callbacks are the T3 split: `beforeSelectionChange` is [stopForModelSwitch] (it must run before the
+     * repository writes the selection), `selectionChanged` is [onCatalogSelectionChanged], and `probeConsent` is the
+     * probe gate's grant. A null tester disables the detail page's test with a reason instead of crashing.
+     */
+    internal fun modelCatalogViewModel(): ModelCatalogViewModel? {
+        val repository = modelCatalog ?: return null
+        val service = modelCatalogService ?: return null
+        return ModelCatalogViewModel(
+            repository = repository,
+            service = service,
+            tester = profileTester,
+            probeConsent = { consent -> profileConsent(consent) },
+            beforeSelectionChange = { stopForModelSwitch() },
+            selectionChanged = { profile -> onCatalogSelectionChanged(profile) },
+            sessionRunning = { sessionBlocksModelSwitch() },
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        )
+    }
+
+    /** True while a live plugin session would have to be stopped before a model selection is written. */
+    private fun sessionBlocksModelSwitch(): Boolean = !closed && activatedPlugin != null
 
     /**
      * 0.52 design §5.8 / ruling R18: stops the running session **before** a model selection is written.
@@ -3450,6 +3500,12 @@ class HostCompositionRoot internal constructor(
                 .retryOnConnectionFailure(false)
                 .build()
             val modelListSource = ModelListClient(modelListHttp, resolver, allowLocalHttp = BuildConfig.DEBUG)
+            // 0.52 design §5.5: the refresh/restore orchestration Task 13's model-service view model drives; one
+            // instance per composition, over the same catalog and model-list client.
+            val modelCatalogService = ModelCatalogService(catalog, modelListSource)
+            // 0.52 design §5.3: the one-shot pre-catalog upgrade notice. The flag persists in SharedPreferences
+            // (`edith_model_upgrade`), the payload check reads the same encrypted store as the catalog.
+            val legacyModelConfig = LegacyModelConfig(blobs, SharedPreferencesLegacyPromptStore(context))
             // 0.25 Task 13 (R67/R71/R72): the one artifact store of this composition. The kernel writes a screenshot
             // into it; both model adapters read the same instance back through the one `MediaSource` the controlled
             // client holds. App-cache scratch, bounded and LRU — never the repository, never a log line.
@@ -4330,6 +4386,10 @@ class HostCompositionRoot internal constructor(
                 modelCatalog = catalog,
                 // 0.52 design §5.4: the dedicated gateway list client the catalog refresh will use.
                 modelListSource = modelListSource,
+                // 0.52 design §5.5: the refresh/restore service Task 13's page view model drives.
+                modelCatalogService = modelCatalogService,
+                // 0.52 design §5.3: the one-shot legacy upgrade detector PhoneScreen asks at first composition.
+                legacyModelConfig = legacyModelConfig,
                 // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
                 syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the

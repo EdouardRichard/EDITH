@@ -59,6 +59,7 @@ import com.sheen.rokid.phone.overlay.phoneOnlyStartFailureText
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
+import com.sheen.rokid.phone.storage.LegacyModelConfig
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillContent
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillListing
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.DetachUi
@@ -71,8 +72,10 @@ import com.sheen.rokid.phone.app.errorLabel
 import com.sheen.rokid.phone.actions.executionChannelLabel
 import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.plugin.Capability
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /**
@@ -100,6 +103,9 @@ internal fun PhoneScreen(
     remainingSeconds: Long,
 ) {
     var tab by remember { mutableStateOf(PhoneTab.ASSISTANT) }
+    // 0.52 first-run upgrade: 「去配置」 must switch to the settings tab *and* open the model service page, which the
+    // settings shell owns. The page request is handed down as the shell's initial route and consumed when it is pushed.
+    var settingsRoute by remember { mutableStateOf<com.sheen.rokid.phone.ui.settings.SettingsRoute?>(null) }
     // 0.4 Task 13e-prep: the composer state belongs to the page, not to the assistant tab. A bottom-tab switch
     // disposes AssistantTab, which used to discard the draft — and a dictated final appended to it — even though
     // PhoneScreen never left the composition. Hoisted here it survives every 助手/技能/记忆/设置 switch and still
@@ -206,11 +212,76 @@ internal fun PhoneScreen(
                     PhoneTab.MEMORY -> ScrollableTab(body, state.errorCode) {
                         root.memoryLogView?.let { MemorySection(it) } ?: Text("记忆服务不可用")
                     }
-                    PhoneTab.SETTINGS -> SettingsShell(root = root, state = state)
+                    PhoneTab.SETTINGS -> SettingsShell(
+                        root = root,
+                        state = state,
+                        initialRoute = settingsRoute,
+                        onInitialRouteConsumed = { settingsRoute = null },
+                    )
                 }
             }
         }
     }
+    FirstRunModelUpgrade(
+        legacy = root.legacyModelConfig,
+        onConfigured = {
+            tab = PhoneTab.SETTINGS
+            settingsRoute = com.sheen.rokid.phone.ui.settings.SettingsRoute.ModelService
+        },
+    )
+}
+
+/**
+ * 0.52 design §5.3: the one-shot pre-catalog upgrade notice.
+ *
+ * Shown once when `LegacyModelConfig` reports old profiles and no v2 catalog and the persisted flag has not been set.
+ * 「去配置」 runs the legacy cleanup (which touches only the old manifest/payloads, never the catalog or other settings),
+ * records the shown flag, hides the dialog and calls [onConfigured] so the host can switch to the settings tab and push
+ * the model service page. 「稍后」 (and a back/outside dismissal) records the flag and keeps the old payloads; they are
+ * never read. The flag makes the prompt one-shot even if the composition re-enters.
+ *
+ * The cleanup runs on the IO dispatcher so the encrypted-blob read cannot block the first frame; the button is hidden
+ * until it finishes.
+ */
+@Composable
+internal fun FirstRunModelUpgrade(
+    legacy: LegacyModelConfig?,
+    onConfigured: () -> Unit,
+) {
+    var visible by remember(legacy) { mutableStateOf(false) }
+    if (legacy != null) {
+        LaunchedEffect(legacy) {
+            visible = !legacy.promptShown() && withContext(Dispatchers.IO) { legacy.isPresent() }
+        }
+    }
+    if (!visible) return
+    val scope = rememberCoroutineScope()
+    val current = requireNotNull(legacy)
+    AlertDialog(
+        onDismissRequest = {
+            // A back/outside dismissal must not keep asking on every launch; it records the same "shown" flag as 稍后.
+            current.markPromptShown()
+            visible = false
+        },
+        title = { Text("模型配置已升级") },
+        text = { Text("模型配置方式已升级，需要重新填写服务提供商与 API Key；旧档案不会被读取。") },
+        confirmButton = {
+            TextButton(onClick = {
+                visible = false
+                scope.launch {
+                    withContext(Dispatchers.IO) { current.cleanup() }
+                    current.markPromptShown()
+                    onConfigured()
+                }
+            }) { Text("去配置") }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                current.markPromptShown()
+                visible = false
+            }) { Text("稍后") }
+        },
+    )
 }
 
 /**
