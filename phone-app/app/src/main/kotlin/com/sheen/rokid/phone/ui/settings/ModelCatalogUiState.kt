@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.ui.settings
 
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.model.ModelListError
+import com.sheen.rokid.model.ProtocolIds
 import com.sheen.rokid.phone.model.catalog.CatalogValidation
 import com.sheen.rokid.phone.model.catalog.ModelCatalog
 import com.sheen.rokid.phone.model.catalog.ModelEntry
@@ -95,7 +96,7 @@ internal data class ProviderDraft(
     val name: String,
     val baseUrl: String,
     val apiKey: CharArray? = null,
-    val protocolId: String = "OPENAI_RESPONSES",
+    val protocolId: String = ProtocolIds.DEFAULT,
     val timeoutMillis: Long = 30_000,
     val providerId: String? = null,
 )

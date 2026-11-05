@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.model.catalog
 
+import com.sheen.rokid.model.ProtocolIds
 import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelProfile
@@ -54,7 +55,8 @@ data class Provider(
     val id: String,
     val name: String,
     val baseUrl: String,
-    val protocolId: String = "OPENAI_RESPONSES",
+    // 0.52 C1: the catalog default and the runtime support id are the same single-source vocabulary (ProtocolIds).
+    val protocolId: String = ProtocolIds.DEFAULT,
     val timeoutMillis: Long = 30_000,
     val secretHandleId: String? = null,
     val revision: Long = 1,

@@ -28,6 +28,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.sheen.rokid.model.ProtocolIds
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.model.catalog.Provider
 
@@ -55,7 +56,7 @@ internal fun ProviderEditorScreen(
     var name by remember(providerId) { mutableStateOf(stored?.name.orEmpty()) }
     var baseUrl by remember(providerId) { mutableStateOf(stored?.baseUrl.orEmpty()) }
     var apiKey by remember(providerId) { mutableStateOf("") }
-    var protocolId by remember(providerId) { mutableStateOf(stored?.protocolId ?: "OPENAI_RESPONSES") }
+    var protocolId by remember(providerId) { mutableStateOf(stored?.protocolId ?: ProtocolIds.DEFAULT) }
     var timeoutText by remember(providerId) { mutableStateOf((stored?.timeoutMillis ?: 30_000L).toString()) }
     var advanced by remember { mutableStateOf(false) }
     var errors by remember { mutableStateOf(emptyList<String>()) }
@@ -64,7 +65,7 @@ internal fun ProviderEditorScreen(
     val dirty = name != stored?.name.orEmpty() ||
         baseUrl != stored?.baseUrl.orEmpty() ||
         apiKey.isNotEmpty() ||
-        protocolId != (stored?.protocolId ?: "OPENAI_RESPONSES") ||
+        protocolId != (stored?.protocolId ?: ProtocolIds.DEFAULT) ||
         timeoutText != (stored?.timeoutMillis ?: 30_000L).toString()
     var discardPrompt by remember { mutableStateOf(false) }
     val dirtyNow by rememberUpdatedState(dirty)
@@ -142,13 +143,13 @@ internal fun ProviderEditorScreen(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(
-                    selected = protocolId == "OPENAI_RESPONSES",
-                    onClick = { protocolId = "OPENAI_RESPONSES"; errors = emptyList() },
+                    selected = ProtocolIds.canonical(protocolId) == ProtocolIds.OPENAI_RESPONSES,
+                    onClick = { protocolId = ProtocolIds.OPENAI_RESPONSES; errors = emptyList() },
                     label = { Text(ModelCatalogUi.RESPONSES) },
                 )
                 FilterChip(
-                    selected = protocolId == "OPENAI_CHAT_COMPLETIONS",
-                    onClick = { protocolId = "OPENAI_CHAT_COMPLETIONS"; errors = emptyList() },
+                    selected = ProtocolIds.canonical(protocolId) == ProtocolIds.OPENAI_CHAT_COMPLETIONS,
+                    onClick = { protocolId = ProtocolIds.OPENAI_CHAT_COMPLETIONS; errors = emptyList() },
                     label = { Text(ModelCatalogUi.CHAT_COMPLETIONS) },
                 )
             }

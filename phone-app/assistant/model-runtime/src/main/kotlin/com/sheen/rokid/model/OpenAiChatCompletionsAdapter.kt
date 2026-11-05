@@ -25,7 +25,7 @@ import java.util.Base64
  * are `image_url` parts on `user` messages, the only role that may carry them.
  */
 class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
-    val support = ProtocolSupport("OPENAI_CHAT_COMPLETIONS",
+    val support = ProtocolSupport(ProtocolIds.OPENAI_CHAT_COMPLETIONS,
         setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO), setOf(OutputModality.TEXT))
 
     /**
@@ -37,7 +37,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
      * followed by tool role messages.
      */
     fun encode(profile: ModelProfile, frame: RequestFrame, audioParts: List<InputPart.Audio> = emptyList()): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
 
         val resolvedAudios = audioParts.map { part ->
             media.resolveAudio(part.localRef)
@@ -188,7 +188,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
     }
 
     fun encode(profile: ModelProfile, budgeted: BudgetedRequest): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
         val textParts = budgeted.request.input.filterIsInstance<InputPart.Text>()
         val imageParts = budgeted.request.input.filterIsInstance<InputPart.Image>()
         val audioParts = budgeted.request.input.filterIsInstance<InputPart.Audio>()

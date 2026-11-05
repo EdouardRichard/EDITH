@@ -20,7 +20,7 @@ import java.util.Locale
  * (`ToolOutput.images`, restored by `ModelClientGateway`), never in `TOOL_ROUND` JSON (R6).
  */
 class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
-    val support = ProtocolSupport("DEEPSEEK_RESPONSES",
+    val support = ProtocolSupport(ProtocolIds.OPENAI_RESPONSES,
         setOf(InputModality.TEXT, InputModality.IMAGE), setOf(OutputModality.TEXT))
 
     /**
@@ -32,7 +32,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
      * carried by the budgeted overload below.
      */
     fun encode(profile: ModelProfile, frame: RequestFrame): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
         require(InputModality.TEXT in profile.inputs && OutputModality.TEXT in profile.outputs)
         val tools = frame.tools.map(::descriptor)
         val body = buildJsonObject {
@@ -104,7 +104,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     } catch (_: Exception) { null }
 
     fun encode(profile: ModelProfile, budgeted: BudgetedRequest): ByteArray {
-        require(profile.protocolId == support.id && budgeted.request.profileId == profile.id && budgeted.request.profileRevision == profile.revision)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id && budgeted.request.profileId == profile.id && budgeted.request.profileRevision == profile.revision)
         require(InputModality.TEXT in profile.inputs && OutputModality.TEXT in profile.outputs)
         require(budgeted.request.output == OutputModality.TEXT)
         // 0.25 §4.10: this version sends TEXT + IMAGE. An audio part is refused visibly rather than dropped, and the

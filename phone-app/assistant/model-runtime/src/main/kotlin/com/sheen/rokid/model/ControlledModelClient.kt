@@ -58,13 +58,14 @@ class ControlledModelClient(
 
     private fun admit(input: ModelRequest, listener: (ModelStreamEvent) -> Unit, probe: Boolean): CancellationHandle {
         val profile = repository.get(input.profileId) ?: rejected()
-        val support = when (profile.protocolId) {
-            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.support
-            else -> deepSeekAdapter.support
-        }
-        gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(profile), probe)
+        // 0.52 C1: one mapping table decides adapter + endpoint, so the catalog's family id and the adapter's support id
+        // can never disagree again. `DEEPSEEK_RESPONSES` stays the documented alias for pre-0.5.2 debug profiles.
+        val protocol = ProtocolIds.canonical(profile.protocolId)
+        val chatCompletions = protocol == ProtocolIds.OPENAI_CHAT_COMPLETIONS
+        val support = if (chatCompletions) openAiAdapter.support else deepSeekAdapter.support
+        gate.check(profile, input, support, consent(profile), probe)
         val prepared = budgeter.prepare(profile, input)
-        val endpoint = if (profile.protocolId == "OPENAI_CHAT_COMPLETIONS")
+        val endpoint = if (chatCompletions)
             ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)
         else ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
         val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
@@ -84,9 +85,10 @@ class ControlledModelClient(
         }
         superseded.forEach { it.end(ModelEnd.CANCELLED, "TURN_REPLACED") }
         if (!pending.active()) return pending
-        val payload = when (profile.protocolId) {
-            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.encode(profile, prepared)
-            else -> deepSeekAdapter.encode(profile, prepared)
+        val payload = if (chatCompletions) {
+            openAiAdapter.encode(profile, prepared)
+        } else {
+            deepSeekAdapter.encode(profile, prepared)
         }
         var encoded: Request? = null
         try {
@@ -145,7 +147,9 @@ class ControlledModelClient(
                     val framing = SseDecoder()
                     // P5: route to the right SSE decoder by protocol. Chat Completions uses a different wire format
                     // (choices[].delta.content + finish_reason) than the Responses API (response.output_text.delta).
-                    val isChatCompletions = repository.get(pending.input.profileId)?.protocolId == "OPENAI_CHAT_COMPLETIONS"
+                    val isChatCompletions = ProtocolIds.isChatCompletions(
+                        repository.get(pending.input.profileId)?.protocolId.orEmpty(),
+                    )
                     val chatDecoder = if (isChatCompletions) ChatCompletionsDecoder(pending.input.requestId) else null
                     val responsesDecoder = if (!isChatCompletions) ResponsesDecoder(pending.input.requestId) else null
                     fun frames(frames: List<SseFrame>) {

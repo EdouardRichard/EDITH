@@ -150,6 +150,9 @@ dependencies {
     // debug/implementation dependency of the app variant, while the JUnit4 rule itself only belongs to the test APK.
     debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation(libs.junit)
+    // 0.52 C1: the catalog-created provider must be driven through the real ControlledModelClient against a real
+    // HTTP server, not only through model-runtime fixtures (final review C1).
+    testImplementation(libs.mockwebserver)
     testImplementation(project(":common:testkit:test-support"))
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")

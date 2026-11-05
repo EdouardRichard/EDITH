@@ -42,7 +42,9 @@ class CapabilityGate {
             throw ContractError.ConfigurationRejected("Profile revision mismatch")
         }
         fun missing(): Nothing = throw ContractError.CapabilityMissing("Request capability unavailable")
-        if (support == null || support.id != profile.protocolId) missing()
+        // 0.52 C1: compare canonical family ids on both sides, so the documented legacy Responses spelling is accepted
+        // whether it appears on the profile (old catalogs/debug profiles) or on a hand-built support declaration.
+        if (support == null || ProtocolIds.canonical(support.id) != ProtocolIds.canonical(profile.protocolId)) missing()
         val inputs = buildSet {
             request.input.forEach {
                 add(
