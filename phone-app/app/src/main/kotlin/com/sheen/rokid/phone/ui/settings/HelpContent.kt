@@ -208,10 +208,10 @@ object HelpContent {
         impact = "影响：保存后立即生效",
     )
 
-    /** §5.2 default timeout + §5.4's fixed gateway-fetch timeout. */
+    /** §5.2 default timeout + §5.4's fixed gateway-fetch timeout. 0.5.4 Task 6 Finding 2: the default is now 90 s. */
     val PROVIDER_TIMEOUT = HelpText(
         title = "超时",
-        body = "超时是高级项，默认 30000 毫秒（30 秒），用于模型请求；拉取模型列表另用固定的 10 秒超时。",
+        body = "超时是高级项，默认 90000 毫秒（90 秒），用于模型请求；拉取模型列表另用固定的 10 秒超时。",
         impact = "影响：保存后立即生效",
     )
 

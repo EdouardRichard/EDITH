@@ -388,6 +388,28 @@ class ModelCatalogViewModelTest {
     }
 
     @Test
+    fun `a provider saved from the form defaults its timeout to the 90 second cap`() {
+        // 0.5.4 Task 6 Finding 2: a provider created through Settings used to start at 30 s while the catalog default
+        // (and the client's 90 s hard cap) is 90 s. The form is what a real user gets, so its unedited default must be
+        // the same 90 s - an old stored provider keeps its own value (there is no migration).
+        val repository = repository()
+        val model = viewModel(repository)
+        model.enter()
+
+        model.saveProvider(
+            ProviderDraft(
+                name = "DeepSeek",
+                baseUrl = "https://api.deepseek.com/v1",
+                apiKey = "sk-test-1234".toCharArray(),
+                protocolId = "OPENAI_RESPONSES",
+            ),
+        )
+
+        val saved = requireNotNull(repository.catalog().providers.firstOrNull()) { "the provider must be saved" }
+        assertEquals(90_000L, saved.timeoutMillis)
+    }
+
+    @Test
     fun `a failed first fetch keeps the provider and shows the mapped error`() {
         val repository = repository()
         val source = Source(ModelListResult.Failure(ModelListError.AUTH))

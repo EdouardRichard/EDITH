@@ -33,6 +33,14 @@ import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.model.catalog.Provider
 
 /**
+ * 0.5.4 Task 6 Finding 2: the timeout field's text. A new provider starts at the 90 s catalog/client default; an edited
+ * provider keeps the value it was stored with (no migration of old 30 s rows). Extracted so the JVM test can pin both
+ * branches without a Compose host.
+ */
+internal fun providerTimeoutText(stored: Provider?): String =
+    (stored?.timeoutMillis ?: PROVIDER_TIMEOUT_DEFAULT_MILLIS).toString()
+
+/**
  * 0.52 design §5.10: the add/edit provider form - three required fields plus a collapsed 高级 section.
  *
  * The plaintext key never leaves this form: the save button converts it into a `CharArray` for the view model and
@@ -57,7 +65,7 @@ internal fun ProviderEditorScreen(
     var baseUrl by remember(providerId) { mutableStateOf(stored?.baseUrl.orEmpty()) }
     var apiKey by remember(providerId) { mutableStateOf("") }
     var protocolId by remember(providerId) { mutableStateOf(stored?.protocolId ?: ProtocolIds.DEFAULT) }
-    var timeoutText by remember(providerId) { mutableStateOf((stored?.timeoutMillis ?: 30_000L).toString()) }
+    var timeoutText by remember(providerId) { mutableStateOf(providerTimeoutText(stored)) }
     var advanced by remember { mutableStateOf(false) }
     var errors by remember { mutableStateOf(emptyList<String>()) }
 
@@ -66,7 +74,7 @@ internal fun ProviderEditorScreen(
         baseUrl != stored?.baseUrl.orEmpty() ||
         apiKey.isNotEmpty() ||
         protocolId != (stored?.protocolId ?: ProtocolIds.DEFAULT) ||
-        timeoutText != (stored?.timeoutMillis ?: 30_000L).toString()
+        timeoutText != providerTimeoutText(stored)
     var discardPrompt by remember { mutableStateOf(false) }
     val dirtyNow by rememberUpdatedState(dirty)
     val pop by rememberUpdatedState(requestPop)

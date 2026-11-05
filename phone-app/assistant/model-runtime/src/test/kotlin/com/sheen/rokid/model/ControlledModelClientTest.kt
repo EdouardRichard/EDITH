@@ -311,9 +311,51 @@ class ControlledModelClientTest {
         assertEquals(1, grace.size, "the first-token grace must be armed 45 s after the request was sent")
         rig.timers.fire(grace.single())
         rig.awaitTerminal()
-        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        // Finding 3: a stage timeout is a deadline event, not a generic provider failure, so the wearer hears the
+        // timeout copy. The stage code stays in the terminal's safeCode (and therefore in the P3_TURN detail).
+        assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
         assertEquals("FIRST_TOKEN_TIMEOUT", rig.terminal().safeCode)
         assertEquals(45_000_000_000L, rig.settledAtNanos, "the grace, not the hard cap, decided this request")
+    }
+
+    @Test fun `a tool-call-only stream outlives the first-token grace`() = Rig().use { rig ->
+        // A tool-call-only turn streams no answer text and no thinking fragment. Its call fragments still prove the
+        // request is alive, so they must count as the first token: otherwise the 45 s grace kills a legal call that is
+        // being produced (Finding 1). 12 s between fragments makes the call itself take 48 s - past the grace.
+        rig.server.enqueue(sse(CREATED + TOOL_ITEM_ADDED + toolDelta(2, "1") + toolDelta(3, "2") +
+            toolDelta(4, "3") + toolDelta(5, "4") + toolItemDone(6, "1234") + completed(7)))
+        rig.client.request(rig.request().copy(deadlineNanos = 120_000_000_000L)) { event ->
+            if (event is ModelStreamEvent.ToolCallDelta) rig.timers.advanceAndFire(12_000_000_000L)
+            rig.event(event)
+        }
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.COMPLETED), rig.ends())
+        assertNull(rig.terminal().safeCode)
+        assertEquals(4, rig.events.count { it is ModelStreamEvent.ToolCallDelta })
+        assertEquals(
+            listOf("1234"),
+            rig.events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().map { it.argsJson },
+        )
+        assertTrue(rig.settledAtNanos > 45_000_000_000L, "the tool-only stream must be allowed to outlive the grace")
+        assertTrue(
+            rig.timers.entries.single { it.deadline == 45_000_000_000L }.cancelled,
+            "the first tool-call fragment must disarm the grace exactly like a text fragment",
+        )
+    }
+
+    @Test fun `a caller deadline below the grace leaves the grace unarmed`() = Rig().use { rig ->
+        // Finding 2's client side: a 30 s caller deadline (an older stored provider) is below the 45 s grace. Arming
+        // the grace would create a timer that can never decide anything, and firing it after the caller's cap would
+        // report the wrong stage, so the request must be bounded by the caller's deadline alone.
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        rig.client.request(rig.request().copy(deadlineNanos = 30_000_000_000L), rig::event)
+        rig.awaitRequest()
+        assertEquals(listOf(30_000_000_000L), rig.timers.entries.map { it.deadline })
+        rig.timers.fire(rig.timers.entries.single())
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
+        assertEquals("REQUEST_DEADLINE", rig.terminal().safeCode)
+        assertEquals(30_000_000_000L, rig.settledAtNanos)
     }
 
     @Test fun `a reasoning stream that keeps flowing does not trip the idle timeout`() = Rig().use { rig ->
@@ -360,7 +402,9 @@ class ControlledModelClientTest {
                 rig.event(event)
             }
             rig.awaitTerminal()
-            assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+            // Finding 3: the idle timeout is a deadline, so the wearer gets the timeout copy; the stage code survives
+            // in the terminal's safeCode and in the turn's P3_TURN detail.
+            assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
             assertEquals("STREAM_IDLE_TIMEOUT", rig.terminal().safeCode)
             assertEquals(idleNanos, settledAtNanos, "the idle window, not the grace or the cap, decided this request")
             assertEquals(listOf("hi"), rig.events.filterIsInstance<ModelStreamEvent.TextDelta>().map { it.text })
@@ -692,7 +736,8 @@ class ControlledModelClientTest {
     }
 
     private class Timers(private val now: AtomicLong) : DeadlineScheduler {
-        data class Entry(val deadline: Long, val callback: () -> Unit, @Volatile var cancelled: Boolean = false)
+        data class Entry(val deadline: Long, val callback: () -> Unit, @Volatile var cancelled: Boolean = false,
+            @Volatile var fired: Boolean = false)
         val entries = CopyOnWriteArrayList<Entry>()
         private val retry = LinkedBlockingQueue<Entry>()
         override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
@@ -703,6 +748,16 @@ class ControlledModelClientTest {
         }
         fun awaitRetry() = assertNotNull(retry.poll(5, TimeUnit.SECONDS))
         fun fire(entry: Entry) { now.set(entry.deadline); if (!entry.cancelled) entry.callback() }
+        /**
+         * Move the fake clock and run every timer that became due, in deadline order. A stream test uses this to prove
+         * that a watchdog which really expires during the stream decides the request (Finding 1).
+         */
+        fun advanceAndFire(nanos: Long) {
+            now.addAndGet(nanos)
+            entries.filter { !it.cancelled && !it.fired && it.deadline <= now.get() }
+                .sortedBy { it.deadline }
+                .forEach { entry -> entry.fired = true; entry.callback() }
+        }
     }
 
     companion object {
@@ -729,6 +784,20 @@ class ControlledModelClientTest {
         /** Task 6: back-to-back reasoning frames with strictly increasing sequence numbers. */
         fun reasoning(sequence: Int, text: String) =
             "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":$sequence,\"response_id\":\"s\",\"item_id\":\"rs\",\"content_index\":0,\"delta\":\"$text\"}\n\n"
+
+        /** Task 6 Finding 1: a tool-call-only stream, whose arguments arrive as fragments and carry no answer text. */
+        const val TOOL_ITEM_ADDED =
+            "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0," +
+                "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"record_note\"}}\n\n"
+
+        fun toolDelta(sequence: Int, fragment: String) =
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":$sequence," +
+                "\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"$fragment\"}\n\n"
+
+        fun toolItemDone(sequence: Int, arguments: String) =
+            "data: {\"type\":\"response.output_item.done\",\"sequence_number\":$sequence,\"output_index\":0," +
+                "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," +
+                "\"name\":\"record_note\",\"arguments\":\"$arguments\"}}\n\n"
 
         fun completed(sequence: Int) =
             "data: {\"type\":\"response.completed\",\"sequence_number\":$sequence,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"

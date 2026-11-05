@@ -22,8 +22,10 @@ private const val MAX_ERROR_BODY_BYTES = 8_192L
  * 0.5.4 Task 6: the three stages that bound one model request. [ControlledModelClient] owns all of them, so no caller
  * (and no HTTP-library default) can silently decide when a request dies.
  *
- * - [firstTokenMillis]: send → first `TextDelta`/`ReasoningDelta`. A thinking model may spend a long time before the
- *   first visible fragment; 45 s is the grace, not the whole answer budget.
+ * - [firstTokenMillis]: send → first liveness delta (`TextDelta`, `ReasoningDelta`, `ToolCallDelta` or
+ *   `ToolCallTerminal`). A thinking model may spend a long time before the first visible fragment, and a tool-call-only
+ *   turn has no visible fragment at all, so the grace must end on whichever delta proves the request is alive; 45 s is
+ *   the grace, not the whole answer budget.
  * - [streamIdleMillis]: the longest silence allowed **between** two fragments. Every accepted delta restarts it, so a
  *   stream that keeps flowing never trips it.
  * - [hardCapMillis]: the whole request, whatever the profile or caller allows. It is only ever lowered by the caller's
@@ -40,7 +42,9 @@ data class RequestTimeouts(
 }
 
 // Stable machine codes for the three stages. A timeout is never a verdict on the answer; these tell an operator (and
-// Task 8's `P3_MODEL_REQ`) which stage expired. The turn/gateway boundary keeps its own `DEADLINE`.
+// Task 8's `P3_MODEL_REQ`) which stage expired. All three are reported as `ModelEnd.DEADLINE` so the user hears the
+// timeout copy rather than a generic failure; the stage code still rides the terminal's `safeCode` into the turn's
+// detail/log line. The turn/gateway boundary keeps its own `DEADLINE` code as well.
 private const val FIRST_TOKEN_TIMEOUT = "FIRST_TOKEN_TIMEOUT"
 private const val STREAM_IDLE_TIMEOUT = "STREAM_IDLE_TIMEOUT"
 private const val REQUEST_DEADLINE = "REQUEST_DEADLINE"
@@ -269,7 +273,7 @@ class ControlledModelClient(
         private val listener: (ModelStreamEvent) -> Unit) : CancellationHandle {
         private val done = AtomicBoolean(false)
         val delta = AtomicBoolean(false)
-        /** Task 6: true once the first `TextDelta`/`ReasoningDelta` arrived; disarms the first-token grace. */
+        /** Task 6: true once the first liveness delta arrived; disarms the first-token grace. */
         private val firstToken = AtomicBoolean(false)
         private var firstTokenTimer: CancellationHandle? = null
         private var idleTimer: CancellationHandle? = null
@@ -299,11 +303,19 @@ class ControlledModelClient(
             if (!accepted) value.cancel()
         }
         fun firstTokenTimedOut() {
-            if (!firstToken.get()) end(ModelEnd.FAILED, FIRST_TOKEN_TIMEOUT)
+            if (!firstToken.get()) end(ModelEnd.DEADLINE, FIRST_TOKEN_TIMEOUT)
         }
-        /** Task 6: mark the first fragment as seen (`TextDelta`/`ReasoningDelta`) and disarm the grace. */
+        /**
+         * Task 6: the deltas that mean the request is still producing something. This one predicate feeds both the
+         * first-token grace and the idle window: answer text, thinking, and a tool-call fragment are all liveness, so a
+         * stream is never killed while the server is still sending (Finding 1).
+         */
+        private fun isLiveness(event: ModelStreamEvent) = event is ModelStreamEvent.TextDelta ||
+            event is ModelStreamEvent.ReasoningDelta || event is ModelStreamEvent.ToolCallDelta ||
+            event is ModelStreamEvent.ToolCallTerminal
+        /** Task 6: mark the first liveness delta as seen and disarm the grace. */
         private fun noteFirstToken(event: ModelStreamEvent) {
-            if (event !is ModelStreamEvent.TextDelta && event !is ModelStreamEvent.ReasoningDelta) return
+            if (!isLiveness(event)) return
             if (!firstToken.compareAndSet(false, true)) return
             val grace = synchronized(lock) { val armed = firstTokenTimer; firstTokenTimer = null; armed }
             grace?.cancel()
@@ -315,7 +327,9 @@ class ControlledModelClient(
         private fun armIdle() {
             if (done.get()) return
             val handle = scheduler.at(saturatedAdd(clock.nowNanos(), millisNanos(timeouts.streamIdleMillis))) {
-                end(ModelEnd.FAILED, STREAM_IDLE_TIMEOUT)
+                // Finding 3: the idle stage is a deadline, not a generic provider failure: the wearer must hear the
+                // timeout copy, while the stage code stays in `safeCode` for the turn's detail/log line.
+                end(ModelEnd.DEADLINE, STREAM_IDLE_TIMEOUT)
             }
             var previous: CancellationHandle? = null
             val accepted = synchronized(lock) {
@@ -338,10 +352,7 @@ class ControlledModelClient(
             val admitted = synchronized(lock) { !done.get() }
             if (admitted) try { listener(event) } catch (_: Exception) { end(ModelEnd.FAILED, "LISTENER_FAILED") }
             // Deltas of any kind are liveness for the idle window; metadata only (`response.created`) is not.
-            if (event is ModelStreamEvent.TextDelta || event is ModelStreamEvent.ReasoningDelta ||
-                event is ModelStreamEvent.ToolCallDelta || event is ModelStreamEvent.ToolCallTerminal) {
-                armIdle()
-            }
+            if (isLiveness(event)) armIdle()
         }
         fun end(end: ModelEnd, code: String?, usage: ModelUsage? = null) {
             if (!done.compareAndSet(false, true)) return

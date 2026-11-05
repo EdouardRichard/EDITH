@@ -87,6 +87,14 @@ internal sealed interface CatalogConfirmation {
 }
 
 /**
+ * 0.5.4 Task 6 Finding 2: the timeout a provider form starts with. It is the same 90 s as the catalog default
+ * (`Provider.timeoutMillis`) and the model client's hard request cap, so a provider created through Settings is not
+ * silently born at the old 30 s. Kept as one constant because the form's field text and [ProviderDraft] must not drift;
+ * `ProviderTimeoutDefaultTest` pins it to the domain default. Stored providers keep their own value - no migration.
+ */
+internal const val PROVIDER_TIMEOUT_DEFAULT_MILLIS = 90_000L
+
+/**
  * One provider form submission (0.52 design §5.10).
  *
  * [apiKey] is the caller's mutable buffer: the repository stages it and the view model zeroes it, so the compose form
@@ -98,7 +106,7 @@ internal data class ProviderDraft(
     val baseUrl: String,
     val apiKey: CharArray? = null,
     val protocolId: String = ProtocolIds.DEFAULT,
-    val timeoutMillis: Long = 30_000,
+    val timeoutMillis: Long = PROVIDER_TIMEOUT_DEFAULT_MILLIS,
     val providerId: String? = null,
 )
 

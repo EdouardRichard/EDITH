@@ -190,7 +190,9 @@ class HelpContentTest {
         assertTrue(HelpContent.PROVIDER_PROTOCOL.body.contains("OpenAI Responses"))
         assertTrue(HelpContent.PROVIDER_PROTOCOL.body.contains("高级"))
         assertTrue("both protocols support DeepSeek thinking", HelpContent.PROVIDER_PROTOCOL.body.contains("思考"))
-        assertTrue(HelpContent.PROVIDER_TIMEOUT.body.contains("30000"))
+        // 0.5.4 Task 6 Finding 2: the catalog default and the form default are 90 s (the hard request cap), not 30 s.
+        assertTrue(HelpContent.PROVIDER_TIMEOUT.body.contains("90000"))
+        assertTrue("the default is stated in seconds too", HelpContent.PROVIDER_TIMEOUT.body.contains("90 秒"))
         assertTrue("the gateway fetch timeout is a different, fixed 10 seconds", HelpContent.PROVIDER_TIMEOUT.body.contains("10 秒"))
 
         assertTrue(HelpContent.FETCH_MODELS.body.contains("/models"))
