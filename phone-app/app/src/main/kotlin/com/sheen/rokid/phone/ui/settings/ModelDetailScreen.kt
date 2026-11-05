@@ -29,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -551,7 +552,13 @@ private fun DetailBody(
             checked = false,
             onCheckedChange = null,
             enabled = false,
-            modifier = Modifier.semantics { contentDescription = ModelDetailUi.AUDIO_SWITCH },
+            // `Switch` only publishes `Disabled` through the toggleable semantics it installs for a change handler;
+            // with no handler the switch is inert but would still be announced as an enabled control. State the
+            // 0.52 reservation's disabled state explicitly so accessibility matches what the row says and does.
+            modifier = Modifier.semantics {
+                contentDescription = ModelDetailUi.AUDIO_SWITCH
+                disabled()
+            },
         )
     }
 

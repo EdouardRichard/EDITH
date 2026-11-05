@@ -324,7 +324,9 @@ class ModelDetailUiTest {
         compose.onNodeWithContentDescription("模型显示名输入").performTextReplacement("Edited")
 
         val leave = requireNotNull(guard) { "the detail page must register its back guard" }
-        leave()
+        // The shell invokes its registered guard on the main thread; run it there and let the state write settle so
+        // the assertion sees the same recomposition the device would.
+        compose.runOnIdle { leave() }
         compose.onNodeWithText(SettingsPageUi.DISCARD_TITLE).assertExists()
         assertEquals("the route does not close while the draft is unsaved", 0, popped)
 
@@ -332,7 +334,7 @@ class ModelDetailUiTest {
         compose.onNodeWithText(SettingsPageUi.DISCARD_TITLE).assertDoesNotExist()
         assertEquals(0, popped)
 
-        leave()
+        compose.runOnIdle { leave() }
         compose.onNodeWithText(SettingsPageUi.DISCARD_CONFIRM).performClick()
         assertEquals("discarding the draft leaves the route", 1, popped)
     }
