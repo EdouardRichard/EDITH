@@ -147,6 +147,9 @@ class DiagnosticTextPlugin(
                     if (event.text.isNotEmpty() && !o.firstToken) { o.firstToken = true; mark(TraceMark.FIRST_TOKEN, o) }
                 }
                 is ModelStreamEvent.ToolCallDelta, is ModelStreamEvent.ToolCallTerminal -> Unit
+                // 0.53: a chain of thought is internal model state, not the advice text this diagnostic plugin
+                // renders. Stated explicitly (never a silent `else`) so a future event type still fails loudly.
+                is ModelStreamEvent.ReasoningDelta -> Unit
                 is ModelStreamEvent.Terminal -> {
                     if (event.requestId != o.requestId) return
                     o.terminal = true; handle = o.handle; o.handle = null
@@ -159,6 +162,8 @@ class DiagnosticTextPlugin(
             // This plugin declares no tools, so a tool event carries nothing it can act on: it must not end the turn
             // (a terminal tool call is not the model's text answer) and must not be rendered.
             is ModelStreamEvent.ToolCallDelta, is ModelStreamEvent.ToolCallTerminal -> Unit
+            // 0.53: reasoning is never appended to the diagnostic text either.
+            is ModelStreamEvent.ReasoningDelta -> Unit
         }
         handle?.cancel()
     }
