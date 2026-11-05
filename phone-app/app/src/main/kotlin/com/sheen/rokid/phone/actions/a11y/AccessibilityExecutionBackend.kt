@@ -36,8 +36,9 @@ private const val SNAPSHOT_STALE = "SNAPSHOT_STALE"
 /**
  * 0.5.4 T12: the port accepted the text write but the field does not carry it after the settle window.
  *
- * The write was dispatched, so this is not an argument or target error; the field simply did not apply it. It is also
- * not [NO_SCREEN_CHANGE]: the screen may well have changed (a focused field, a cursor) while the text did not land.
+ * The write was dispatched, so this is not an argument or target error; the field simply did not apply it. It is the
+ * only refusal `input_text` has after a dispatched write: a matching read-back is `Done` and any other read-back is
+ * this code, whichever way the screen fingerprint moved. (`NO_SCREEN_CHANGE` stays a `tap`/`long_press` verdict.)
  */
 private const val TEXT_NOT_APPLIED = "TEXT_NOT_APPLIED"
 
@@ -148,7 +149,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = INPUT_TEXT,
         title = "在指定索引的输入框输入文字",
-        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen，滚动后旧快照失效，旧快照被动作或通道作废后复用索引返回 SNAPSHOT_STALE；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE；写入后会在 800 毫秒内回读该字段，回读不到 text 返回 TEXT_NOT_APPLIED（平台接受了写入但字段没有生效，不回显字段内容），屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen，滚动后旧快照失效，旧快照被动作或通道作废后复用索引返回 SNAPSHOT_STALE；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE；写入后会在 800 毫秒内回读该字段，回读不到 text 返回 TEXT_NOT_APPLIED（平台接受了写入但字段没有生效，不回显字段内容）；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"text":{"type":"string"}},"required":["index","text"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -627,7 +628,6 @@ class AccessibilityExecutionBackend(
         // Read-back must use the filter the acted-on snapshot was read with: indices are assigned after filtering.
         val filter = currentSnapshotFilter ?: ScreenFilter.INTERACTIVE
 
-        val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
         // 0.5.4 Task 8, same dispatch position as `tap`: `input_text` is index-targeted, so it reports the same via
         // token only when the write is actually dispatched; the typed text never rides it.
         P3Log.line("P3_ACT via=index")
@@ -636,12 +636,11 @@ class AccessibilityExecutionBackend(
         invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
         // 0.5.4 T12: success is the field carrying the text, not the platform accepting the write. The settle window is
-        // exactly when a late UI update can appear, so it is awaited before any verdict. A field that never takes the
-        // text still keeps the pre-T12 distinction below: "nothing changed" is NO_SCREEN_CHANGE, "the screen moved but
-        // the field did not take the text" is TEXT_NOT_APPLIED.
+        // exactly when a late UI update can appear, so it is awaited before the verdict. Any non-matching read-back is
+        // TEXT_NOT_APPLIED (0.5.4 T12 fix round): "the screen did not move" is not a separate input_text answer, because
+        // the field can refuse the text while nothing else changes. NO_SCREEN_CHANGE stays reserved for tap/long_press.
         if (awaitFieldText(index, filter, trimmed)) return done("typed into index $index")
-        val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after == before) refused(NO_SCREEN_CHANGE) else refused(TEXT_NOT_APPLIED)
+        return refused(TEXT_NOT_APPLIED)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

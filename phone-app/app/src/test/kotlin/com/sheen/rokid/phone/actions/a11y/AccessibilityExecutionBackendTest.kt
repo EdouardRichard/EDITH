@@ -461,9 +461,10 @@ class AccessibilityExecutionBackendTest {
         assertTrue(result.detail.contains("tapped"))
     }
 
-    @Test fun `input_text keeps NO_SCREEN_CHANGE when the text did not land and nothing changed`() {
-        // 0.5.4 T12 replaces the fingerprint-only criterion for input_text, but keeps its pre-T12 refusal: a field that
-        // never takes the text *and* a screen that never moved is still NO_SCREEN_CHANGE, not TEXT_NOT_APPLIED.
+    @Test fun `input_text reports TEXT_NOT_APPLIED when the text did not land and nothing changed`() {
+        // 0.5.4 T12 fix round: the read-back is the only input_text verdict. A field that never takes the text *and* a
+        // screen that never moved (fingerprintAfter == fingerprintBefore here) is still "the dispatched write did not
+        // apply" - NO_SCREEN_CHANGE stays a tap/long_press refusal, not an input_text one.
         val editableNode = RawSnapshotNode(
             text = "", contentDescription = null, className = null,
             clickable = false, editable = true, scrollable = false, checked = false,
@@ -475,7 +476,8 @@ class AccessibilityExecutionBackendTest {
         staleB.execute("read_screen", "{}")
         val stale = staleB.execute("input_text", """{"index":0,"text":"hello"}""")
         assertEquals(ActionOutcome.Refused, stale.outcome)
-        assertEquals("NO_SCREEN_CHANGE", stale.detail)
+        assertEquals("TEXT_NOT_APPLIED", stale.detail)
+        assertEquals("the refusal waits out the settle window", 800L, now)
 
         val okUi = FakeUi(nodes = listOf(editableNode))
         val okB = backend(okUi)
@@ -583,6 +585,47 @@ class AccessibilityExecutionBackendTest {
             assertEquals("$action cold start", ActionOutcome.Refused, result.outcome)
             assertEquals("$action cold start", "ARGUMENTS_INVALID", result.detail)
         }
+    }
+
+    @Test fun `a new turn clears the stale marker so its first index action is the cold case`() {
+        // 0.5.4 T12 fix round (review Important 2): beginTurn() drops the snapshot AND the "it was invalidated by an
+        // action" marker. Without the second half, an index action right after the turn seam would answer SNAPSHOT_STALE
+        // and tell the model to re-read a screen it has not read yet; the cold ARGUMENTS_INVALID case is the correct
+        // recovery. The marker is proven set first, so the second half is not passing merely because it was never set.
+        val ui = FakeUi()
+        val b = backend(ui)
+        b.execute("read_screen", "{}")
+        assertEquals("the dispatch succeeds", ActionOutcome.Done, b.execute("tap", """{"index":0}""").outcome)
+        assertEquals(
+            "the dispatched action really left the marker set",
+            "SNAPSHOT_STALE",
+            b.execute("tap", """{"index":0}""").detail,
+        )
+
+        b.beginTurn()
+
+        val result = b.execute("tap", """{"index":0}""")
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("a new turn has read nothing", "ARGUMENTS_INVALID", result.detail)
+        assertNotEquals("a new turn must not claim staleness", "SNAPSHOT_STALE", result.detail)
+        assertEquals("only the first tap reached the device", 1, ui.clickByIndexCalls.size)
+    }
+
+    @Test fun `a stale index reuse emits no act line`() {
+        // 0.5.4 T12 fix round: P3_ACT counts actions that reached the device. A stale reuse is refused before dispatch,
+        // so logging it would overstate acts and attribute a device line to an action that never touched the device.
+        val ui = FakeUi()
+        val b = backend(ui)
+        b.execute("read_screen", "{}")
+        b.execute("tap", """{"index":0}""") // dispatched: it invalidates the snapshot
+
+        val acts = withP3Sink { captured ->
+            val stale = b.execute("tap", """{"index":0}""")
+            assertEquals("the reuse is stale", "SNAPSHOT_STALE", stale.detail)
+            captured.filter { it.startsWith("P3_ACT") }.toList()
+        }
+
+        assertTrue("a stale reuse never reached the device and emitted no act line: $acts", acts.isEmpty())
     }
 
     @Test fun `an invalid snapshot at the port is SNAPSHOT_STALE and dispatches nothing`() {
