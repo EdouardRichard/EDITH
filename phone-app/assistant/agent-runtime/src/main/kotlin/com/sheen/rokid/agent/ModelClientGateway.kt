@@ -326,13 +326,15 @@ class ModelClientGateway(
     /**
      * 0.53: the count-only `P3_THINKING` line of one model request.
      *
-     * `active` is the profile's configuration (not whether this particular stream happened to produce reasoning), so a
-     * device log can tell "thinking off" from "thinking on but the model reasoned nothing". `reasoningChars` and
-     * `replayChars` are character counts only — no reasoning text ever rides this line, exactly like `P3_CACHE`.
+     * `active` is the profile's **enabled switch** alone (0.53 revised: the capability bit is not part of the behaviour
+     * surface; the family rule lives in the catalog projection, not here). It describes what the operator set — not
+     * whether this particular stream happened to produce reasoning — so a device log can tell "thinking off" from
+     * "thinking on but the model reasoned nothing". `reasoningChars` and `replayChars` are character counts only — no
+     * reasoning text ever rides this line, exactly like `P3_CACHE`.
      */
     private fun emitThinkingMetric(request: GatewayTurn, reply: GatewayReply, modelRequest: ModelRequest) {
         val profile = profileLookup(request.profileId) ?: return
-        val active = profile.thinkingSupported && profile.thinkingEnabled
+        val active = profile.thinkingEnabled
         val effort = if (active) profile.thinkingEffort.name.lowercase() else "-"
         val reasoningChars = reply.reasoning?.length ?: 0
         val replayChars = modelRequest.history.filterIsInstance<ModelHistoryItem.Text>()

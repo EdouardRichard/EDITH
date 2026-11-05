@@ -586,6 +586,41 @@ class ModelClientGatewayTest {
         assertFalse(line.contains("新想") || line.contains("旧想"))
     }
 
+    @Test fun `the thinking metric reports active from the enabled switch alone`() {
+        // 0.53 revised: the capability bit is not part of the behaviour surface. `active` describes what the operator
+        // set (and what the adapter therefore sends), so a profile with the family bit false but the switch on still
+        // reads active=true, and a supported profile with the switch off reads active=false with no effort.
+        val enabled = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingSupported = false,
+                thinkingEnabled = true,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.LOW,
+            )
+        }
+        gateway(terminalClient(), metricLine = { enabled += it }).turn(turn())
+
+        assertEquals(
+            "P3_THINKING active=true effort=low reasoningChars=0 replayChars=0",
+            enabled.single { it.startsWith("P3_THINKING") },
+        )
+
+        val disabled = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingSupported = true,
+                thinkingEnabled = false,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.MAX,
+            )
+        }
+        gateway(terminalClient(), metricLine = { disabled += it }).turn(turn())
+
+        assertEquals(
+            "P3_THINKING active=false effort=- reasoningChars=0 replayChars=0",
+            disabled.single { it.startsWith("P3_THINKING") },
+        )
+    }
+
     // ------------------------------------------------------------ 7. stop
 
     @Test fun `a stop that arrives while the turn is in flight cancels the handle and beats the late terminal`() {
