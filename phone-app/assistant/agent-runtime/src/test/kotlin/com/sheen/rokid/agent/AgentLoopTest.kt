@@ -2110,6 +2110,7 @@ class AgentLoopTest {
         val run = loop.run(request())
 
         assertEquals(AgentOutcome.AWAITING_USER, run.outcome)
+        assertNull(run.finalText, "waiting for the wearer has no model answer; the tool's text is its own notification")
         assertEquals(1, gateway.requests.size, "an awaiting-user result must not ask the model again")
         assertTrue(
             ModelHistoryItem.Text(MessageRole.ASSISTANT, "想继续吗？") in run.transcript,

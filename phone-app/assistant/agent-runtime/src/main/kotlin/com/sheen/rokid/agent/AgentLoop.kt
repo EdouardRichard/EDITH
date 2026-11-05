@@ -230,9 +230,9 @@ data class AgentMetrics(
  * The terminal result of one run.
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
- * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set for [AgentOutcome.COMPLETED] (the
- * model's answer) and [AgentOutcome.AWAITING_USER] (the awaiting tool's own `data`); every failure outcome leaves it
- * `null`.
+ * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED] (the
+ * model's answer); [AgentOutcome.AWAITING_USER] leaves it `null` — that outcome has no model answer, and the awaiting
+ * tool's text is its own notification emit, not a final answer — and every failure outcome leaves it `null` too.
  *
  * [humanWaitNanos] is the wall clock this run spent waiting for a **person** — the confirmation port and the bounded
  * mayAskHuman wait a tool reports as its deadline shift (the shell/`ConfirmingActions` wrapper) — and it is
@@ -1171,10 +1171,11 @@ class AgentLoop(
                 // text and the tool output are already in history (above), so the turn can be settled from the
                 // transcript; no second model request is made, because the answer is the person's to give. This is not
                 // a failure: no safe code and no failure hint. It sits before the terminal-scope check because the
-                // awaiting declaration is the stronger verdict of the two.
+                // awaiting declaration is the stronger verdict of the two. `finalText` is `null`: there is no model
+                // answer, and the awaiting tool's own text is its notification emit, not this run's answer.
                 if (result.awaitingUser) {
                     return finish(
-                        AgentOutcome.AWAITING_USER, null, result.data, steps, history, "", spentSteps,
+                        AgentOutcome.AWAITING_USER, null, null, steps, history, "", spentSteps,
                         reply.reasoning,
                     )
                 }
