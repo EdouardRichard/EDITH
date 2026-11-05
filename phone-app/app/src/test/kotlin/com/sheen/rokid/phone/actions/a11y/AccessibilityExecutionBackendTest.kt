@@ -50,10 +50,16 @@ class AccessibilityExecutionBackendTest {
         // describe a normal unlocked app screen; a test that wants a refusal scripts the fact that causes it.
         private val foregroundPackage: String? = "com.example.app",
         private val keyguardLocked: Boolean = false,
+        /**
+         * The focused-window-type witness the coordinate gate also reads (0.5.4 T11 fix round). `null` means "cannot
+         * tell", which must refuse exactly like `false`; the default is the normal "an app window is focused".
+         */
+        private val focusedWindow: Boolean? = true,
         private val screen: ScreenBounds? = ScreenBounds(0, 0, 1080, 2400),
         private val gestureAccepted: Boolean = true,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
+        val longPressByIndexCalls = mutableListOf<Pair<String, Int>>()
         val setTextByIndexCalls = mutableListOf<Triple<String, Int, String>>()
         val clickAtCalls = mutableListOf<Pair<Int, Int>>()
         val longPressAtCalls = mutableListOf<Pair<Int, Int>>()
@@ -71,6 +77,8 @@ class AccessibilityExecutionBackendTest {
         override fun foreground(): Foreground? = foregroundPackage?.let { Foreground(it, null) }
 
         override fun isKeyguardLocked(): Boolean = keyguardLocked
+
+        override fun focusedWindowIsApplication(): Boolean? = focusedWindow
 
         override fun screenBounds(): ScreenBounds? = screen
 
@@ -110,6 +118,9 @@ class AccessibilityExecutionBackendTest {
         }
 
         override fun longPressByIndex(snapshotId: String, index: Int): Boolean {
+            // Record the attempt before validating, so the list proves "the index path was never reached" even when the
+            // coordinate test has no snapshot at all.
+            longPressByIndexCalls += snapshotId to index
             val snap = currentSnapshot ?: return false
             if (SnapshotValidator.validate(snapshotId, snap) != null) return false
             if (SnapshotValidator.validateIndex(snap, index) != null) return false
@@ -601,6 +612,8 @@ class AccessibilityExecutionBackendTest {
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(listOf(540 to 400), ui.longPressAtCalls)
         assertTrue("a coordinate long press never resolves an index", ui.clickByIndexCalls.isEmpty())
+        // The fake now records the index long-press too: before this, a fallback to the index path was invisible here.
+        assertTrue("a coordinate long press never falls back to an index", ui.longPressByIndexCalls.isEmpty())
     }
 
     @Test fun `coordinate actions are refused while the keyguard is up`() {
@@ -633,6 +646,28 @@ class AccessibilityExecutionBackendTest {
             assertEquals("foreground=$packageName", ActionOutcome.Refused, result.outcome)
             assertEquals("foreground=$packageName", "COORD_REFUSED_SYSTEM_UI", result.detail)
             assertTrue("foreground=$packageName dispatches nothing", ui.clickAtCalls.isEmpty())
+        }
+    }
+
+    @Test fun `a coordinate action requires the focused window to be a normal app`() {
+        // 0.5.4 T11 fix round: the foreground package alone is a package-level witness, so a system overlay that never
+        // raises a window-state event could slip through. The window type is a second witness: the focused window must
+        // be TYPE_APPLICATION. `true` plus a normal foreground dispatches; `false` (system/IME/keyguard window) and
+        // `null` (cannot tell) both fail closed and dispatch nothing.
+        val allowed = FakeUi(focusedWindow = true)
+        val dispatched = backend(allowed).execute("tap", """{"x":540,"y":400}""")
+        assertEquals(ActionOutcome.Done, dispatched.outcome)
+        assertEquals(listOf(540 to 400), allowed.clickAtCalls)
+
+        listOf(false, null).forEach { focused ->
+            val ui = FakeUi(focusedWindow = focused)
+            val b = backend(ui)
+            listOf("tap" to ui.clickAtCalls, "long_press" to ui.longPressAtCalls).forEach { (action, calls) ->
+                val result = b.execute(action, """{"x":540,"y":400}""")
+                assertEquals("focused=$focused $action", ActionOutcome.Refused, result.outcome)
+                assertEquals("focused=$focused $action", "COORD_REFUSED_SYSTEM_UI", result.detail)
+                assertTrue("focused=$focused $action dispatches nothing", calls.isEmpty())
+            }
         }
     }
 

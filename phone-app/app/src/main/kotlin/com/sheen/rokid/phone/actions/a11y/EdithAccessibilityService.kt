@@ -131,6 +131,23 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
     }
 
     /**
+     * Whether the focused accessibility window is a normal application window (0.5.4 T11 fix round).
+     *
+     * [foreground] is only a package-level witness: a system overlay that never raises a window-state event can stay
+     * invisible to it. `windows` exposes the window types directly, so the focused window's type is a second,
+     * type-level witness for the coordinate gate. `isFocused` is the primary signal; `isActive` is the documented
+     * fallback when a vendor build reports no focused window. No focused window, no window list, or a throwing probe
+     * answers `null` ("cannot tell"), which the backend refuses rather than grants. No window content is read.
+     */
+    override fun focusedWindowIsApplication(): Boolean? = runCatching {
+        val visibleWindows = windows ?: return@runCatching null
+        val focused = visibleWindows.firstOrNull { it.isFocused }
+            ?: visibleWindows.firstOrNull { it.isActive }
+            ?: return@runCatching null
+        focused.type == AccessibilityWindowInfo.TYPE_APPLICATION
+    }.getOrNull()
+
+    /**
      * The active window's root package — the second witness `open` verifies a launch against.
      *
      * Only the package string is read; no node content. A failed or missing root answers `null` (an
@@ -349,22 +366,27 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
      * The display rectangle in the same screen-pixel space as the accessibility bounds.
      *
      * `currentWindowMetrics` is preferred on API 30+ (the same source [com.sheen.rokid.phone.context.AndroidDeviceStateProvider]
-     * uses for the device profile); display metrics is the always-present fallback for a vendor build that refuses it.
-     * `null` means "cannot tell", which the backend treats as fail-closed rather than as a 0-sized screen.
+     * uses for the device profile), but an `AccessibilityService` is a non-UI context and some vendor builds throw from
+     * it. That probe is therefore caught **on its own**, and [resolveScreenBounds] always tries the always-present
+     * `resources.displayMetrics` fallback afterwards; wrapping both in one `runCatching` would turn the throw into a
+     * `null` answer and make every coordinate action refuse `MISSING_POINT` on device (T11 fix round). `null` means
+     * "neither source could read a positive display", which the backend treats as fail-closed rather than as a
+     * 0-sized screen.
      */
-    override fun screenBounds(): ScreenBounds? = runCatching {
-        val bounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            getSystemService(WindowManager::class.java)?.currentWindowMetrics?.bounds
-        } else {
-            null
-        }
-        if (bounds != null) {
-            ScreenBounds(bounds.left, bounds.top, bounds.right, bounds.bottom)
-        } else {
+    override fun screenBounds(): ScreenBounds? = resolveScreenBounds(
+        windowProbe = {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                getSystemService(WindowManager::class.java)?.currentWindowMetrics?.bounds
+                    ?.let { ScreenBounds(it.left, it.top, it.right, it.bottom) }
+            } else {
+                null
+            }
+        },
+        fallbackProbe = {
             val metrics = resources.displayMetrics
-            ScreenBounds(0, 0, metrics.widthPixels, metrics.heightPixels)
-        }
-    }.getOrNull()
+            metrics.widthPixels to metrics.heightPixels
+        },
+    )
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 

@@ -4152,6 +4152,7 @@ class HostCompositionRoot internal constructor(
                 // `AccessibilityUi` fail closed, so the wrapper must delegate or production would never tap a point.
                 override fun foreground(): Foreground? = live().foreground()
                 override fun isKeyguardLocked(): Boolean = live().isKeyguardLocked()
+                override fun focusedWindowIsApplication(): Boolean? = live().focusedWindowIsApplication()
                 override fun screenBounds(): ScreenBounds? = live().screenBounds()
                 override fun clickAt(x: Int, y: Int): Boolean = live().clickAt(x, y)
                 override fun longPressAt(x: Int, y: Int): Boolean = live().longPressAt(x, y)

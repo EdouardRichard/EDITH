@@ -43,6 +43,24 @@ data class ScreenBounds(
 /** A screen-pixel point; the midpoint of [ScreenBounds] for a rendered element. */
 data class ScreenPoint(val x: Int, val y: Int)
 
+/**
+ * Picks the one usable display rectangle from the two platform witnesses (0.5.4 T11 fix round).
+ *
+ * `WindowManager.currentWindowMetrics` can throw from a non-UI context such as an `AccessibilityService`; that failure
+ * must not discard the always-present `resources.displayMetrics` fallback, so each probe is caught on its own and the
+ * fallback is always tried when the window answer is missing or degenerate. `null` means neither source produced a
+ * positive display, which the backend treats as fail-closed [MISSING_POINT], never as a guessable screen.
+ */
+internal fun resolveScreenBounds(
+    windowProbe: () -> ScreenBounds?,
+    fallbackProbe: () -> Pair<Int, Int>?,
+): ScreenBounds? {
+    val window = runCatching(windowProbe).getOrNull()
+    if (window != null && window.right > window.left && window.bottom > window.top) return window
+    val (width, height) = runCatching(fallbackProbe).getOrNull() ?: return null
+    return if (width > 0 && height > 0) ScreenBounds(0, 0, width, height) else null
+}
+
 data class ScreenElement(
     val index: Int,
     val text: String?,

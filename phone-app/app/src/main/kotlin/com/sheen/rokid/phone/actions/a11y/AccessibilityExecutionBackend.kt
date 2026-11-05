@@ -186,6 +186,17 @@ interface AccessibilityUi {
     /** Keyguard state; the default `true` (locked) keeps a channel that cannot answer from guessing "unlocked". */
     fun isKeyguardLocked(): Boolean = true
 
+    /**
+     * Whether the focused window is a normal application window (`TYPE_APPLICATION`), or `null` when the channel cannot
+     * tell (0.5.4 T11 fix round).
+     *
+     * The foreground package is only a package-level witness: a system overlay that never raises a window-state event
+     * can stay invisible to it. The focused window's type is the second, type-level witness. The default `null` is
+     * fail-closed: an implementation that cannot prove an application window is focused must never dispatch a blind
+     * coordinate gesture.
+     */
+    fun focusedWindowIsApplication(): Boolean? = null
+
     /** The display rectangle in screen pixels, matching [ScreenBounds]; `null` when the channel cannot tell. */
     fun screenBounds(): ScreenBounds? = null
 
@@ -469,12 +480,15 @@ class AccessibilityExecutionBackend(
      * The coordinate eligibility gate (spec §6.3.3), or `null` when the point may be injected.
      *
      * Every probe fails closed: a probe that throws is the same as a probe that answers "unknown". Keyguard first (the
-     * dominant fact), then the foreground app, then the display rectangle. There is no "no answer" branch that permits
-     * the gesture; an unknown foreground is grouped with [COORD_REFUSED_SYSTEM_UI] because both mean "the channel cannot
-     * prove a normal target app is in front".
+     * dominant fact), then the two system-surface witnesses - the focused window's type and the foreground package -
+     * then the display rectangle. There is no "no answer" branch that permits the gesture; an unknown focused window,
+     * an unknown foreground, or a known system surface are all [COORD_REFUSED_SYSTEM_UI] because each means "the
+     * channel cannot prove a normal target app is in front".
      */
     private fun coordinateRefusal(x: Int, y: Int): String? {
         if (runCatching { ui.isKeyguardLocked() }.getOrDefault(true)) return COORD_REFUSED_KEYGUARD
+        // Type-level witness: a system/IME/keyguard window that is not TYPE_APPLICATION, or an unreadable answer.
+        if (runCatching { ui.focusedWindowIsApplication() }.getOrNull() != true) return COORD_REFUSED_SYSTEM_UI
         val foreground = runCatching { ui.foreground() }.getOrNull()?.packageName
         if (foreground.isNullOrBlank() || foreground in SYSTEM_FOREGROUND_PACKAGES) return COORD_REFUSED_SYSTEM_UI
         val bounds = runCatching { ui.screenBounds() }.getOrNull() ?: return MISSING_POINT
