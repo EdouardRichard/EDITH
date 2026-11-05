@@ -78,8 +78,10 @@ private fun JsonObject.toSnapshot(id: String): GatewayModelSnapshot {
             ?: positiveInt("max_tokens"),
         inputs = modalities(),
         ownedBy = ownedBy,
-        thinkingSupported = ModelFamilies.isDeepSeekFamily(id, ownedBy) ||
-            declaresReasoningEffort(),
+        // 0.53 design (revised) §T8: the system does not guess a model family. Only the gateway's own explicit
+        // reasoning metadata marks a model as thinking-capable; an id or `owned_by` that merely says "deepseek" is not
+        // evidence (owner ruling A). The user's switch decides what a request asks for either way.
+        thinkingSupported = declaresReasoningEffort(),
     )
 }
 

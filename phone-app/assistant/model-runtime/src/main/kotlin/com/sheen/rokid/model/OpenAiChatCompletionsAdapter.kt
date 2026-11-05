@@ -49,15 +49,13 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            put("max_tokens", maxTokens(profile, null))
-            // 0.52 design §5.7 + 0.53 §T3: Chat Completions spells the switch as `thinking.type` plus a top-level
-            // `reasoning_effort`; the vendor-only `enable_thinking` and a reasoning token budget are not used. A tool
-            // request no longer turns thinking off: when the profile has thinking active the switch and the chosen
-            // effort are sent with tools too, and the reasoning history is replayed (0.53). Both fields are
-            // DeepSeek-native: an OpenAI-compatible non-DeepSeek endpoint may reject them, so they are sent only when
-            // the projected model declares support (the pre-0.5.2 body otherwise).
-            if (profile.thinkingSupported) {
-                put("thinking", buildJsonObject { put("type", thinkingType(profile)) })
+            // 0.53 design (revised) §T3/§T5: the user switch is the only behaviour switch (no family guess). With it
+            // on, the official DeepSeek fields go out on every request — tools included — and `max_tokens` is
+            // **omitted** so the provider's documented 64K/128K default applies. With it off, no thinking field is
+            // sent at all: the general OpenAI body, exactly the pre-0.5.2 shape, keeps the existing cap.
+            if (!profile.thinkingEnabled) put("max_tokens", profile.maxOutputTokens)
+            if (profile.thinkingEnabled) {
+                put("thinking", buildJsonObject { put("type", "enabled") })
                 put("reasoning_effort", reasoningEffort(profile))
             }
             if (frame.tools.isNotEmpty()) {
@@ -157,30 +155,14 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
     } catch (_: Exception) { null }
 
     /**
-     * 0.53 design §T3: thinking is active only when the model is thinking-capable **and** the profile asks for it.
-     * A tool request no longer forces it off; the pre-0.53 forced-off rule was a safety net for the missing reasoning
-     * history, which the 0.53 replay now supplies.
+     * 0.53 design (revised) §T5: the official effort names for the three catalog levels. Only called when the user
+     * switch is on; the switched-off request carries no field at all.
      */
-    private fun active(profile: ModelProfile) = ThinkingOutputBudget.active(profile)
-
-    /** Chat Completions' switch. Stated explicitly even when off: DeepSeek defaults thinking on. */
-    private fun thinkingType(profile: ModelProfile): String = if (active(profile)) "enabled" else "disabled"
-
-    /** The top-level effort; `none` is the explicit off state DeepSeek documents. */
-    private fun reasoningEffort(profile: ModelProfile): String = if (!active(profile)) "none"
-    else when (profile.thinkingEffort) {
+    private fun reasoningEffort(profile: ModelProfile): String = when (profile.thinkingEffort) {
         ThinkingEffort.LOW -> "low"
         ThinkingEffort.HIGH -> "high"
         ThinkingEffort.MAX -> "max"
     }
-
-    /**
-     * 0.53 design §T5: an active thinking turn's allowance is raised to [ThinkingOutputBudget.reserve] so the
-     * deliberation cannot consume the whole budget and starve the answer or the tool call.
-     */
-    private fun maxTokens(profile: ModelProfile, cap: Int?): Int =
-        if (active(profile)) maxOf(cap ?: profile.maxOutputTokens, ThinkingOutputBudget.reserve(profile))
-        else cap ?: profile.maxOutputTokens
 
     private fun toolDescriptor(spec: ToolSpec) = buildJsonObject {
         put("type", "function")
@@ -217,15 +199,15 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
-            // when the request declares no cap of its own (every pre-0.3 caller). 0.53 §T5: an active thinking turn
-            // raises it to the output floor, because thinking is charged against this same allowance.
-            put("max_tokens", maxTokens(profile, budgeted.request.maxOutputTokens))
-            // 0.52 design §5.7 + 0.53 §T3: the same gated mapping as the legacy overload, including the active-tool
-            // turn; the live path must not drift. A non-DeepSeek profile keeps the pre-0.5.2 body: neither native
-            // field is sent.
-            if (profile.thinkingSupported) {
-                put("thinking", buildJsonObject { put("type", thinkingType(profile)) })
+            // 0.3 design §5.2: with the switch off the turn policy's cap wins, and the profile's value is only the
+            // window reservation used when the request declares no cap of its own. 0.53 (revised) §T5: with the
+            // switch on no `max_tokens` is sent at all, so the provider's official 64K/128K default applies.
+            if (!profile.thinkingEnabled) {
+                put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            }
+            // The same mapping as the legacy overload — the live path must not drift — and no family/capability gate.
+            if (profile.thinkingEnabled) {
+                put("thinking", buildJsonObject { put("type", "enabled") })
                 put("reasoning_effort", reasoningEffort(profile))
             }
             if (budgeted.request.tools.isNotEmpty()) {
@@ -242,7 +224,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                     put("content", budgeted.request.instructions)
                 })
                 // History, including the tool round-trip the stateless endpoint needs echoed back.
-                historyToMessages(budgeted.request.history, profile).forEach { add(it) }
+                historyToMessages(budgeted.request.history, budgeted.request.tools.isNotEmpty()).forEach { add(it) }
                 // Current turn: text + optional image + optional audio. An empty input is a history-only continuation
                 // (the request that follows a tool round): the tool output stays last and no empty user message is
                 // appended after it.
@@ -277,12 +259,14 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
      * and D9 warns against, so a batch renders as `assistant(tool_calls)` → all `tool` replies → the image messages.
      * A one-output tool round (the common case) is therefore exactly `tool` → user image.
      *
-     * 0.53 design §T2/§T4: a thinking-capable profile replays each assistant item's `reasoning` as
-     * `reasoning_content` on the very message that carries its text and calls. DeepSeek requires every past assistant
-     * turn's reasoning when the request carries `tools`; because the field rides the assistant message, a message the
-     * caller dropped takes its reasoning with it. A non-DeepSeek profile never writes the field (design §G3).
+     * 0.53 design (revised) §T4: when the request carries `tools`, each assistant item's captured `reasoning` is
+     * replayed as `reasoning_content` on the very message that carries its text and calls. DeepSeek requires every past
+     * assistant turn's reasoning in a tool-bearing request, and the capture is not gated on a capability guess — a turn
+     * whose switch was off may still have been given reasoning by the server. Without `tools` the field is omitted (the
+     * provider ignores it, and the history with no returned reasoning stays byte-identical to 0.5.2). Because the field
+     * rides the assistant message, a message the caller dropped takes its reasoning with it.
      */
-    private fun historyToMessages(history: List<ModelHistoryItem>, profile: ModelProfile): JsonArray {
+    private fun historyToMessages(history: List<ModelHistoryItem>, replayReasoning: Boolean): JsonArray {
         val messages = mutableListOf<JsonObject>()
         // User messages carrying a finished tool run's images; emitted once that run of replies is complete.
         val pendingImages = mutableListOf<JsonObject>()
@@ -299,7 +283,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
         }
 
         fun reasoningContent(): JsonElement? =
-            if (profile.thinkingSupported) assistantReasoning?.let { JsonPrimitive(it) } else null
+            if (replayReasoning) assistantReasoning?.let { JsonPrimitive(it) } else null
 
         fun flushCalls() {
             if (calls.isEmpty()) return

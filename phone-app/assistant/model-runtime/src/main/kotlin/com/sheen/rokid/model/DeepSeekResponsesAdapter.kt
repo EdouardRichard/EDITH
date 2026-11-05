@@ -39,15 +39,11 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("model", profile.model)
             put("instructions", frame.systemText)
             put("stream", true)
-            // 0.53 design §T5: an active thinking turn raises the allowance to the output floor; the profile's own
-            // value is the disabled reservation.
-            put("max_output_tokens", maxTokens(profile, null))
-            // 0.52 design §5.7 + R21: state reasoning explicitly when the model is DeepSeek-family — it defaults
-            // thinking on, so an absent field is not the same request. A non-DeepSeek OpenAI-compatible gateway may
-            // reject the native field, so a text-only request to one keeps the pre-0.5.2 body. A tool request keeps
-            // the explicit `none` on every protocol (measured: otherwise the deliberation is charged against the
-            // output budget and the tool call never arrives).
-            if (tools.isNotEmpty() || profile.thinkingSupported) {
+            // 0.53 design (revised) §T3/§T5: the user switch is the only behaviour switch. With it on, the official
+            // `reasoning.effort` goes out on every request (tools included) and `max_output_tokens` is **omitted** so
+            // the provider's documented 64K/128K default applies. With it off, no thinking field at all is sent.
+            if (!profile.thinkingEnabled) put("max_output_tokens", profile.maxOutputTokens)
+            if (profile.thinkingEnabled) {
                 put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
@@ -124,14 +120,14 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("model", profile.model)
             put("instructions", budgeted.request.instructions)
             put("stream", true)
-            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
-            // when the request declares no cap of its own (every pre-0.3 caller). 0.53 §T5: an active thinking turn
-            // raises it to the output floor, because thinking shares this allowance.
-            put("max_output_tokens", maxTokens(profile, budgeted.request.maxOutputTokens))
-            // 0.52 design §5.7 + R21: both overloads write the same gated mapping — the explicit `none` for a
-            // supported text-only request, the pre-0.5.2 omission for an unsupported text-only one, and `none` for
-            // every tool request (see the legacy overload).
-            if (tools.isNotEmpty() || profile.thinkingSupported) {
+            // 0.3 design §5.2: with the switch off the turn policy's cap wins, and the profile's value is only the
+            // window reservation used when the request declares no cap of its own. 0.53 (revised) §T5: with the
+            // switch on no `max_output_tokens` is sent at all, so the official 64K/128K default applies.
+            if (!profile.thinkingEnabled) {
+                put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            }
+            // Both overloads write the same mapping — no family/capability gate.
+            if (profile.thinkingEnabled) {
                 put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
             }
             if (tools.isNotEmpty()) {
@@ -142,7 +138,8 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }
             put("input", buildJsonArray {
-                budgeted.request.history.forEach { item -> historyItems(item, profile).forEach { add(it) } }
+                val replayReasoning = budgeted.request.tools.isNotEmpty()
+                budgeted.request.history.forEach { item -> historyItems(item, replayReasoning).forEach { add(it) } }
                 // The current turn. Text alone keeps the proven plain-string message shape; any image makes the whole
                 // turn one user message whose content is the content-item array (text and images in caller order).
                 val input = budgeted.request.input
@@ -168,16 +165,17 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     }
 
     /**
-     * 0.53 design §T2/§T4: one history item becomes one or two wire items.
+     * 0.53 design (revised) §T4: one history item becomes one or two wire items.
      *
-     * A thinking-capable profile replays an assistant item's `reasoning` as a `reasoning` input item **immediately
-     * before** the assistant message it belongs to. The reasoning ride on the item, so a dropped message takes its
-     * reasoning with it, and a non-DeepSeek profile emits nothing extra (design §G3). The item's inner shape is kept
-     * in the one [reasoningItem] helper so a gateway-probe correction changes a single place.
+     * When the request carries `tools`, an assistant item's captured `reasoning` is replayed as a `reasoning` input
+     * item **immediately before** the assistant message it belongs to; without tools it is not replayed. The capture is
+     * not gated on a capability guess (owner ruling A) — a turn whose switch was off may still have been given reasoning
+     * by the server, and the next tool request must carry it. The item's inner shape is kept in the one [reasoningItem]
+     * helper so a gateway-probe correction changes a single place.
      */
-    private fun historyItems(item: ModelHistoryItem, profile: ModelProfile): List<JsonElement> = when (item) {
+    private fun historyItems(item: ModelHistoryItem, replayReasoning: Boolean): List<JsonElement> = when (item) {
         is ModelHistoryItem.Text -> buildList {
-            if (item.role == MessageRole.ASSISTANT && profile.thinkingSupported) {
+            if (replayReasoning && item.role == MessageRole.ASSISTANT) {
                 item.reasoning?.let { add(reasoningItem(it)) }
             }
             add(message(item.role.name.lowercase(Locale.ROOT), item.text))
@@ -250,29 +248,14 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             ?: throw ContractError.CapabilityMissing("image ref unresolvable: $artifactId")
 
     /**
-     * 0.52 design §5.7 + 0.53 §T3: the Responses `reasoning.effort` wire value.
-     *
-     * An active thinking profile sends its chosen level, tool request or not — the pre-0.53 forced `none` on tool
-     * turns was a safety net for the missing reasoning history, which the 0.53 replay supplies. When thinking is off
-     * the field is stated as `none` rather than omitted because DeepSeek defaults thinking on; only a non-DeepSeek
-     * text-only request omits it entirely (its caller's gate). Only called when the model is DeepSeek-family (R21) or
-     * the request is a tool request.
+     * 0.53 design (revised) §T5: the official effort names for the three catalog levels. Only called when the user
+     * switch is on; the switched-off request carries no reasoning field at all.
      */
-    private fun reasoningEffort(profile: ModelProfile): String =
-        if (!ThinkingOutputBudget.active(profile)) "none"
-        else when (profile.thinkingEffort) {
-            ThinkingEffort.LOW -> "low"
-            ThinkingEffort.HIGH -> "high"
-            ThinkingEffort.MAX -> "max"
-        }
-
-    /**
-     * 0.53 design §T5: an active thinking turn's allowance is raised to [ThinkingOutputBudget.reserve] so the
-     * deliberation cannot consume the whole budget and starve the answer or the tool call.
-     */
-    private fun maxTokens(profile: ModelProfile, cap: Int?): Int =
-        if (ThinkingOutputBudget.active(profile)) maxOf(cap ?: profile.maxOutputTokens, ThinkingOutputBudget.reserve(profile))
-        else cap ?: profile.maxOutputTokens
+    private fun reasoningEffort(profile: ModelProfile): String = when (profile.thinkingEffort) {
+        ThinkingEffort.LOW -> "low"
+        ThinkingEffort.HIGH -> "high"
+        ThinkingEffort.MAX -> "max"
+    }
 
     /**
      * The flattened descriptor proven against the endpoint: `{type, name, description, parameters}` at the top level.

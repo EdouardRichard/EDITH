@@ -52,6 +52,7 @@ class ModelListClientTest {
                   "effort": {"supported_levels": ["low", "high"], "default_level": "low"}
                 },
                 {"id": "vendor-reasoner", "effort": {"supported_levels": ["high"]}},
+                {"id": "deepseek-no-metadata", "owned_by": "deepseek"},
                 {"id": "plain", "object": "model"}
               ]
             }
@@ -59,7 +60,7 @@ class ModelListClientTest {
 
         val success = client().fetch(baseUrl(), secret).success()
 
-        assertEquals(3, success.models.size)
+        assertEquals(4, success.models.size)
         assertFalse(success.truncated)
         with(success.models[0]) {
             assertEquals("deepseek-chat", id)
@@ -68,10 +69,10 @@ class ModelListClientTest {
             assertEquals(8192, maxOutputTokens)
             assertEquals(setOf(InputModality.TEXT, InputModality.IMAGE), inputs)
             assertEquals("deepseek", ownedBy)
-            assertTrue(thinkingSupported)
+            assertTrue(thinkingSupported, "the gateway's own reasoning-effort metadata marks support")
         }
         with(success.models[1]) {
-            // The id does not mention DeepSeek; the effort metadata alone must mark it as thinking-capable.
+            // The id does not mention DeepSeek; the effort metadata alone marks it as thinking-capable.
             assertEquals("vendor-reasoner", id)
             assertNull(displayName)
             assertNull(contextWindowTokens)
@@ -81,6 +82,12 @@ class ModelListClientTest {
             assertTrue(thinkingSupported)
         }
         with(success.models[2]) {
+            // Owner ruling A: no family guess. A DeepSeek-looking id/owner without gateway-declared reasoning metadata
+            // is NOT marked thinking-capable; the user's switch decides the request, not this field.
+            assertEquals("deepseek-no-metadata", id)
+            assertFalse(thinkingSupported, "the id/owner alone must not infer thinking support")
+        }
+        with(success.models[3]) {
             assertEquals("plain", id)
             assertNull(displayName)
             assertNull(contextWindowTokens)

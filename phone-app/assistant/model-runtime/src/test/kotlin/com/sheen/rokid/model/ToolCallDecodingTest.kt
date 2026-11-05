@@ -222,10 +222,12 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","sta
         assertNull(ends(events).single().safeCode)
     }
 
-    @Test fun `tool request encodes the proven flattened descriptor and disables thinking`() {
+    @Test fun `tool request encodes the proven flattened descriptor and sends no thinking field`() {
+        // 0.53 revised §T3: with the user switch off there is no DeepSeek-specific field at all, tools included; the
+        // pre-0.5.3 generic body (and its output cap) is what goes out.
         val request = requestFixture().copy(tools = toolSpecs())
         val body = encodedBody(request)
-        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "tools", "tool_choice", "reasoning", "input"), body.keys)
+        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "tools", "tool_choice", "input"), body.keys)
         val tool = body.getValue("tools").jsonArray.single().jsonObject
         assertEquals(
             setOf("type", "name", "description", "parameters"),
@@ -241,7 +243,7 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","sta
             "the descriptor's parameters document is passed through unchanged, exactly as the probe built it",
         )
         assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content)
-        assertEquals("none", body.getValue("reasoning").jsonObject.getValue("effort").jsonPrimitive.content)
+        assertTrue("reasoning" !in body, "the switch is off: no reasoning field may be sent")
     }
 
     @Test fun `text only request keeps P2 key set without tool keys`() {

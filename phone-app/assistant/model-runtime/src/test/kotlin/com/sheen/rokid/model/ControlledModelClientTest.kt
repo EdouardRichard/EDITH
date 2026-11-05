@@ -497,20 +497,22 @@ class ControlledModelClientTest {
         }
     }
 
-    @Test fun `reasoning events surface only for a thinking capable profile`() {
-        // 0.53 §5.4: the client is the capability gate for the stream. A non-DeepSeek profile must stay byte- and
-        // event-identical to 0.5.2, so a stray ReasoningDelta is swallowed while the answer text still flows. The
-        // Chat protocol is used here so the assertion is about this filter, not about a protocol decoder.
-        for (capable in listOf(true, false)) Rig().use { rig ->
+    @Test fun `reasoning events are forwarded for every profile without a capability check`() {
+        // 0.53 design (revised) §5.4: the client no longer guesses a model family. Whatever reasoning the server
+        // streams is forwarded as-is — even when the compatibility capability bit is false — because only the user's
+        // switch decides what is *requested*, never what may be received. Answer text and terminal are unchanged.
+        for (capabilityFlag in listOf(true, false)) Rig().use { rig ->
             rig.profile = rig.repository.save(
-                rig.profile.copy(protocolId = "OPENAI_CHAT_COMPLETIONS", thinkingSupported = capable),
+                rig.profile.copy(protocolId = "OPENAI_CHAT_COMPLETIONS", thinkingSupported = capabilityFlag),
             )
             rig.verify()
             rig.server.enqueue(sse(CHAT_REASONING_BODY))
             rig.start(); rig.awaitTerminal()
-            val reasoning = rig.events.filterIsInstance<ModelStreamEvent.ReasoningDelta>().map { it.text }
-            if (capable) assertEquals(listOf("think"), reasoning, "a capable profile receives the chain of thought")
-            else assertTrue(reasoning.isEmpty(), "a non-DeepSeek profile never sees reasoning")
+            assertEquals(
+                listOf("think"),
+                rig.events.filterIsInstance<ModelStreamEvent.ReasoningDelta>().map { it.text },
+                "capability flag $capabilityFlag: server-returned reasoning is never filtered",
+            )
             assertEquals(listOf("hi"), rig.events.filterIsInstance<ModelStreamEvent.TextDelta>().map { it.text })
             assertEquals(listOf(ModelEnd.COMPLETED), rig.ends())
         }

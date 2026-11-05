@@ -61,8 +61,8 @@ class ThinkingToolRoundE2ETest {
 
     // ------------------------------------------------------------ round-1/round-2 SSE scripts
 
-    private fun chatRoundOne(reasoning: String = "need lookup") = sse(
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"},\"index\":0}]}\n\n" +
+    private fun chatRoundOne(reasoning: String? = "need lookup") = sse(
+        (reasoning?.let { "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$it\"},\"index\":0}]}\n\n" } ?: "") +
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\"," +
             "\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"hangzhou\\\"}\"}}]},\"index\":0}]}\n\n" +
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10," +
@@ -70,18 +70,20 @@ class ThinkingToolRoundE2ETest {
             "data: [DONE]\n\n",
     )
 
-    private fun chatRoundTwo(reasoning: String = "done thinking") = sse(
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"},\"index\":0}]}\n\n" +
+    private fun chatRoundTwo(reasoning: String? = "done thinking") = sse(
+        (reasoning?.let { "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$it\"},\"index\":0}]}\n\n" } ?: "") +
             "data: {\"choices\":[{\"delta\":{\"content\":\"sunny 25C\"},\"index\":0}]}\n\n" +
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20," +
             "\"completion_tokens\":3}}\n\n" +
             "data: [DONE]\n\n",
     )
 
-    private fun responsesRoundOne(reasoning: String = "need lookup") = sse(
+    private fun responsesRoundOne(reasoning: String? = "need lookup") = sse(
         "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n" +
-            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
-            "\"item_id\":\"rs_1\",\"content_index\":0,\"delta\":\"$reasoning\"}\n\n" +
+            (reasoning?.let {
+                "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
+                    "\"item_id\":\"rs_1\",\"content_index\":0,\"delta\":\"$it\"}\n\n"
+            } ?: "") +
             "data: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0," +
             "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"," +
             "\"arguments\":\"\"}}\n\n" +
@@ -94,10 +96,12 @@ class ThinkingToolRoundE2ETest {
             "\"status\":\"completed\",\"output\":[]}}\n\n",
     )
 
-    private fun responsesRoundTwo(reasoning: String = "done thinking") = sse(
+    private fun responsesRoundTwo(reasoning: String? = "done thinking") = sse(
         "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n" +
-            "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
-            "\"item_id\":\"rs_2\",\"content_index\":0,\"delta\":\"$reasoning\"}\n\n" +
+            (reasoning?.let {
+                "data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"response_id\":\"s\"," +
+                    "\"item_id\":\"rs_2\",\"content_index\":0,\"delta\":\"$it\"}\n\n"
+            } ?: "") +
             "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m_2\"," +
             "\"content_index\":0,\"delta\":\"sunny 25C\"}\n\n" +
             "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"s\"," +
@@ -152,7 +156,6 @@ class ThinkingToolRoundE2ETest {
     private inner class Rig(
         private val server: MockWebServer,
         protocolId: String,
-        thinkingSupported: Boolean,
         thinkingEnabled: Boolean,
         model: String,
     ) : AutoCloseable {
@@ -188,7 +191,6 @@ class ThinkingToolRoundE2ETest {
                     verifications = emptyList(),
                     thinkingEnabled = thinkingEnabled,
                     thinkingEffort = ThinkingEffort.LOW,
-                    thinkingSupported = thinkingSupported,
                 ),
             )
             // The repository clears prior evidence on save and only records a verification whose revision matches, so
@@ -268,7 +270,7 @@ class ThinkingToolRoundE2ETest {
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
             server.enqueue(chatRoundOne())
             server.enqueue(chatRoundTwo())
-            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingSupported = true, thinkingEnabled = true, model = "deepseek-flash")
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingEnabled = true, model = "deepseek-flash")
                 .use { rig ->
                     val run = rig.run()
                     assertEquals(AgentOutcome.COMPLETED, run.outcome)
@@ -283,6 +285,9 @@ class ThinkingToolRoundE2ETest {
                     val (first, second) = rig.bodies()
                     assertEquals("enabled", first.getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content)
                     assertEquals("low", first.getValue("reasoning_effort").jsonPrimitive.content)
+                    // Owner ruling B: with thinking on the provider's official default applies, so no cap is sent.
+                    assertFalse("max_tokens" in first, "an active thinking turn must not cap the output: $first")
+                    assertFalse("max_tokens" in second, "every request of the active turn omits the cap: $second")
                     assertEquals("lookup", first.getValue("tools").jsonArray.single().jsonObject
                         .getValue("function").jsonObject.getValue("name").jsonPrimitive.content)
 
@@ -319,7 +324,7 @@ class ThinkingToolRoundE2ETest {
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
             server.enqueue(responsesRoundOne())
             server.enqueue(responsesRoundTwo())
-            Rig(server, "DEEPSEEK_RESPONSES", thinkingSupported = true, thinkingEnabled = true, model = "deepseek-flash")
+            Rig(server, "DEEPSEEK_RESPONSES", thinkingEnabled = true, model = "deepseek-flash")
                 .use { rig ->
                     val run = rig.run()
                     assertEquals(AgentOutcome.COMPLETED, run.outcome)
@@ -329,11 +334,9 @@ class ThinkingToolRoundE2ETest {
 
                     val (first, second) = rig.bodies()
                     assertEquals("low", first.getValue("reasoning").jsonObject.getValue("effort").jsonPrimitive.content)
-                    assertEquals(
-                        ThinkingOutputBudget.reserve(rig.profile),
-                        first.getValue("max_output_tokens").jsonPrimitive.int,
-                        "an active thinking turn sends the raised output allowance",
-                    )
+                    // Owner ruling B: an active thinking turn omits the output cap and the provider's 64K/128K applies.
+                    assertFalse("max_output_tokens" in first, "an active thinking turn must not cap the output: $first")
+                    assertFalse("max_output_tokens" in second, "every request of the active turn omits the cap: $second")
 
                     val input = second.inputItems()
                     val reasoningIndex = input.indexOfFirst { it.typeOf() == "reasoning" }
@@ -355,36 +358,70 @@ class ThinkingToolRoundE2ETest {
         }
     }
 
-    @Test fun `a non deepseek profile never sends thinking fields or replays reasoning`() {
+    @Test fun `a thinking-off chat profile still captures server reasoning and replays it with the next tool request`() {
         MockWebServer().use { server ->
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
-            // The provider even streams a reasoning field: the client's capability filter must swallow it, so the
-            // second request has nothing to replay and the run carries no finalReasoning.
+            // The switch is off, so no thinking field is requested — but DeepSeek defaults thinking on and still
+            // streams reasoning_content. It must be captured and replayed on the tool-bearing continuation, or the
+            // official rule turns round 2 into an HTTP 400.
             server.enqueue(chatRoundOne())
             server.enqueue(chatRoundTwo())
-            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingSupported = false, thinkingEnabled = true, model = "gpt-4o-mini")
+            Rig(server, "OPENAI_CHAT_COMPLETIONS", thinkingEnabled = false, model = "deepseek-flash")
                 .use { rig ->
                     val run = rig.run()
                     assertEquals(AgentOutcome.COMPLETED, run.outcome)
-                    assertNull(run.finalReasoning, "a non-DeepSeek profile never receives reasoning")
+                    assertEquals("sunny 25C", run.finalText)
+                    assertEquals("done thinking", run.finalReasoning, "server-returned reasoning is captured even with the switch off")
                     assertEquals(2, server.requestCount)
-                    assertTrue(
-                        rig.lines.any { it.startsWith("P3_THINKING active=false") },
-                        "the line still states the off configuration: ${rig.lines.filter { it.startsWith("P3_THINKING") }}",
-                    )
 
                     val (first, second) = rig.bodies()
-                    assertFalse("thinking" in first)
-                    assertFalse("reasoning_effort" in first)
-                    assertTrue(first.getValue("tools").jsonArray.size == 1, "the tool table still goes out")
-                    assertTrue(
-                        second.messages().none { "reasoning_content" in it },
-                        "no reasoning_content reaches a non-DeepSeek endpoint: ${second.messages()}",
+                    for ((path, body) in listOf("first" to first, "second" to second)) {
+                        assertFalse("thinking" in body, "$path must not send a thinking field with the switch off")
+                        assertFalse("reasoning_effort" in body, "$path must not send reasoning_effort with the switch off")
+                    }
+                    val assistant = second.messages().single {
+                        it.roleOf() == "assistant" && "tool_calls" in it
+                    }
+                    assertEquals(
+                        "need lookup",
+                        assistant.getValue("reasoning_content").jsonPrimitive.content,
+                        "the captured reasoning is replayed beside the assistant message that carried the call",
                     )
-                    assertTrue(
-                        run.transcript.none { it is com.sheen.rokid.plugin.ModelHistoryItem.Text && it.reasoning != null },
-                        "the loop never stored reasoning for an incapable profile",
+                    assertEquals(
+                        listOf("need lookup"),
+                        run.transcript.filterIsInstance<com.sheen.rokid.plugin.ModelHistoryItem.Text>()
+                            .mapNotNull { it.reasoning },
+                        "the loop stored the first turn's server-returned reasoning with its assistant turn",
                     )
+                }
+        }
+    }
+
+    @Test fun `a thinking-off responses profile sends no thinking field and no reasoning item in either round`() {
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            // Nothing in this exchange is a thinking request or a thinking reply, so both bodies must be the plain
+            // pre-0.5.3 shape — the non-DeepSeek regression control.
+            server.enqueue(responsesRoundOne(reasoning = null))
+            server.enqueue(responsesRoundTwo(reasoning = null))
+            Rig(server, "DEEPSEEK_RESPONSES", thinkingEnabled = false, model = "gpt-4o-mini")
+                .use { rig ->
+                    val run = rig.run()
+                    assertEquals(AgentOutcome.COMPLETED, run.outcome)
+                    assertEquals("sunny 25C", run.finalText)
+                    assertNull(run.finalReasoning, "the server returned no reasoning and none was invented")
+                    assertEquals(2, server.requestCount)
+
+                    val (first, second) = rig.bodies()
+                    for ((path, body) in listOf("first" to first, "second" to second)) {
+                        assertFalse("reasoning" in body, "$path must send no reasoning field with the switch off: $body")
+                        assertEquals(6_000, body.getValue("max_output_tokens").jsonPrimitive.int, "$path keeps the generic cap")
+                    }
+                    assertTrue(
+                        second.inputItems().none { it.typeOf() == "reasoning" },
+                        "no reasoning item may appear when nothing was captured: ${second.inputItems()}",
+                    )
+                    assertTrue(first.inputItems().none { it.typeOf() == "reasoning" }, "round one carries no reasoning item")
                 }
         }
     }

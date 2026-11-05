@@ -11,23 +11,22 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * 0.52 design §5.7 / 0.53 design §5.2: the profile's thinking choice is mapped onto each protocol's wire fields by the
- * adapters themselves — no shared config object and no new public type.
+ * 0.53 design (revised) §5.2: Chat Completions' thinking switch and official output budget.
+ *
+ * The owner ruling is that the **user switch is the only behaviour switch** — the system does not guess a model family.
+ * `thinkingEnabled=true` sends the DeepSeek fields (`thinking.type=enabled` + the chosen `reasoning_effort`) on every
+ * request, tools included, and **omits `max_tokens`** so the provider's official default (64K for LOW/HIGH, 128K for
+ * MAX) applies. `thinkingEnabled=false` sends **no** thinking field at all — the general OpenAI body, which is exactly
+ * the pre-0.5.2 shape — and keeps the existing cap.
+ *
+ * History reasoning is replayed as `reasoning_content` **only when the request carries tools**; it is not gated on any
+ * capability bit. That is what lets a turn whose switch was off still round-trip reasoning the server returned anyway
+ * (DeepSeek defaults thinking on), avoiding the next turn's HTTP 400.
  *
  * Both encoders have a legacy frame overload and a budgeted live overload, and the live path has already diverged from
- * the legacy one once (the Chat budgeted overload silently dropped the system slot and the tool table). Every mapping
- * test therefore asserts both overloads.
- *
- * 0.53 §T3 changed the tool rule: a **tool request no longer forces thinking off** when the profile has thinking active;
- * the switch and the chosen effort are sent with tools too. When thinking is off it is still stated explicitly
- * (`disabled`/`none`) because DeepSeek defaults thinking on — an absent field is not the same request. A profile whose
- * model is not thinking-capable keeps the pre-0.5.2 body: no DeepSeek-native field at all.
- *
- * 0.53 §T5: thinking is charged against the output budget, so an active request's output allowance is raised to
- * [ThinkingOutputBudget.reserve]; the budgeted overload's own cap is a lower bound, not the wire value.
+ * the legacy one once, so every mapping test asserts both overloads.
  */
 class ThinkingRequestTest {
-    private val responses = DeepSeekResponsesAdapter()
     private val chat = OpenAiChatCompletionsAdapter(object : MediaSource {
         override fun resolveAudio(ref: String): ResolvedAudio? = null
     })
@@ -46,40 +45,24 @@ class ThinkingRequestTest {
         ThinkingEffort.MAX to "max",
     )
 
-    private fun responsesProfile(enabled: Boolean = false, effort: ThinkingEffort = ThinkingEffort.LOW) =
-        profileFixture().copy(thinkingEnabled = enabled, thinkingEffort = effort, thinkingSupported = true)
-
-    private fun chatProfile(enabled: Boolean = false, effort: ThinkingEffort = ThinkingEffort.LOW) =
-        profileFixture().copy(
-            protocolId = "OPENAI_CHAT_COMPLETIONS",
-            thinkingEnabled = enabled,
-            thinkingEffort = effort,
-            thinkingSupported = true,
-        )
-
     /**
-     * A Chat profile with room for the thinking output floor. `profileFixture()` only reserves 4 096 tokens, so its
-     * low/high floor is capped back down to its 256-token allowance and the floor rule is unobservable.
+     * A profile with a realistic window: the official output default (64K/128K) is reserved by the send-time
+     * `ContextBudgeter`, so a 4 096-token fixture would refuse every thinking request instead of exercising the body.
      */
-    private fun roomyChatProfile(
-        enabled: Boolean = true,
-        effort: ThinkingEffort = ThinkingEffort.HIGH,
-    ) = chatProfile(enabled = enabled, effort = effort).copy(
+    private fun profile(
+        enabled: Boolean = false,
+        effort: ThinkingEffort = ThinkingEffort.LOW,
+        thinkingSupported: Boolean = false,
+    ) = profileFixture().copy(
         usableWindowTokens = 200_000,
         inputBudgetTokens = 100_000,
-        maxOutputTokens = 1_024,
+        maxOutputTokens = 6_000,
         safetyTokens = 1_000,
+        protocolId = "OPENAI_CHAT_COMPLETIONS",
+        thinkingEnabled = enabled,
+        thinkingEffort = effort,
+        thinkingSupported = thinkingSupported,
     )
-
-    /**
-     * A non-DeepSeek family model. Thinking is even switched on to prove the gate wins: the native fields are never
-     * sent based on the profile's own choice, only on the model's capability bit (R21).
-     */
-    private fun nonDeepSeekResponsesProfile() = responsesProfile(enabled = true, effort = ThinkingEffort.MAX)
-        .copy(thinkingSupported = false)
-
-    private fun nonDeepSeekChatProfile() = chatProfile(enabled = true, effort = ThinkingEffort.MAX)
-        .copy(thinkingSupported = false)
 
     private fun frame(tools: List<ToolSpec>) = RequestFrame(
         listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "synthetic instructions")),
@@ -89,269 +72,102 @@ class ThinkingRequestTest {
 
     private fun json(bytes: ByteArray) = Json.parseToJsonElement(String(bytes, Charsets.UTF_8)).jsonObject
 
-    /** Both Responses encoding paths: the legacy frame overload and the budgeted live overload. */
-    private fun responsesBodies(profile: ModelProfile, tools: List<ToolSpec> = emptyList()): Map<String, JsonObject> =
-        mapOf(
-            "frame" to json(responses.encode(profile, frame(tools))),
-            "budgeted" to json(
-                responses.encode(
-                    profile,
-                    ContextBudgeter().prepare(profile, requestFixture().copy(tools = tools)),
-                ),
-            ),
-        )
-
     /** Both Chat encoding paths: the legacy frame overload and the budgeted live overload. */
-    private fun chatBodies(profile: ModelProfile, tools: List<ToolSpec> = emptyList()): Map<String, JsonObject> =
+    private fun bodies(profile: ModelProfile, tools: List<ToolSpec> = emptyList(), cap: Int? = null): Map<String, JsonObject> =
         mapOf(
             "frame" to json(chat.encode(profile, frame(tools))),
             "budgeted" to json(
-                chat.encode(
-                    profile,
-                    ContextBudgeter().prepare(profile, requestFixture().copy(tools = tools)),
-                ),
+                chat.encode(profile, ContextBudgeter().prepare(profile, requestFixture().copy(tools = tools, maxOutputTokens = cap))),
             ),
         )
-
-    private fun JsonObject.reasoningEffort() =
-        getValue("reasoning").jsonObject.getValue("effort").jsonPrimitive.content
 
     private fun JsonObject.thinkingType() =
         getValue("thinking").jsonObject.getValue("type").jsonPrimitive.content
 
-    @Test fun `responses text only disables thinking by default`() {
-        for ((path, body) in responsesBodies(responsesProfile())) {
-            assertEquals(
-                setOf("model", "instructions", "stream", "max_output_tokens", "reasoning", "input"),
-                body.keys,
-                "$path must state the defaulted-off reasoning explicitly: DeepSeek defaults thinking on",
-            )
-            assertEquals(setOf("effort"), body.getValue("reasoning").jsonObject.keys, path)
-            assertEquals("none", body.reasoningEffort(), path)
-        }
-    }
-
-    @Test fun `responses text only enabled sends low high and max`() {
+    @Test fun `thinking on sends the deepseek switch and omits the output cap on every request`() {
         for ((effort, wire) in efforts) {
-            for ((path, body) in responsesBodies(responsesProfile(enabled = true, effort = effort))) {
-                assertEquals(wire, body.reasoningEffort(), "$path/$effort")
+            for (withTools in listOf(false, true)) {
+                for ((path, body) in bodies(profile(enabled = true, effort = effort), if (withTools) tools else emptyList())) {
+                    assertEquals("enabled", body.thinkingType(), "$path/$effort/tools=$withTools")
+                    assertEquals(wire, body.getValue("reasoning_effort").jsonPrimitive.content, "$path/$effort/tools=$withTools")
+                    assertFalse("max_tokens" in body, "$path/$effort/tools=$withTools must let the provider use its 64K/128K default")
+                }
             }
         }
     }
 
-    @Test fun `responses tool requests still state effort none when thinking is disabled`() {
-        for ((path, body) in responsesBodies(responsesProfile(enabled = false), tools)) {
-            assertEquals("none", body.reasoningEffort(), path)
-        }
-    }
-
-    @Test fun `chat text only disables thinking by default`() {
-        for ((path, body) in chatBodies(chatProfile())) {
-            assertEquals("disabled", body.thinkingType(), path)
-            assertEquals("none", body.getValue("reasoning_effort").jsonPrimitive.content, path)
-            assertEquals(setOf("type"), body.getValue("thinking").jsonObject.keys, path)
-            assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
-            assertFalse("reasoning" in body, "$path must not send a Responses-style reasoning budget")
-        }
-    }
-
-    @Test fun `chat text only enabled sends enabled and the chosen effort`() {
-        for ((effort, wire) in efforts) {
-            for ((path, body) in chatBodies(chatProfile(enabled = true, effort = effort))) {
-                assertEquals("enabled", body.thinkingType(), "$path/$effort")
-                assertEquals(wire, body.getValue("reasoning_effort").jsonPrimitive.content, "$path/$effort")
-            }
-        }
-    }
-
-    @Test fun `chat tool requests keep thinking enabled and the chosen effort`() {
-        // 0.53 §T3: the DeepSeek tool turn is no longer forced off; the reasoning history is replayed instead.
-        for ((effort, wire) in efforts) {
-            for ((path, body) in chatBodies(chatProfile(enabled = true, effort = effort), tools)) {
-                assertEquals("enabled", body.thinkingType(), "$path/$effort")
-                assertEquals(wire, body.getValue("reasoning_effort").jsonPrimitive.content, "$path/$effort")
+    @Test fun `thinking off sends no deepseek field and keeps the existing cap`() {
+        for (withTools in listOf(false, true)) {
+            val chosen = if (withTools) tools else emptyList()
+            for ((path, body) in bodies(profile(enabled = false), chosen, cap = 512)) {
                 assertEquals(
-                    "record_note",
-                    body.getValue("tools").jsonArray.single().jsonObject.getValue("function").jsonObject
-                        .getValue("name").jsonPrimitive.content,
-                    "$path/$effort",
+                    setOf("model", "stream", "stream_options", "modalities", "max_tokens") +
+                        (if (withTools) setOf("tools", "tool_choice") else emptySet()) + "messages",
+                    body.keys,
+                    "$path/tools=$withTools must keep the pre-0.5.3 generic body",
                 )
-                assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content, "$path/$effort")
-            }
-        }
-    }
-
-    @Test fun `chat tool requests still state disabled and none when thinking is disabled`() {
-        for ((path, body) in chatBodies(chatProfile(enabled = false), tools)) {
-            assertEquals("disabled", body.thinkingType(), path)
-            assertEquals("none", body.getValue("reasoning_effort").jsonPrimitive.content, path)
-        }
-    }
-
-    @Test fun `responses text only omits reasoning for a non deepseek model`() {
-        for ((path, body) in responsesBodies(nonDeepSeekResponsesProfile())) {
-            assertEquals(
-                setOf("model", "instructions", "stream", "max_output_tokens", "input"),
-                body.keys,
-                "$path must restore the pre-0.5.2 text-only shape for a non-DeepSeek model",
-            )
-            assertFalse("reasoning" in body, "$path must not send a DeepSeek-native reasoning field")
-        }
-    }
-
-    @Test fun `responses tool requests keep explicit effort none for a non deepseek model`() {
-        // The measured tool turn needs `none` on every protocol, so the tool path keeps the field even when the
-        // model is not DeepSeek: the ruling gates only the text-only shape.
-        for ((path, body) in responsesBodies(nonDeepSeekResponsesProfile(), tools)) {
-            assertEquals("none", body.reasoningEffort(), path)
-        }
-    }
-
-    @Test fun `chat text only omits the native thinking fields for a non deepseek model`() {
-        for ((path, body) in chatBodies(nonDeepSeekChatProfile())) {
-            assertEquals(
-                setOf("model", "stream", "stream_options", "modalities", "max_tokens", "messages"),
-                body.keys,
-                "$path must restore the pre-0.5.2 text-only shape for a non-DeepSeek model",
-            )
-            assertFalse("thinking" in body, "$path must omit thinking")
-            assertFalse("reasoning_effort" in body, "$path must omit reasoning_effort")
-            assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
-        }
-    }
-
-    @Test fun `chat tool requests omit the native thinking fields for a non deepseek model`() {
-        for ((path, body) in chatBodies(nonDeepSeekChatProfile(), tools)) {
-            assertEquals(
-                setOf("model", "stream", "stream_options", "modalities", "max_tokens", "tools", "tool_choice", "messages"),
-                body.keys,
-                "$path must keep the tool table while omitting the DeepSeek-native fields",
-            )
-            assertFalse("thinking" in body, "$path must omit thinking")
-            assertFalse("reasoning_effort" in body, "$path must omit reasoning_effort")
-            assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
-        }
-    }
-
-    @Test fun `the live chat request keeps instructions and the tool table`() {
-        val request = requestFixture().copy(
-            history = listOf(
-                ModelHistoryItem.Text(MessageRole.USER, "old question"),
-                ModelHistoryItem.Text(MessageRole.ASSISTANT, "old answer"),
-            ),
-            tools = tools,
-        )
-        val profile = chatProfile()
-        val body = json(chat.encode(profile, ContextBudgeter().prepare(profile, request)))
-
-        val messages = body.getValue("messages").jsonArray.map { it.jsonObject }
-        assertEquals(
-            listOf("system", "user", "assistant", "user"),
-            messages.map { it.getValue("role").jsonPrimitive.content },
-            "message order stays system -> history -> current turn",
-        )
-        assertEquals("synthetic instructions", messages[0].getValue("content").jsonPrimitive.content)
-        assertEquals("old question", messages[1].getValue("content").jsonPrimitive.content)
-        assertEquals("old answer", messages[2].getValue("content").jsonPrimitive.content)
-        assertEquals("synthetic question", messages[3].getValue("content").jsonArray.single().jsonObject
-            .getValue("text").jsonPrimitive.content)
-        assertEquals(
-            "record_note",
-            body.getValue("tools").jsonArray.single().jsonObject
-                .getValue("function").jsonObject.getValue("name").jsonPrimitive.content,
-            "the live Chat request must carry the tool table, like the legacy overload",
-        )
-        assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content)
-    }
-
-    // ------------------------------------------------------------ 0.53 §T5 output floor
-
-    @Test fun `an active thinking chat request raises the output allowance to the floor`() {
-        for ((effort, floor) in listOf(
-            ThinkingEffort.LOW to 32_768,
-            ThinkingEffort.HIGH to 32_768,
-            ThinkingEffort.MAX to 65_536,
-        )) {
-            val chat = roomyChatProfile(effort = effort)
-            assertEquals(maxOf(chat.maxOutputTokens, floor), ThinkingOutputBudget.reserve(chat), "$effort")
-            for ((path, body) in chatBodies(chat)) {
+                // The frame overload carries no turn cap, so the profile's allowance is the value; the live overload
+                // keeps the turn's own 512.
                 assertEquals(
-                    ThinkingOutputBudget.reserve(chat),
+                    if (path == "frame") 6_000 else 512,
                     body.getValue("max_tokens").jsonPrimitive.int,
-                    "chat/$path/$effort",
+                    "$path must keep the existing cap",
                 )
+                assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
             }
         }
     }
 
-    @Test fun `a small chat request cap is raised to the thinking output floor and left alone when thinking is off`() {
-        val active = roomyChatProfile()
-        val capped = requestFixture().copy(maxOutputTokens = 512, tools = tools)
-        assertEquals(32_768, ThinkingOutputBudget.reserve(active))
-        assertEquals(
-            32_768,
-            json(chat.encode(active, ContextBudgeter().prepare(active, capped))).getValue("max_tokens").jsonPrimitive.int,
+    @Test fun `history reasoning is replayed as reasoning_content only when the request carries tools`() {
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "old question"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "先说", reasoning = "想"),
+            ModelHistoryItem.ToolCall("call_1", "record_note", "{}"),
+            ModelHistoryItem.ToolOutput("call_1", "noted"),
         )
-
-        val off = roomyChatProfile(enabled = false)
-        assertEquals(off.maxOutputTokens, ThinkingOutputBudget.reserve(off))
-        assertEquals(
-            512,
-            json(chat.encode(off, ContextBudgeter().prepare(off, capped))).getValue("max_tokens").jsonPrimitive.int,
-            "a disabled profile keeps the turn's own cap",
-        )
-    }
-
-    // ------------------------------------------------------------ 0.53 §T4 reasoning replay (Chat)
-
-    @Test fun `a chat history replays assistant reasoning on the very assistant message that carried the calls`() {
-        val profile = chatProfile()
-        val request = requestFixture().copy(
-            history = listOf(
-                ModelHistoryItem.Text(MessageRole.USER, "old question"),
-                ModelHistoryItem.Text(MessageRole.ASSISTANT, "先说", reasoning = "想"),
-                ModelHistoryItem.ToolCall("call_1", "record_note", "{}"),
-                ModelHistoryItem.ToolOutput("call_1", "noted"),
-            ),
-        )
-        val messages = json(chat.encode(profile, ContextBudgeter().prepare(profile, request)))
+        val profile = profile(enabled = false)
+        val withTools = json(chat.encode(profile, ContextBudgeter().prepare(profile, requestFixture().copy(history = history, tools = tools))))
             .getValue("messages").jsonArray.map { it.jsonObject }
-
-        val assistant = messages[2]
-        assertEquals("assistant", assistant.getValue("role").jsonPrimitive.content)
-        assertEquals("先说", assistant.getValue("content").jsonPrimitive.content)
+        val assistant = withTools.single { it["role"]?.jsonPrimitive?.content == "assistant" && "tool_calls" in it }
         assertEquals("想", assistant.getValue("reasoning_content").jsonPrimitive.content)
+        assertEquals("call_1", assistant.getValue("tool_calls").jsonArray.single().jsonObject
+            .getValue("id").jsonPrimitive.content)
+
+        val withoutTools = json(chat.encode(profile, ContextBudgeter().prepare(profile, requestFixture().copy(history = history))))
+            .getValue("messages").jsonArray.map { it.jsonObject }
+        assertTrue(withoutTools.none { "reasoning_content" in it }, "without tools the reasoning stays local: $withoutTools")
+    }
+
+    @Test fun `reasoning replay does not look at the compatibility capability bit`() {
+        // The switch is off and the compatibility `thinkingSupported` flag is false, yet the server may still have
+        // returned reasoning (DeepSeek defaults thinking on). A tool-bearing request must replay it regardless.
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "old question"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "先说", reasoning = "想"),
+        )
+        val profile = profile(enabled = false, thinkingSupported = false)
+        val messages = json(chat.encode(profile, ContextBudgeter().prepare(profile, requestFixture().copy(history = history, tools = tools))))
+            .getValue("messages").jsonArray.map { it.jsonObject }
         assertEquals(
-            "call_1",
-            assistant.getValue("tool_calls").jsonArray.single().jsonObject.getValue("id").jsonPrimitive.content,
-            "the reasoning rides on the message that merges the assistant text and its calls",
+            "想",
+            messages.single { it["role"]?.jsonPrimitive?.content == "assistant" }
+                .getValue("reasoning_content").jsonPrimitive.content,
         )
     }
 
-    @Test fun `a chat history omits reasoning for a non deepseek model`() {
-        val profile = chatProfile().copy(thinkingSupported = false)
-        val request = requestFixture().copy(
-            history = listOf(
-                ModelHistoryItem.Text(MessageRole.USER, "old question"),
-                ModelHistoryItem.Text(MessageRole.ASSISTANT, "old answer", reasoning = "想"),
-            ),
-        )
-        val messages = json(chat.encode(profile, ContextBudgeter().prepare(profile, request)))
-            .getValue("messages").jsonArray.map { it.jsonObject }
-        assertFalse("reasoning_content" in messages[2], "a non-DeepSeek endpoint never receives reasoning_content")
-    }
-
-    @Test fun `a plain assistant text keeps its own reasoning when another assistant text follows`() {
-        val profile = chatProfile()
-        val request = requestFixture().copy(
-            history = listOf(
-                ModelHistoryItem.Text(MessageRole.USER, "old question"),
-                ModelHistoryItem.Text(MessageRole.ASSISTANT, "first answer", reasoning = "first thought"),
-            ),
-        )
-        val messages = json(chat.encode(profile, ContextBudgeter().prepare(profile, request)))
-            .getValue("messages").jsonArray.map { it.jsonObject }
-        assertEquals("first thought", messages[2].getValue("reasoning_content").jsonPrimitive.content)
-        assertTrue("tool_calls" !in messages[2], "a text-only assistant turn has no calls")
+    @Test fun `a non deepseek model with the switch off is the pre-0_53 chat body`() {
+        val profile = profile(enabled = false).copy(model = "gpt-4o-mini")
+        for (withTools in listOf(false, true)) {
+            for ((path, body) in bodies(profile, if (withTools) tools else emptyList(), cap = 512)) {
+                assertFalse("thinking" in body, "$path must omit thinking")
+                assertFalse("reasoning_effort" in body, "$path must omit reasoning_effort")
+                assertEquals(
+                    if (path == "frame") 6_000 else 512,
+                    body.getValue("max_tokens").jsonPrimitive.int,
+                    "$path keeps the generic cap",
+                )
+                assertEquals(withTools, "tools" in body, "$path")
+            }
+        }
     }
 }

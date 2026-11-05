@@ -94,11 +94,11 @@ class ContextBudgeter {
             var total = Math.addExact(32L, message(request.instructions))
             input.forEach { total = Math.addExact(total, partCost(it)) }
             history.forEach { total = Math.addExact(total, itemCost(it)) }
-            // 0.53 §T5: an active thinking turn reserves the same raised output allowance the adapters put on the
-            // wire (`ThinkingOutputBudget.reserve`), so this stage and the encoder cannot disagree. When thinking is
-            // off the reserve is exactly `profile.maxOutputTokens` — the pre-0.53 formula.
+            // 0.53 design (revised) §T5: when the user switch is on, the adapters send no output cap and the provider
+            // applies its official 64K/128K default, so this stage reserves exactly that documented value. When the
+            // switch is off the reservation is `profile.maxOutputTokens` — the pre-0.53 formula.
             val limit = minOf(profile.inputBudgetTokens.toLong(),
-                profile.usableWindowTokens.toLong() - ThinkingOutputBudget.reserve(profile).toLong() - profile.safetyTokens.toLong())
+                profile.usableWindowTokens.toLong() - ThoughtBudget.reserve(profile).toLong() - profile.safetyTokens.toLong())
             val removed = mutableListOf<String>()
             var removedGroups = 0
             while (total > limit && removedGroups < groups.size) {
