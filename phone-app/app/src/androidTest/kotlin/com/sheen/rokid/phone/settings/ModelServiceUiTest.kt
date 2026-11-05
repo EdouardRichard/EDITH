@@ -5,11 +5,16 @@ import android.content.Context
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.phone.ForegroundTestActivity
 import com.sheen.rokid.phone.model.catalog.ModelCatalog
@@ -170,6 +175,75 @@ class ModelServiceUiTest {
         compose.onAllNodesWithText("128K 输入 · 8K 输出").assertCountEquals(3)
         // A text-only row cannot run the assistant (design §5.6): the reason is visible, not just a disabled radio.
         compose.onAllNodesWithText(ModelCatalogUi.TEXT_ONLY_DISABLED).assertCountEquals(1)
+    }
+
+    // ---- selection rule (I1) ------------------------------------------------------------------------------------
+
+    @Test
+    fun onlyTestedImageCapableRowsCanBeSelected() {
+        val missing = entry("m-missing", missing = true, textVerifiedAtRevision = 1)
+        val untested = entry("m-untested")
+        val tested = entry("m-tested", textVerifiedAtRevision = 1)
+        val provider = provider(models = listOf(missing, untested, tested))
+
+        setContent {
+            ModelServiceScreen(
+                state = stateOf(provider, selected = null),
+                actions = ModelCatalogActions(),
+                help = rememberHelpState(),
+            )
+        }
+
+        compose.onNodeWithContentDescription("选择模型 Model m-missing").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("选择模型 Model m-untested").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("选择模型 Model m-tested").assertIsEnabled()
+        compose.onNodeWithText(ModelCatalogUi.SELECT_MISSING_ROW).assertExists()
+        compose.onNodeWithText(ModelCatalogUi.SELECT_NEEDS_TEST).assertExists()
+        // I1's no-candidate copy is visible instead of a silent, unusable selection.
+        compose.onNodeWithText(ModelCatalogUi.NO_MODEL_SELECTED).assertExists()
+    }
+
+    // ---- 500-row laziness (I5) ----------------------------------------------------------------------------------
+
+    @Test
+    fun theFiveHundredRowModelListIsLazyAndStillReachesTheLastRow() {
+        val models = (1..500).map { entry("m-$it", textVerifiedAtRevision = 1) }
+        val provider = provider(models = models)
+
+        setContent {
+            ModelServiceScreen(
+                state = stateOf(provider, selected = models.first()),
+                actions = ModelCatalogActions(),
+                help = rememberHelpState(),
+            )
+        }
+
+        compose.waitForIdle()
+        val composed = compose.onAllNodesWithContentDescription("选择模型", substring = true)
+            .fetchSemanticsNodes().size
+        assertTrue("a LazyColumn composes only the visible window, found $composed of 500 rows", composed < 500)
+
+        compose.onNode(hasScrollAction()).performScrollToIndex(models.lastIndex)
+        compose.onNodeWithContentDescription("选择模型 Model m-500").assertExists()
+    }
+
+    // ---- stale selection warning (I6/R28) ----------------------------------------------------------------------
+
+    @Test
+    fun aStaleSelectionShowsTheFreshTestWarningAndADisabledRadio() {
+        val stale = entry("m-stale", textVerifiedAtRevision = 0)
+        val provider = provider(models = listOf(stale))
+
+        setContent {
+            ModelServiceScreen(
+                state = stateOf(provider, selected = stale).copy(warning = ModelCatalogUi.SELECTION_NEEDS_TEST),
+                actions = ModelCatalogActions(),
+                help = rememberHelpState(),
+            )
+        }
+
+        compose.onNodeWithText(ModelCatalogUi.SELECTION_NEEDS_TEST).assertExists()
+        compose.onNodeWithContentDescription("选择模型 Model m-stale").assertIsNotEnabled()
     }
 
     // ---- long values -------------------------------------------------------------------------------------------

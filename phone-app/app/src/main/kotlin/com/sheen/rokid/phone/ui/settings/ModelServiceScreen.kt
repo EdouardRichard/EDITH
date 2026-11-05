@@ -6,9 +6,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -66,69 +69,77 @@ internal fun ModelServiceScreen(
     var addModelOpen by remember { mutableStateOf(false) }
     var resetConfirm by remember { mutableStateOf(false) }
 
-    Column(
-        modifier = Modifier.fillMaxWidth(),
+    // 0.52 I5: this page owns its scroll container. The model list is a LazyColumn item range, so a provider with the
+    // gateway maximum (500 models) composes only the visible window instead of every row inside a shared vertical scroll.
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (state.corrupt) {
-            CorruptCatalogCard(
-                onReset = { resetConfirm = true },
-                busy = state.saving,
-            )
+            item {
+                CorruptCatalogCard(
+                    onReset = { resetConfirm = true },
+                    busy = state.saving,
+                )
+            }
         } else {
             state.warning?.let { warning ->
-                Text(warning, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                item { Text(warning, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
             state.error?.let { error ->
-                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                item { Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
             state.notice?.let { notice ->
-                Text(notice, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                item { Text(notice, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall) }
             }
             state.refreshSummary?.let { summary ->
-                RefreshSummaryRow(summary) { actions.dismissRefreshSummary() }
+                item { RefreshSummaryRow(summary) { actions.dismissRefreshSummary() } }
             }
 
             val provider = state.activeProvider
             if (provider == null) {
-                EmptyCatalogCard(onAddProvider)
+                item { EmptyCatalogCard(onAddProvider) }
             } else {
-                ProviderCard(state, provider, onOpenProviders)
-                FetchRow(state, actions, help, onAddModel = { addModelOpen = true })
+                item { ProviderCard(state, provider, onOpenProviders) }
+                item { FetchRow(state, actions, help, onAddModel = { addModelOpen = true }) }
                 if (state.models.isEmpty()) {
-                    Text(ModelCatalogUi.NO_MODELS_TITLE, style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        ModelCatalogUi.NO_MODELS_DETAIL,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    if (state.selectedModel == null) {
+                    item { Text(ModelCatalogUi.NO_MODELS_TITLE, style = MaterialTheme.typography.titleSmall) }
+                    item {
                         Text(
-                            ModelCatalogUi.NO_MODEL_SELECTED,
+                            ModelCatalogUi.NO_MODELS_DETAIL,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        state.models.forEach { entry ->
-                            ModelRow(
-                                entry = entry,
-                                provider = provider,
-                                selected = state.selectedModel?.id == entry.id,
-                                enabled = ModelCatalogUi.canSelect(entry, provider),
-                                onSelect = { actions.selectModel(entry.id) },
-                                onOpen = { onOpenModel(entry.id) },
+                } else {
+                    if (state.selectedModel == null) {
+                        item {
+                            Text(
+                                ModelCatalogUi.NO_MODEL_SELECTED,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
+                    items(state.models, key = { it.id }) { entry ->
+                        ModelRow(
+                            entry = entry,
+                            provider = provider,
+                            selected = state.selectedModel?.id == entry.id,
+                            enabled = ModelCatalogUi.canSelect(entry, provider),
+                            onSelect = { actions.selectModel(entry.id) },
+                            onOpen = { onOpenModel(entry.id) },
+                        )
+                    }
                 }
             }
-            Text(
-                ModelCatalogUi.FOOTER,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            item {
+                Text(
+                    ModelCatalogUi.FOOTER,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 

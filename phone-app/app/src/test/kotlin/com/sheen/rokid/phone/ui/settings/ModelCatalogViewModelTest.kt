@@ -74,6 +74,36 @@ class ModelCatalogViewModelTest {
         override fun revoke(handle: SecretHandle) = Unit
     }
 
+    /** Mirrors `KeystoreVault.stage`'s admission rules so an invalid edit is not silently accepted by the double. */
+    private class StrictCredentials : CatalogCredentialStore {
+        val staged = mutableListOf<CharArray>()
+        override fun stage(value: CharArray): SecretHandle {
+            try {
+                if (value.isEmpty() || value.all { it.isWhitespace() } || value.size > 8192) {
+                    throw ContractError.ConfigurationRejected("Credential staging failed")
+                }
+                staged += value.copyOf()
+                return object : SecretHandle {
+                    override val id = "credential-${UUID.randomUUID()}"
+                    override fun toString() = "SecretHandle(redacted)"
+                }
+            } finally {
+                value.fill('\u0000')
+            }
+        }
+
+        override fun revoke(handle: SecretHandle) = Unit
+    }
+
+    private class FailingCredentials : CatalogCredentialStore {
+        override fun stage(value: CharArray): SecretHandle {
+            value.fill('\u0000')
+            throw ContractError.ConfigurationRejected("Credential staging failed")
+        }
+
+        override fun revoke(handle: SecretHandle) = Unit
+    }
+
     /**
      * Pins the view model's own zeroing: unlike the production store this double keeps the caller's buffer untouched, so
      * only the view model can make it zero after the save.
@@ -390,6 +420,59 @@ class ModelCatalogViewModelTest {
         assertEquals("an edit without a new key keeps the stored credential", false, saved.secretHandleId.isNullOrBlank())
     }
 
+    @Test
+    fun `a whitespace-only key while editing keeps the stored credential`() {
+        val credentials = StrictCredentials()
+        val repository = repository(credentials)
+        save(repository, provider("p-1", "One", entry("m-1")))
+        val storedSecret = repository.catalog().providers.single().secretHandleId
+        val stagedBefore = credentials.staged.size
+        val model = viewModel(repository)
+        model.enter()
+        val key = "   ".toCharArray()
+
+        model.saveProvider(draft(providerId = "p-1", key = key))
+
+        assertNull("a blank edit is not a failure; it means keep the stored key", model.state.value.error)
+        assertEquals("p-1", model.state.value.savedProviderId)
+        assertTrue("the caller's buffer is zeroed even when the key is dropped", key.all { it == '\u0000' })
+        assertEquals("nothing new is staged", stagedBefore, credentials.staged.size)
+        assertEquals("the stored credential is untouched", storedSecret,
+            repository.catalog().providers.single().secretHandleId)
+    }
+
+    @Test
+    fun `an over-length key on edit is a field error and stages nothing`() {
+        val credentials = StrictCredentials()
+        val repository = repository(credentials)
+        save(repository, provider("p-1", "One", entry("m-1")))
+        val stagedBefore = credentials.staged.size
+        val model = viewModel(repository)
+        model.enter()
+        val key = "x".repeat(9000).toCharArray()
+
+        model.saveProvider(draft(providerId = "p-1", key = key))
+
+        assertEquals("API Key 过长", model.state.value.error)
+        assertNull("a refused key never reports a saved provider", model.state.value.savedProviderId)
+        assertEquals("nothing new is staged", stagedBefore, credentials.staged.size)
+        assertTrue("the caller's buffer is zeroed", key.all { it == '\u0000' })
+    }
+
+    @Test
+    fun `a credential staging failure never suggests resetting the catalog`() {
+        val repository = repository(FailingCredentials())
+        val model = viewModel(repository)
+        model.enter()
+
+        model.saveProvider(draft())
+
+        assertEquals("API Key 保存失败，请重试", model.state.value.error)
+        assertFalse("a Keystore problem must not suggest deleting the catalog",
+            requireNotNull(model.state.value.error).contains("重置"))
+        assertNull(model.state.value.savedProviderId)
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // switching
     // ---------------------------------------------------------------------------------------------------------
@@ -644,6 +727,50 @@ class ModelCatalogViewModelTest {
         )
     }
 
+    @Test
+    fun `a content save while a session runs stays successful and still emits the saved event`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        // The host refuses `configure` while a plugin is active; a content-only edit must not call it at all (I4).
+        val model = viewModel(
+            repository,
+            selectionChanged = { throw IllegalStateException("configure refused while a plugin is active") },
+            sessionRunning = { true },
+        )
+        model.enter()
+        val original = requireNotNull(repository.catalog().activeProvider()).models.single()
+
+        model.updateModel("p-1", original, original.copy(displayName = "Renamed"))
+
+        assertNull("a committed catalog write must not be reported as a save failure", model.state.value.error)
+        assertEquals("the detail page's pop signal is still published", "m-1", model.state.value.savedModelId)
+        assertEquals("Renamed",
+            repository.catalog().activeProvider()?.models?.single()?.displayName)
+    }
+
+    @Test
+    fun `restoring defaults while a session runs does not reconfigure and keeps its event`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1")))
+        repository.setActiveProvider("p-1")
+        var reconfigurations = 0
+        val model = viewModel(
+            repository,
+            selectionChanged = { reconfigurations++ },
+            sessionRunning = { true },
+        )
+        model.enter()
+        val epoch = model.state.value.modelEditEpoch
+
+        model.restoreDefaults("m-1")
+
+        assertNull(model.state.value.error)
+        assertEquals("content-only restore must not reconfigure the plugin", 0, reconfigurations)
+        assertEquals("the detail page's reload signal is still published", epoch + 1, model.state.value.modelEditEpoch)
+        assertNotNull(model.state.value.notice)
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // model selection / manual rows
     // ---------------------------------------------------------------------------------------------------------
@@ -811,6 +938,27 @@ class ModelCatalogViewModelTest {
             repository.catalog().activeProvider()?.models?.map { it.id })
         assertNull("a deleted selection must not resurrect on refresh", repository.catalog().selectedModelId)
         assertNull(model.state.value.selectedModel)
+    }
+
+    @Test
+    fun `a content change that invalidates the selected evidence warns for a fresh test`() {
+        val repository = repository()
+        save(repository, provider("p-1", "One", entry("m-1", verifications = listOf(
+            CapabilityVerification(1, "TEXT_REQUEST", VerificationState.Verified, now)))))
+        repository.setActiveProvider("p-1")
+        // A gateway refresh adds one model: provider-level revision (R28) bumps and clears the selected row's evidence.
+        val source = Source(ModelListResult.Success(listOf(snapshot("m-1"), snapshot("m-2")), truncated = false))
+        val model = viewModel(repository, source)
+        model.enter()
+        assertEquals("m-1", model.state.value.selectedModel?.id)
+
+        model.refresh()
+
+        val provider = requireNotNull(repository.catalog().activeProvider())
+        val selected = provider.models.first { it.id == "m-1" }
+        assertEquals("the selection is kept so the user sees what became stale", "m-1", repository.catalog().selectedModelId)
+        assertFalse("the selection rule leaves it unselectable", ModelCatalogUi.canSelect(selected, provider))
+        assertEquals("当前选择的模型需要重新测试后才能使用", model.state.value.warning)
     }
 
     // ---------------------------------------------------------------------------------------------------------

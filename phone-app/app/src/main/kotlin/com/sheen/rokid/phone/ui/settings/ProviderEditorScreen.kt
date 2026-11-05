@@ -179,7 +179,9 @@ internal fun ProviderEditorScreen(
                 val problems = buildList {
                     ModelCatalogUi.providerNameError(name)?.let(::add)
                     ModelCatalogUi.providerBaseUrlError(baseUrl, BuildConfig.DEBUG)?.let(::add)
-                    if (!editing && apiKey.isBlank()) add(ModelCatalogUi.KEY_REQUIRED)
+                    // I7: blank on create is required; blank/whitespace-only on edit keeps the credential; over-length
+                    // or embedded whitespace is a field error (never a staged credential / reset-catalog suggestion).
+                    ModelCatalogUi.providerKeyError(apiKey, editing)?.let(::add)
                     timeoutText.trim().toLongOrNull()?.takeIf { it > 0 } ?: add("超时需为大于 0 的毫秒整数")
                 }
                 if (problems.isNotEmpty()) {
@@ -190,7 +192,7 @@ internal fun ProviderEditorScreen(
                         ProviderDraft(
                             name = name.trim(),
                             baseUrl = baseUrl.trim(),
-                            apiKey = apiKey.takeIf { it.isNotEmpty() }?.toCharArray(),
+                            apiKey = apiKey.takeIf { it.isNotBlank() }?.toCharArray(),
                             protocolId = protocolId,
                             timeoutMillis = requireNotNull(timeoutText.trim().toLongOrNull()),
                             providerId = providerId,

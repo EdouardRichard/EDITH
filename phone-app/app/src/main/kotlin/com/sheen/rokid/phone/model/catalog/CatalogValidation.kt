@@ -18,6 +18,41 @@ object CatalogValidation {
     /** 0.52 design §5.2: provider names are 1-40 characters. */
     const val MAX_PROVIDER_NAME = 40
 
+    /** 0.52 I7: `KeystoreVault.stage` admits at most this many characters. */
+    const val MAX_API_KEY_CHARS = 8192
+
+    const val API_KEY_REQUIRED = "API Key 不能为空"
+    const val API_KEY_TOO_LONG = "API Key 过长"
+    const val API_KEY_WHITESPACE = "API Key 不能包含空格"
+
+    /**
+     * 0.52 I7: one rule for the provider editor and the view model.
+     *
+     * A blank/whitespace-only value on **edit** means "keep the stored credential" (null), exactly like an empty field;
+     * it is never forwarded to the vault where it would become a storage failure whose copy suggests resetting the
+     * catalog. A whitespace-only value on create, an over-length value, or a value with embedded whitespace is a field
+     * error. The caller owns zeroing the buffer.
+     */
+    fun apiKeyError(key: String?, editing: Boolean): String? =
+        apiKeyError(key?.length ?: -1, editing) { key!![it] }
+
+    /** CharArray overload: no secret copy is made just to validate it. */
+    fun apiKeyError(key: CharArray?, editing: Boolean): String? =
+        apiKeyError(key?.size ?: -1, editing) { key!![it] }
+
+    private inline fun apiKeyError(length: Int, editing: Boolean, characterAt: (Int) -> Char): String? {
+        if (length < 0) return if (editing) null else API_KEY_REQUIRED
+        var allWhitespace = true
+        var anyWhitespace = false
+        for (index in 0 until length) {
+            if (characterAt(index).isWhitespace()) anyWhitespace = true else allWhitespace = false
+        }
+        if (allWhitespace) return if (editing) null else API_KEY_REQUIRED
+        if (length > MAX_API_KEY_CHARS) return API_KEY_TOO_LONG
+        if (anyWhitespace) return API_KEY_WHITESPACE
+        return null
+    }
+
     fun providerNameError(name: String): String? {
         val trimmed = name.trim()
         return when {

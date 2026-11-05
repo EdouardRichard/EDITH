@@ -441,6 +441,9 @@ internal fun SettingsShellContent(
             route != SettingsRoute.RuntimeAppearance &&
             route != SettingsRoute.PermissionsSecurity &&
             !catalogRoute,
+        // 0.52 I5: the model service's 500-row list must be a page-owned LazyColumn. The shared vertical scroll would
+        // measure it unbounded and compose every row, so that one page hands its full-height body to the page.
+        scrollable = route != SettingsRoute.ModelService,
     ) {
         when {
             catalogRoute -> {

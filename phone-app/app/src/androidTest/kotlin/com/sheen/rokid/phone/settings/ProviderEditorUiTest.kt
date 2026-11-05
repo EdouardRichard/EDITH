@@ -143,6 +143,31 @@ class ProviderEditorUiTest {
     }
 
     @Test
+    fun aWhitespaceOnlyKeyOnEditKeepsTheCredentialAndAnOverLongKeyIsAFieldError() {
+        var saved: ProviderDraft? = null
+        setEditor {
+            ProviderEditorScreen(
+                state = editingState(),
+                actions = ModelCatalogActions(saveProvider = { draft -> saved = draft }),
+                help = rememberHelpState(),
+                providerId = "p-1",
+            )
+        }
+
+        compose.onNodeWithContentDescription("提供商 API Key 输入").performTextReplacement("   ")
+        compose.onNodeWithText(ModelCatalogUi.SAVE_AND_FETCH).performScrollTo().performClick()
+
+        assertNull("whitespace-only on edit means keep the stored credential", requireNotNull(saved).apiKey)
+
+        saved = null
+        compose.onNodeWithContentDescription("提供商 API Key 输入").performTextReplacement("x".repeat(9000))
+        compose.onNodeWithText(ModelCatalogUi.SAVE_AND_FETCH).performScrollTo().performClick()
+
+        compose.onNodeWithText("API Key 过长").assertExists()
+        assertNull("an over-length key is never submitted", saved)
+    }
+
+    @Test
     fun aFailedSaveIsShownInlineAndTheFormStaysEditable() {
         setEditor {
             ProviderEditorScreen(

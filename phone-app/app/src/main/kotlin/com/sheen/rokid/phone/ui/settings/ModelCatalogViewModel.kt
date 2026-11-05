@@ -125,17 +125,20 @@ internal class ModelCatalogViewModel(
      * whole row - building a fresh `Provider` would silently drop that provider's model list.
      */
     fun saveProvider(draft: ProviderDraft) {
-        val key = draft.apiKey
+        val rawKey = draft.apiKey
         // `launch` refuses work once the page left; the early return there would otherwise keep the caller's key
         // buffer alive. Zero it here instead of relying on a coroutine body that will never run.
         if (!entered) {
-            key?.fill('\u0000')
+            rawKey?.fill('\u0000')
             return
         }
+        val newProvider = draft.providerId == null
+        // I7: on edit, an empty or whitespace-only field means "keep the stored credential"; it must never be staged.
+        val key = if (newProvider) rawKey else rawKey?.takeUnless { raw -> raw.all { it.isWhitespace() } }
+        if (key !== rawKey) rawKey?.fill('\u0000')
         val nameError = ModelCatalogUi.providerNameError(draft.name)
         val urlError = ModelCatalogUi.providerBaseUrlError(draft.baseUrl, allowLocalHttp = BuildConfig.DEBUG)
-        val newProvider = draft.providerId == null
-        val keyError = if (newProvider && (key == null || key.isEmpty())) ModelCatalogUi.KEY_REQUIRED else null
+        val keyError = ModelCatalogUi.providerKeyError(key, editing = !newProvider)
         if (nameError != null || urlError != null || keyError != null) {
             key?.fill('\u0000')
             _state.update { it.copy(error = nameError ?: urlError ?: keyError, notice = null) }
@@ -367,7 +370,10 @@ internal class ModelCatalogViewModel(
             )
             val next = repository.catalog()
             applyCatalog(next)
-            if (next.activeProviderId == provider.id) selectionChanged(next.activeProfile())
+            // I4: a content-only edit is re-resolved from the live projection on the next request. It must not call
+            // `selectionChanged`/`host.configure`, because the host refuses `configure` while a plugin is active - a
+            // committed write would then surface as 「保存失败」 and the detail page would never pop. The selection
+            // itself is unchanged here; only the request path needs the new content.
             _state.update {
                 it.copy(
                     notice = ModelCatalogUi.savedProvider(changed.displayName),
@@ -402,7 +408,7 @@ internal class ModelCatalogViewModel(
             } else {
                 val next = repository.catalog()
                 applyCatalog(next)
-                if (next.activeProviderId == provider.id) selectionChanged(next.activeProfile())
+                // I4: restoring defaults is a content-only write too; the next request re-reads the live projection.
                 _state.update {
                     it.copy(
                         notice = ModelCatalogUi.restoredDefaults(restored.displayName),
@@ -613,6 +619,11 @@ internal class ModelCatalogViewModel(
             provider == null -> null
             catalog.selectedModelId != null && selected == null -> ModelCatalogUi.MISSING_SELECTED
             selected?.missing == true -> ModelCatalogUi.MISSING_GATEWAY
+            // 0.52 I6/R28: a real directory change invalidates the selected model's evidence. Keep the choice visible
+            // but warn that a fresh test is required; the same ModelSelection rule leaves the radio unselectable.
+            selected != null && InputModality.IMAGE !in selected.inputs -> ModelCatalogUi.TEXT_ONLY_SELECTED
+            selected != null && !ModelSelection.isSelectable(selected, provider.revision) ->
+                ModelCatalogUi.SELECTION_NEEDS_TEST
             else -> null
         }
         _state.update {

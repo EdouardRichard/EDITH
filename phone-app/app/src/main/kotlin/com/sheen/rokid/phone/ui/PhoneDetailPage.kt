@@ -44,6 +44,10 @@ internal const val BACK_DESCRIPTION = "返回"
  * [actions] is the header's trailing slot (0.52 §3.1): a settings page can put its own page-level control — for example
  * 「获取模型」 - beside the title without every page growing its own header. An empty lambda keeps every existing call
  * source-compatible.
+ *
+ * [scrollable] = false gives the body to a page-owned scroll container (the model service's `LazyColumn`, 0.52 I5). The
+ * shared `verticalScroll` cannot wrap a lazy list: an unbounded-height list composes every row and defeats the whole
+ * point. The caller keeps the header and the dialog; the page owns the full-height list.
  */
 @Composable
 internal fun PhoneDetailPage(
@@ -51,6 +55,7 @@ internal fun PhoneDetailPage(
     onBack: () -> Unit,
     actions: @Composable RowScope.() -> Unit = {},
     selectionEnabled: Boolean = true,
+    scrollable: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Dialog(
@@ -74,8 +79,11 @@ internal fun PhoneDetailPage(
                     actions()
                 }
                 HorizontalDivider()
+                val scrollState = rememberScrollState()
                 Column(
-                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                    Modifier.fillMaxSize()
+                        .then(if (scrollable) Modifier.verticalScroll(scrollState) else Modifier)
+                        .padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     if (selectionEnabled) {

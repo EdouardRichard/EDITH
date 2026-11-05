@@ -189,12 +189,19 @@ internal object ModelCatalogUi {
     const val TEXT_ONLY_DISABLED = "不支持图片，助手不可用"
     const val MISSING_SELECTED = "当前选择的模型已不存在，请重新选择模型"
     const val MISSING_GATEWAY = "当前选择的模型已被网关移除，建议重新选择模型"
+    /** 0.52 I6/R28: a provider-directory change bumped the revision, so the selected model's evidence is stale. */
+    const val SELECTION_NEEDS_TEST = "当前选择的模型需要重新测试后才能使用"
+    const val TEXT_ONLY_SELECTED = "当前选择的模型不支持图片输入，助手不可用"
     /** 0.52 I1: tapping the radio of a gateway-removed row. */
     const val SELECT_MISSING_ROW = "该模型已被网关移除，无法选择"
     const val PROVIDER_MISSING = "提供商不存在，请返回后重新进入"
     const val MODEL_MISSING = "模型不存在，请刷新后重试"
     const val ADD_PROVIDER_FIRST = "请先添加提供商"
     const val KEY_REQUIRED = "API Key 不能为空"
+    /** The provider editor's own key validation seam (I7); field errors are fixed sentences, never the key itself. */
+    fun providerKeyError(key: String?, editing: Boolean): String? = CatalogValidation.apiKeyError(key, editing)
+
+    fun providerKeyError(key: CharArray?, editing: Boolean): String? = CatalogValidation.apiKeyError(key, editing)
     const val MISSING_SECRET = "缺少 API Key，请重新保存提供商"
     const val NEW_ACTIVE_REQUIRED = "请先选择新的生效提供商"
     const val MODEL_ID_IMMUTABLE = "模型 ID 不可修改"
@@ -259,6 +266,8 @@ internal object ModelCatalogUi {
             "尚未选择提供商" -> "请先添加并选择提供商"
             "Storage unavailable; reconfigure", "Model configuration unavailable" ->
                 "模型目录无法读取，请重置模型目录"
+            // I7: a credential-staging failure is a Keystore problem, not catalog corruption. Never suggest a reset.
+            "Credential staging failed" -> "API Key 保存失败，请重试"
             else -> "保存失败，请重试"
         }
         else -> "保存失败，请重试"

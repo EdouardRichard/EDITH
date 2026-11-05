@@ -219,6 +219,25 @@ class AndroidModelCatalogRepositoryTest {
         assertEquals(first.secretHandleId, repository.providerSecret("provider-1")?.id)
     }
 
+    /** R28: a save that changes nothing must not act like a directory change (no revision bump, no evidence wipe). */
+    @Test fun `re-saving an unchanged provider keeps the revision and the model evidence`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider(), "synthetic-first-key".toCharArray())
+        val models = repository.saveModels("provider-1", listOf(entry()), null)
+        repository.verify("provider-1:m-1", textVerified(models.revision))
+        val before = repository.catalog().providers.single()
+        assertEquals(1, before.models.single().verifications.size)
+
+        val reSaved = repository.saveProvider(before, null)
+
+        assertEquals("a no-op provider save must not bump the revision", before.revision, reSaved.revision)
+        assertEquals("the evidence stays valid for the unchanged provider", before.models.single().verifications,
+            reSaved.models.single().verifications)
+        assertEquals(before, repository.catalog().providers.single())
+    }
+
     @Test fun `a failed catalog commit revokes the staged credential and keeps the old one`() {
         val blobs = Blobs()
         val credentials = Credentials()

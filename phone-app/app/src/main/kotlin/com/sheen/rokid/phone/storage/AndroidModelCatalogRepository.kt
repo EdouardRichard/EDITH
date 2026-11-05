@@ -48,17 +48,21 @@ class AndroidModelCatalogRepository(
                 val index = previous.providers.indexOfFirst { it.id == provider.id }
                 val old = previous.providers.getOrNull(index)
                 oldHandleId = old?.secretHandleId
-                val revision = if (old == null) 1L else Math.addExact(old.revision, 1L)
-                saved = provider.copy(
-                    secretHandleId = staged?.id ?: oldHandleId,
-                    revision = revision,
-                    // A revision bump invalidates every verification bound to the previous revision (design §5.2).
-                    models = if (old == null) {
-                        provider.models.toList()
-                    } else {
-                        provider.models.map { it.copy(verifications = emptyList()) }
-                    },
-                )
+                // R28: only a real provider-directory change bumps the revision and invalidates evidence. Re-saving the
+                // same fields with no key change is a no-op: the selected model's tests must stay valid.
+                val unchanged = old != null && newSecret == null &&
+                    old.name == provider.name && old.baseUrl == provider.baseUrl &&
+                    old.protocolId == provider.protocolId && old.timeoutMillis == provider.timeoutMillis
+                saved = when {
+                    old == null -> provider.copy(secretHandleId = staged?.id, revision = 1L)
+                    unchanged -> old
+                    else -> provider.copy(
+                        secretHandleId = staged?.id ?: oldHandleId,
+                        revision = Math.addExact(old.revision, 1L),
+                        // A revision bump invalidates every verification bound to the previous revision (design §5.2).
+                        models = provider.models.map { it.copy(verifications = emptyList()) },
+                    )
+                }
                 val providers = if (index < 0) {
                     previous.providers + saved
                 } else {
@@ -66,7 +70,7 @@ class AndroidModelCatalogRepository(
                 }
                 ModelCatalogJson.write(blobs, previous.copy(providers = providers))
                 committed = true
-                affected = affectedIds(old) + affectedIds(saved)
+                affected = if (unchanged) emptySet() else affectedIds(old) + affectedIds(saved)
                 deliveries = changes.toList()
             }
         } catch (error: Exception) {
