@@ -8,6 +8,7 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -57,12 +58,25 @@ class AccessibilityExecutionBackendTest {
         private val focusedWindow: Boolean? = true,
         private val screen: ScreenBounds? = ScreenBounds(0, 0, 1080, 2400),
         private val gestureAccepted: Boolean = true,
+        /**
+         * What the fake field reads back after `input_text` (0.5.4 T12). `null` means "echo the text the backend
+         * dispatched", i.e. the normal field that accepts the write; a non-null value scripts an unchanged field.
+         */
+        private val textAfterType: String? = null,
+        /**
+         * Per-read-back answers, in order (0.5.4 T12). Lets a test script a field that updates late: the first re-read
+         * is still empty and a later poll carries the text. Calls beyond the list answer like [textAfterType].
+         */
+        private val readBackAnswers: List<String?>? = null,
+        /** Whether the port still recognises the snapshot id it was handed (0.5.4 T12). */
+        private val snapshotValid: Boolean = true,
     ) : AccessibilityUi {
         val clickByIndexCalls = mutableListOf<Pair<String, Int>>()
         val longPressByIndexCalls = mutableListOf<Pair<String, Int>>()
         val setTextByIndexCalls = mutableListOf<Triple<String, Int, String>>()
         val clickAtCalls = mutableListOf<Pair<Int, Int>>()
         val longPressAtCalls = mutableListOf<Pair<Int, Int>>()
+        val textAtCalls = mutableListOf<Pair<Int, ScreenFilter>>()
         var fingerprints = 0
         var snapshotCalls = 0
         private var currentSnapshot: ScreenSnapshot? = null
@@ -142,12 +156,31 @@ class AccessibilityExecutionBackendTest {
             return clickable
         }
 
+        override fun textAt(index: Int, filter: ScreenFilter): String? {
+            textAtCalls += index to filter
+            readBackAnswers?.let { answers ->
+                if (textAtCalls.size <= answers.size) return answers[textAtCalls.size - 1]
+            }
+            return textAfterType ?: setTextByIndexCalls.lastOrNull()?.third
+        }
+
+        override fun isSnapshotValid(snapshotId: String): Boolean = snapshotValid
+
         override fun structuralFingerprint(): ScreenFingerprint =
             ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
     }
 
-    private fun backend(ui: AccessibilityUi, connected: Boolean = true) =
-        AccessibilityExecutionBackend(ui = ui, connected = { connected })
+    private fun backend(
+        ui: AccessibilityUi,
+        connected: Boolean = true,
+        elapsedMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+        sleepMillis: (Long) -> Unit = { Thread.sleep(it) },
+    ) = AccessibilityExecutionBackend(
+        ui = ui,
+        connected = { connected },
+        elapsedMillis = elapsedMillis,
+        sleepMillis = sleepMillis,
+    )
 
     /** A run of plain text nodes with distinct rectangles, for the pagination tests. */
     private fun textNodes(count: Int, prefix: String = "Item"): List<RawSnapshotNode> = (0 until count).map { i ->
@@ -157,6 +190,13 @@ class AccessibilityExecutionBackendTest {
             left = 0, top = i * 10, right = 100, bottom = i * 10 + 10, hintText = null,
         )
     }
+
+    /** One editable field: the target of every `input_text` test. */
+    private fun fieldNode(text: String = ""): RawSnapshotNode = RawSnapshotNode(
+        text = text, contentDescription = null, className = null,
+        clickable = false, editable = true, scrollable = false, checked = false,
+        left = 0, top = 0, right = 100, bottom = 50, hintText = null,
+    )
 
     // ── read_screen fields and pagination (0.5.4 T9) ────────────────────────
 
@@ -421,14 +461,17 @@ class AccessibilityExecutionBackendTest {
         assertTrue(result.detail.contains("tapped"))
     }
 
-    @Test fun `input_text is judged the same way as tap for screen change`() {
+    @Test fun `input_text keeps NO_SCREEN_CHANGE when the text did not land and nothing changed`() {
+        // 0.5.4 T12 replaces the fingerprint-only criterion for input_text, but keeps its pre-T12 refusal: a field that
+        // never takes the text *and* a screen that never moved is still NO_SCREEN_CHANGE, not TEXT_NOT_APPLIED.
         val editableNode = RawSnapshotNode(
             text = "", contentDescription = null, className = null,
             clickable = false, editable = true, scrollable = false, checked = false,
             left = 0, top = 0, right = 100, bottom = 50, hintText = null,
         )
-        val staleUi = FakeUi(fingerprintAfter = "screen-a", nodes = listOf(editableNode))
-        val staleB = backend(staleUi)
+        var now = 0L
+        val staleUi = FakeUi(fingerprintAfter = "screen-a", nodes = listOf(editableNode), textAfterType = "")
+        val staleB = backend(staleUi, elapsedMillis = { now }, sleepMillis = { now += it })
         staleB.execute("read_screen", "{}")
         val stale = staleB.execute("input_text", """{"index":0,"text":"hello"}""")
         assertEquals(ActionOutcome.Refused, stale.outcome)
@@ -439,6 +482,121 @@ class AccessibilityExecutionBackendTest {
         okB.execute("read_screen", "{}")
         val ok = okB.execute("input_text", """{"index":0,"text":"hello"}""")
         assertEquals(ActionOutcome.Done, ok.outcome)
+    }
+
+    // ── input_text read-back (0.5.4 T12) ────────────────────────────────────
+
+    @Test fun `input_text is done only when the field reads the text back`() {
+        // 0.5.4 T12: the platform accepting ACTION_SET_TEXT is not success. The backend re-reads the field it wrote to,
+        // with the same filter the snapshot was read with (indices are assigned after filtering), and only a match is
+        // reported as Done. The fingerprint deliberately does not move here: the field carrying the text is the verdict,
+        // not the old "the screen must also have changed" rule. The fake echoes the dispatched text as its content.
+        val ui = FakeUi(nodes = listOf(fieldNode()), fingerprintAfter = "screen-a")
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("input_text", """{"index":0,"text":"hello"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the write reached the port once", listOf(0), ui.setTextByIndexCalls.map { it.second })
+        assertEquals(
+            "the field was re-read at the written index with the snapshot's filter",
+            listOf(0 to ScreenFilter.INTERACTIVE),
+            ui.textAtCalls,
+        )
+        assertEquals("a matching read-back must not wait out the settle window", 0L, now)
+    }
+
+    @Test fun `input_text reports TEXT_NOT_APPLIED when the field text never changes`() {
+        // The write was accepted but the field still reads back empty after the settle window: the platform said yes and
+        // the app did not apply it. That is neither NODE_NOT_CLICKABLE (the node accepted the action) nor
+        // NO_SCREEN_CHANGE (the screen may have changed) - it is the read-back specifically saying "not applied".
+        val ui = FakeUi(nodes = listOf(fieldNode()), textAfterType = "")
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("input_text", """{"index":0,"text":"hello"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("TEXT_NOT_APPLIED", result.detail)
+        assertEquals("the write really was dispatched", 1, ui.setTextByIndexCalls.size)
+        assertTrue("the read-back is retried, not a single sample: ${ui.textAtCalls}", ui.textAtCalls.size > 1)
+        assertEquals("the settle window is bounded at 800 ms", 800L, now)
+    }
+
+    @Test fun `input_text accepts text that reaches the field within the settle window`() {
+        // Settle, not sleep-once: a field can apply the text after the first poll (IME/async widget). The fake answers
+        // empty first and the dispatched text on the second read, so only a polling loop can report Done.
+        val ui = FakeUi(nodes = listOf(fieldNode()), readBackAnswers = listOf("", "hello"))
+        var now = 0L
+        val b = backend(ui, elapsedMillis = { now }, sleepMillis = { now += it })
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("input_text", """{"index":0,"text":"hello"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the second poll carried the text", 2, ui.textAtCalls.size)
+        assertTrue("the loop waited one poll inside the window: $now", now in 1L..800L)
+    }
+
+    @Test fun `reusing an index after a dispatched action reports SNAPSHOT_STALE`() {
+        // 0.5.4 T12: every dispatched index action invalidates the snapshot (T9). Reusing its index is not a node that
+        // refused the action and not "you never read the screen": the snapshot existed and was invalidated, so the code
+        // that tells the model to read the screen again is SNAPSHOT_STALE.
+        listOf(
+            "tap" to """{"index":0}""",
+            "long_press" to """{"index":0}""",
+            "input_text" to """{"index":0,"text":"hello"}""",
+        ).forEach { (action, args) ->
+            val node = RawSnapshotNode(
+                text = "", contentDescription = null, className = null,
+                clickable = true, editable = true, scrollable = false, checked = false,
+                left = 0, top = 0, right = 100, bottom = 50, hintText = null,
+            )
+            val ui = FakeUi(nodes = listOf(node))
+            val b = backend(ui)
+            b.execute("read_screen", "{}")
+            assertEquals("$action first dispatch succeeds", ActionOutcome.Done, b.execute(action, args).outcome)
+
+            val reused = b.execute(action, args)
+
+            assertEquals("$action reuse is refused", ActionOutcome.Refused, reused.outcome)
+            assertEquals("$action must report the invalidated snapshot", "SNAPSHOT_STALE", reused.detail)
+            assertNotEquals("$action must not blame the node", "NODE_NOT_CLICKABLE", reused.detail)
+            assertNotEquals("$action must not claim no snapshot ever existed", "ARGUMENTS_INVALID", reused.detail)
+            // Nothing may reach the UI with the expired snapshot.
+            assertEquals("$action dispatches once only", 1, ui.clickByIndexCalls.size + ui.longPressByIndexCalls.size + ui.setTextByIndexCalls.size)
+        }
+    }
+
+    @Test fun `an index action with no snapshot this turn stays ARGUMENTS_INVALID`() {
+        // The other side of the distinction: a cold index (or one after the turn boundary cleared the snapshot) never
+        // names a snapshot at all, so it keeps the pre-T12 ARGUMENTS_INVALID answer rather than claiming staleness.
+        listOf(
+            "tap" to """{"index":0}""",
+            "long_press" to """{"index":0}""",
+            "input_text" to """{"index":0,"text":"hello"}""",
+        ).forEach { (action, args) ->
+            val result = backend(FakeUi()).execute(action, args)
+            assertEquals("$action cold start", ActionOutcome.Refused, result.outcome)
+            assertEquals("$action cold start", "ARGUMENTS_INVALID", result.detail)
+        }
+    }
+
+    @Test fun `an invalid snapshot at the port is SNAPSHOT_STALE and dispatches nothing`() {
+        // The channel owns the authoritative snapshot and can invalidate it independently (a newer read on the same
+        // service). The backend's copy must not turn that "false" into NODE_NOT_CLICKABLE - the node was never asked.
+        val ui = FakeUi(nodes = listOf(fieldNode()), snapshotValid = false)
+        val b = backend(ui)
+        b.execute("read_screen", "{}")
+
+        val result = b.execute("input_text", """{"index":0,"text":"hello"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("SNAPSHOT_STALE", result.detail)
+        assertTrue("an invalid snapshot must not reach the UI: ${ui.setTextByIndexCalls}", ui.setTextByIndexCalls.isEmpty())
     }
 
     @Test fun `an unavailable service refuses instead of pretending`() {

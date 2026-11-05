@@ -339,6 +339,30 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         return result
     }
 
+    /**
+     * Re-reads the text the node at [index] carries now (0.5.4 T12).
+     *
+     * This is the production half of `input_text`'s verification: after `ACTION_SET_TEXT` the snapshot is invalidated,
+     * so the field must be read from a **fresh** walk. [filter] must be the one the acted-on snapshot used, because
+     * indices are assigned after filtering. The walk is deliberately side-effect free with respect to the tracked
+     * snapshot - it does not become the next actionable snapshot, and it stores no node references. `null` on a missing
+     * tree/index or a platform failure, which the backend reports as `TEXT_NOT_APPLIED`, never as success.
+     */
+    override fun textAt(index: Int, filter: ScreenFilter): String? = runCatching {
+        AccessibilityNodeSource(this).walkNodes(filter).getOrNull(index)?.text
+    }.getOrNull()
+
+    /**
+     * Whether [snapshotId] is still the channel's current snapshot (0.5.4 T12).
+     *
+     * The service is the authority: it clears its snapshot after every mutating action. Reading the volatile id into a
+     * local keeps the null-check and the comparison on the same value.
+     */
+    override fun isSnapshotValid(snapshotId: String): Boolean {
+        val current = currentSnapshotId ?: return false
+        return snapshotId == current
+    }
+
     override fun structuralFingerprint(): ScreenFingerprint {
         val source = AccessibilityNodeSource(this)
         val snap = SnapshotBuilder.build(source)

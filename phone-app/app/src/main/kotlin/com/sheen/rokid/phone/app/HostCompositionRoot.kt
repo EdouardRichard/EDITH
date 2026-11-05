@@ -4147,6 +4147,11 @@ class HostCompositionRoot internal constructor(
                 override fun scroll(direction: ScrollDirection): Boolean = live().scroll(direction)
                 override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean =
                     live().setTextByIndex(snapshotId, index, text)
+                // 0.5.4 T12: the read-back and the channel's own snapshot-validity answer. Their interface defaults are
+                // the no-op answers (null / true), so the wrapper must delegate or production could never verify a write
+                // and could never tell an invalidated channel snapshot.
+                override fun textAt(index: Int, filter: A11yScreenFilter): String? = live().textAt(index, filter)
+                override fun isSnapshotValid(snapshotId: String): Boolean = live().isSnapshotValid(snapshotId)
                 override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
                 // 0.5.4 T11: coordinate actions are the live service's own gesture and gate probes. The defaults on
                 // `AccessibilityUi` fail closed, so the wrapper must delegate or production would never tap a point.

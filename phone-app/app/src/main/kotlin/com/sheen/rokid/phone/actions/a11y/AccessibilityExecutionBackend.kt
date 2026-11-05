@@ -25,6 +25,34 @@ private const val NO_SCREEN_CHANGE = "NO_SCREEN_CHANGE"
 private const val ACTION_CHANNEL_UNAVAILABLE = "ACTION_CHANNEL_UNAVAILABLE"
 
 /**
+ * 0.5.4 T12: the index the caller reused no longer names a snapshot this turn may act on.
+ *
+ * Distinct from [ARGUMENTS_INVALID] on purpose: "you never read the screen" and "the snapshot you read was
+ * invalidated by an action (or by the channel)" are different mistakes, and only the second is repaired by reading the
+ * screen again. It is also not [NODE_NOT_CLICKABLE]: the node was never asked.
+ */
+private const val SNAPSHOT_STALE = "SNAPSHOT_STALE"
+
+/**
+ * 0.5.4 T12: the port accepted the text write but the field does not carry it after the settle window.
+ *
+ * The write was dispatched, so this is not an argument or target error; the field simply did not apply it. It is also
+ * not [NO_SCREEN_CHANGE]: the screen may well have changed (a focused field, a cursor) while the text did not land.
+ */
+private const val TEXT_NOT_APPLIED = "TEXT_NOT_APPLIED"
+
+/**
+ * How long `input_text` waits for the field to read back the text it dispatched (0.5.4 T12).
+ *
+ * Bounded on purpose: the model needs a verdict within the tool's own timeout, and a field that has not applied the
+ * text within this window is reported as [TEXT_NOT_APPLIED] rather than kept waiting.
+ */
+private const val TEXT_SETTLE_TIMEOUT_MILLIS = 800L
+
+/** One settle poll. Short enough to notice a fast field, long enough not to spin against the accessibility tree. */
+private const val TEXT_SETTLE_POLL_MILLIS = 50L
+
+/**
  * 0.5.4 T11 coordinate codes.
  *
  * [MISSING_POINT] means "the request does not designate a usable on-screen point": one coordinate without the other,
@@ -84,7 +112,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = TAP,
         title = "点击指定索引的元素或屏幕坐标",
-        description = "点击最近一次 read_screen 列表中的第 index 个元素，或点击屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT。index 必须来自本回合上一次 read_screen（滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可点击节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "点击最近一次 read_screen 列表中的第 index 个元素，或点击屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT。index 必须来自本回合上一次 read_screen（滚动后旧快照失效，旧快照被动作或通道作废后复用索引返回 SNAPSHOT_STALE，越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可点击节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -96,7 +124,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = LONG_PRESS,
         title = "长按指定索引的元素或屏幕坐标",
-        description = "长按最近一次 read_screen 列表中的第 index 个元素，或长按屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT（index 来自本回合上一次 read_screen，滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可长按节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "长按最近一次 read_screen 列表中的第 index 个元素，或长按屏幕像素坐标 (x,y)；index 与 x,y 二选一，同时给出或都不给返回 ARGUMENTS_INVALID，只给 x 或只给 y 返回 MISSING_POINT（index 来自本回合上一次 read_screen，滚动后旧快照失效，旧快照被动作或通道作废后复用索引返回 SNAPSHOT_STALE，越界返回 ARGUMENTS_INVALID）。坐标优先用 read_screen 已给出的 center，只有元素没有可长按节点时才用坐标。坐标必须落在屏内，屏幕尺寸不可读或点不在屏内返回 MISSING_POINT；锁屏时返回 COORD_REFUSED_KEYGUARD，系统 UI、权限框、安装器等系统界面在前台或无法确认前台 App 时返回 COORD_REFUSED_SYSTEM_UI，这些情况都不会派发手势。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -120,7 +148,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = INPUT_TEXT,
         title = "在指定索引的输入框输入文字",
-        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen，滚动后旧快照失效；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE，写入后屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen，滚动后旧快照失效，旧快照被动作或通道作废后复用索引返回 SNAPSHOT_STALE；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE；写入后会在 800 毫秒内回读该字段，回读不到 text 返回 TEXT_NOT_APPLIED（平台接受了写入但字段没有生效，不回显字段内容），屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"text":{"type":"string"}},"required":["index","text"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -170,6 +198,29 @@ interface AccessibilityUi {
     /** Sets text on the editable node at [index]. Returns false if not editable or stale. */
     fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean
 
+    /**
+     * The text the node at [index] currently carries, re-read from the live screen with the snapshot's own [filter].
+     *
+     * 0.5.4 T12: `input_text` no longer trusts "the platform accepted the write"; it re-reads this field after a settle
+     * window and only reports `Done` when the text is really there. The filter must be the one the acted-on snapshot was
+     * read with, because indices are assigned after filtering.
+     *
+     * `null` means "cannot be read back" (no tree, no such index, a throwing channel), which is a failed verification,
+     * never a silent success. The default is `null` on purpose: a channel that cannot read the field back must answer
+     * `TEXT_NOT_APPLIED` rather than repeat the old fingerprint-only claim.
+     */
+    fun textAt(index: Int, filter: ScreenFilter): String? = null
+
+    /**
+     * Whether [snapshotId] still names the channel's current snapshot (0.5.4 T12).
+     *
+     * The channel owns the authoritative snapshot and invalidates it after every mutating action; the backend's copy can
+     * therefore be older than the channel's. A `false` answer maps to `SNAPSHOT_STALE`, which tells the caller to read
+     * the screen again instead of reporting that the node itself refused the action. The default `true` keeps channels
+     * that do not track snapshot ids source-compatible; the production service overrides it.
+     */
+    fun isSnapshotValid(snapshotId: String): Boolean = true
+
     /** Structural fingerprint with node counts and truncation flag. */
     fun structuralFingerprint(): ScreenFingerprint
 
@@ -218,6 +269,11 @@ interface AccessibilityUi {
  * [NODE_NOT_CLICKABLE] (the UI did not offer the action) and [NO_SCREEN_CHANGE] (the action was accepted and nothing
  * happened). Neither is a success, and neither is an exception.
  *
+ * 0.5.4 T12 adds two more distinctions for the index path: `input_text` is `Done` only when the field **reads the text
+ * back** within the 800 ms settle window ([TEXT_NOT_APPLIED] otherwise - the platform accepted the write and the field
+ * did not apply it), and reusing an index whose snapshot was invalidated answers [SNAPSHOT_STALE] rather than
+ * [ARGUMENTS_INVALID] (nothing read this turn) or [NODE_NOT_CLICKABLE] (the node refused - it was never asked).
+ *
  * T1.5: Replaced tap_text/type_text with five index-based tools (read_screen, tap, long_press, scroll, input_text).
  * Write actions use fingerprint comparison for success determination. read_screen serializes the snapshot as a
  * numbered element list for model consumption.
@@ -225,6 +281,15 @@ interface AccessibilityUi {
 class AccessibilityExecutionBackend(
     private val ui: AccessibilityUi,
     private val connected: () -> Boolean,
+    /**
+     * Monotonic milliseconds for the `input_text` settle window (0.5.4 T12).
+     *
+     * Injectable for the same reason [com.sheen.rokid.device.DeviceKernel] takes a clock: the read-back loop is timed
+     * behaviour, and a JVM test must prove the 800 ms bound without sleeping through it.
+     */
+    private val elapsedMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+    /** The one blocking wait the settle loop uses; injectable so a test never sleeps for real. */
+    private val sleepMillis: (Long) -> Unit = { Thread.sleep(it) },
 ) : ExecutionBackend {
 
     override val id = "accessibility"
@@ -249,6 +314,16 @@ class AccessibilityExecutionBackend(
     private var currentSnapshotFilter: ScreenFilter? = null
 
     /**
+     * Whether the last snapshot was **invalidated** rather than never read (0.5.4 T12).
+     *
+     * `tap`/`long_press`/`input_text` promise that an index comes from this turn's `read_screen`. Two different mistakes
+     * used to collapse into `ARGUMENTS_INVALID`: a cold index (nothing read this turn) and an index reused after a
+     * dispatched action ended the snapshot it came from. Only the second is repaired by reading the screen again, so it
+     * reports `SNAPSHOT_STALE`; the turn boundary resets the flag because "no snapshot this turn" is the cold case.
+     */
+    private var snapshotStale = false
+
+    /**
      * edith-0.3 Phase 4A close fix: ends the turn that owns [currentSnapshot].
      *
      * The five descriptors promise that an index comes from "本回合上一次 read_screen". The snapshot used to be
@@ -258,20 +333,30 @@ class AccessibilityExecutionBackend(
      * the legacy probe contract does not widen, and a backend without turn state pays nothing.
      */
     internal fun beginTurn() {
-        invalidateSnapshot()
+        currentSnapshot = null
+        currentSnapshotFilter = null
+        // A new turn has read nothing yet: an index action is the cold ARGUMENTS_INVALID case, not "your snapshot is
+        // stale" (0.5.4 T12). The old snapshot is gone, but the caller must still begin with read_screen, so the code
+        // must not suggest a recovery that already happened.
+        snapshotStale = false
     }
 
     /**
-     * Drops [currentSnapshot] and the filter it was read with.
+     * Drops [currentSnapshot] and the filter it was read with after the screen may have moved.
      *
-     * Called by the turn boundary, by a successful scroll, and - 0.5.4 T9 fix round 2 - after **every dispatched**
-     * `tap`/`long_press`/`input_text`, regardless of the port's boolean. The accessibility service invalidates its own
-     * snapshot after any action, so a stale backend copy would let a later `offset > 0` page reuse a tree that predates
-     * the mutation and then have its indices refused as `NODE_NOT_CLICKABLE`; clearing forces that page to re-read.
+     * Called by a successful scroll and - 0.5.4 T9 fix round 2 - after **every dispatched**
+     * `tap`/`long_press`/`input_text`/coordinate gesture, regardless of the port's boolean. The accessibility service
+     * invalidates its own snapshot after any action, so a stale backend copy would let a later `offset > 0` page reuse a
+     * tree that predates the mutation and then have its indices refused as `NODE_NOT_CLICKABLE`; clearing forces that
+     * page to re-read.
+     *
+     * 0.5.4 T12: an invalidation by an action marks the snapshot [snapshotStale], so reusing one of its indices answers
+     * `SNAPSHOT_STALE` instead of the cold-read `ARGUMENTS_INVALID`. [beginTurn] deliberately does not mark it.
      */
     private fun invalidateSnapshot() {
         currentSnapshot = null
         currentSnapshotFilter = null
+        snapshotStale = true
     }
 
     override fun execute(name: String, argsJson: String): ActionResult {
@@ -314,6 +399,8 @@ class AccessibilityExecutionBackend(
         val fresh = runCatching { ui.snapshot(filter) }.getOrElse { return null }
         currentSnapshot = fresh
         currentSnapshotFilter = filter
+        // A fresh snapshot is actionable again: whatever ended the previous one is no longer the caller's situation.
+        snapshotStale = false
         return fresh
     }
 
@@ -434,7 +521,10 @@ class AccessibilityExecutionBackend(
     }
 
     private fun executeIndexClick(index: Int, longPress: Boolean): ActionResult {
-        val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
+        val snapshot = currentSnapshot ?: return refused(noSnapshotRefusal())
+        // The channel owns the snapshot and may have ended it independently (0.5.4 T12). That is staleness, not a node
+        // refusing the action, so it is refused before the node is ever asked.
+        if (!snapshotStillValid(snapshot.snapshotId)) return refused(SNAPSHOT_STALE)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
@@ -530,8 +620,12 @@ class AccessibilityExecutionBackend(
         if (trimmed.isEmpty() || trimmed.length > MAX_TEXT_CHARS) return refused(ARGUMENTS_INVALID)
         if (trimmed.any { it == '\n' || it == '\r' }) return refused(ARGUMENTS_INVALID)
 
-        val snapshot = currentSnapshot ?: return refused(ARGUMENTS_INVALID)
+        val snapshot = currentSnapshot ?: return refused(noSnapshotRefusal())
+        // 0.5.4 T12: same rule as tap/long_press - an invalidated channel snapshot is SNAPSHOT_STALE, not a node refusal.
+        if (!snapshotStillValid(snapshot.snapshotId)) return refused(SNAPSHOT_STALE)
         if (index < 0 || index >= snapshot.elements.size) return refused(ARGUMENTS_INVALID)
+        // Read-back must use the filter the acted-on snapshot was read with: indices are assigned after filtering.
+        val filter = currentSnapshotFilter ?: ScreenFilter.INTERACTIVE
 
         val before = runCatching { ui.screenFingerprint() }.getOrDefault("")
         // 0.5.4 Task 8, same dispatch position as `tap`: `input_text` is index-targeted, so it reports the same via
@@ -541,11 +635,50 @@ class AccessibilityExecutionBackend(
         // Same invalidation rule as `tap`: typing mutates the screen, so no later page may continue the old snapshot.
         invalidateSnapshot()
         if (!accepted) return refused(NODE_NOT_CLICKABLE)
+        // 0.5.4 T12: success is the field carrying the text, not the platform accepting the write. The settle window is
+        // exactly when a late UI update can appear, so it is awaited before any verdict. A field that never takes the
+        // text still keeps the pre-T12 distinction below: "nothing changed" is NO_SCREEN_CHANGE, "the screen moved but
+        // the field did not take the text" is TEXT_NOT_APPLIED.
+        if (awaitFieldText(index, filter, trimmed)) return done("typed into index $index")
         val after = runCatching { ui.screenFingerprint() }.getOrDefault("")
-        return if (after != before) done("typed into index $index") else refused(NO_SCREEN_CHANGE)
+        return if (after == before) refused(NO_SCREEN_CHANGE) else refused(TEXT_NOT_APPLIED)
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * The refusal for "no snapshot is usable now" (0.5.4 T12).
+     *
+     * [SNAPSHOT_STALE] when one was invalidated by an action (read again and the index becomes usable);
+     * [ARGUMENTS_INVALID] when the turn never read the screen (there is no index to reuse in the first place).
+     */
+    private fun noSnapshotRefusal(): String = if (snapshotStale) SNAPSHOT_STALE else ARGUMENTS_INVALID
+
+    /** Whether the channel still recognises [snapshotId]; a throwing probe fails closed as "no". */
+    private fun snapshotStillValid(snapshotId: String): Boolean =
+        runCatching { ui.isSnapshotValid(snapshotId) }.getOrDefault(false)
+
+    /**
+     * Settles and re-reads the written field (0.5.4 T12).
+     *
+     * Polls [AccessibilityUi.textAt] until the field carries [expected], bounded by the 800 ms settle window: a matching
+     * first read returns immediately, and a field that never applies the text answers `false` after the window rather
+     * than hanging the tool. A throwing or `null` read is "not observed yet", not a match. The loop is also capped by
+     * iteration count so an injected clock that does not advance still terminates.
+     */
+    private fun awaitFieldText(index: Int, filter: ScreenFilter, expected: String): Boolean {
+        val deadline = elapsedMillis() + TEXT_SETTLE_TIMEOUT_MILLIS
+        val maxPolls = (TEXT_SETTLE_TIMEOUT_MILLIS / TEXT_SETTLE_POLL_MILLIS).toInt() + 1
+        repeat(maxPolls) {
+            val actual = runCatching { ui.textAt(index, filter) }.getOrNull()
+            if (actual == expected) return true
+            val remaining = deadline - elapsedMillis()
+            if (remaining <= 0L) return false
+            val wait = minOf(TEXT_SETTLE_POLL_MILLIS, remaining)
+            if (runCatching { sleepMillis(wait) }.isFailure) return false
+        }
+        return false
+    }
 
     private fun done(detail: String) = ActionResult(ActionOutcome.Done, detail)
     private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)

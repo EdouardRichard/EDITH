@@ -44,6 +44,7 @@ class ToolAppliedSemanticsTest {
     ) : AccessibilityUi {
         val clicks = mutableListOf<String>()
         val typed = mutableListOf<String>()
+        private var typedByIndex: String? = null
         private var fingerprintCalls = 0
         private var currentSnapshot: ScreenSnapshot? = null
 
@@ -99,8 +100,12 @@ class ToolAppliedSemanticsTest {
             if (SnapshotValidator.validate(snapshotId, snap) != null) return false
             if (SnapshotValidator.validateIndex(snap, index) != null) return false
             currentSnapshot = null
+            typedByIndex = text
             return clickable
         }
+
+        // 0.5.4 T12: the fake field carries the dispatched text, so the backend's read-back can verify the write.
+        override fun textAt(index: Int, filter: ScreenFilter): String? = typedByIndex
 
         override fun structuralFingerprint(): ScreenFingerprint =
             ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)

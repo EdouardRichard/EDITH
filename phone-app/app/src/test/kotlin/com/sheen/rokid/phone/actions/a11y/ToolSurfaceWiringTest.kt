@@ -102,6 +102,9 @@ class ToolSurfaceWiringTest {
             return setTextResult
         }
 
+        // 0.5.4 T12: a field that accepts the write reads the dispatched text back, so the backend's read-back succeeds.
+        override fun textAt(index: Int, filter: ScreenFilter): String? = setTextByIndexCalls.lastOrNull()?.third
+
         override fun structuralFingerprint(): ScreenFingerprint =
             ScreenFingerprint(hash = "fake", nodeCount = nodes.size, clickableCount = nodes.count { it.clickable }, truncated = false)
     }
