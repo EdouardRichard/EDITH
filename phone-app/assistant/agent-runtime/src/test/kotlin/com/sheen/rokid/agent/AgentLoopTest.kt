@@ -2137,6 +2137,28 @@ class AgentLoopTest {
         assertEquals(2, gateway.requests.size)
     }
 
+    @Test fun `a failed tool result carrying awaitingUser does not end the run as AWAITING_USER`() {
+        // 0.5.4 Task 2 review fix: the flag means "set on a **successful** result". A failed execution that carries it
+        // anyway must not skip the no-progress guard, the repeated-error terminalization or the global circuit breaker:
+        // it falls through the ordinary failure path and the model gets its next turn.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "已问用户", awaitingUser = true) }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "没问出去")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(
+            AgentOutcome.COMPLETED, run.outcome,
+            "a failed execution never awaits the wearer: ${run.outcome}",
+        )
+        assertEquals("没问出去", run.finalText)
+        assertNull(run.safeCode)
+        assertEquals(2, gateway.requests.size, "a failed tool must not suppress the next model turn")
+        assertEquals(AgentStep(1, "notify_user", "Failed"), run.steps.single(), "the failed tool step stays visible")
+    }
+
     @Test fun `awaiting user is not a failure and keeps the tool output in history`() {
         val executor = executorOf("notify_user")
         executor.outcome = { _, _ ->

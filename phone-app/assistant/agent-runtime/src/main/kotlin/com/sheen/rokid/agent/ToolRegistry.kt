@@ -114,8 +114,10 @@ class ToolRegistry(
             stateChanging = result.stateChanging,
             images = result.images,
             nonPersistent = result.nonPersistent,
-            // 0.5.4 Task 2: the awaiting-user declaration rides through like the other per-call facts.
-            awaitingUser = result.awaitingUser,
+            // 0.5.4 Task 2: the awaiting-user declaration rides through like the other per-call facts, but only when the
+            // call really succeeded: the flag means "this successful result leaves the turn waiting for the wearer", so a
+            // failed execution that carries it must not skip the loop's failure/guard paths.
+            awaitingUser = result.awaitingUser && execution.outcome == ToolOutcome.Done,
         )
     }
 

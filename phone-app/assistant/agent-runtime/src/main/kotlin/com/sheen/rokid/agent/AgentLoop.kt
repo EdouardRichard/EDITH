@@ -1172,7 +1172,9 @@ class AgentLoop(
                 // transcript; no second model request is made, because the answer is the person's to give. This is not
                 // a failure: no safe code and no failure hint. It sits before the terminal-scope check because the
                 // awaiting declaration is the stronger verdict of the two. `finalText` is `null`: there is no model
-                // answer, and the awaiting tool's own text is its notification emit, not this run's answer.
+                // answer, and the awaiting tool's own text is its notification emit, not this run's answer. The flag is
+                // already success-filtered at the projection seam ([ToolRegistry] carries it only for a `Done`
+                // execution), so a failed result can never take this branch and skip the failure/guard paths below.
                 if (result.awaitingUser) {
                     return finish(
                         AgentOutcome.AWAITING_USER, null, null, steps, history, "", spentSteps,
