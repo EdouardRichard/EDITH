@@ -197,7 +197,7 @@ internal object ModelCatalogUi {
     const val TEST_UNAVAILABLE = "模型测试不可用"
     const val TESTING = "测试中…"
     const val TEST_PASSED = "测试通过"
-    const val IMAGE_INPUT_MISSING = "该模型未声明图片输入"
+    const val IMAGE_INPUT_MISSING = "该模型不支持图片输入"
     const val RESET_DONE = "模型目录已重置"
     const val NO_SECRET = "该提供商还没有保存 API Key。"
 

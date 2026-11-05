@@ -164,7 +164,7 @@ internal fun PermissionsSecurityScreen(
         AlertDialog(
             onDismissRequest = { discardPrompt = false },
             title = { Text(SettingsPageUi.DISCARD_TITLE) },
-            text = { Text("当前页面有未保存的修改。") },
+            text = { Text(SettingsPageUi.DISCARD_BODY) },
             confirmButton = {
                 TextButton(onClick = {
                     discardPrompt = false

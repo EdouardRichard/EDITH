@@ -177,7 +177,7 @@ internal fun AssistantBehaviorScreen(
         AlertDialog(
             onDismissRequest = { discardPrompt = false },
             title = { Text(AssistantBehaviorUi.DISCARD_TITLE) },
-            text = { Text("当前页面有未保存的修改。") },
+            text = { Text(SettingsPageUi.DISCARD_BODY) },
             confirmButton = {
                 TextButton(onClick = {
                     discardPrompt = false

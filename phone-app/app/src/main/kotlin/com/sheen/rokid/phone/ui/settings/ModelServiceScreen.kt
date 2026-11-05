@@ -357,7 +357,7 @@ private fun ModelRow(
 
 @Composable
 private fun ModelIdText(id: String) {
-    LongValueText(id, description = "查看完整模型 ID $id", style = MaterialTheme.typography.bodySmall)
+    LongValueText(id, description = ModelDetailUi.fullModelIdDescription(id), style = MaterialTheme.typography.bodySmall)
 }
 
 /** The supported-input chips; audio is explicitly reserved (design §5.6). */
@@ -387,7 +387,7 @@ private fun AddManualModelDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("上下文窗口", style = MaterialTheme.typography.bodyMedium)
+                    Text(ModelDetailUi.WINDOW, style = MaterialTheme.typography.bodyMedium)
                     HelpIcon(HelpContent.MODEL_CONTEXT_WINDOW, help)
                 }
                 OutlinedTextField(

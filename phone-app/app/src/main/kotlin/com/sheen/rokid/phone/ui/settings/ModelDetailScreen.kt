@@ -167,14 +167,17 @@ internal data class ModelDetailErrors(
 /**
  * 0.52 design §§5.6/5.7: the detail page's fixed copy and its two pure display rules.
  *
- * The audio row is deliberately a constant, not a stored field: 0.52 has no audio input path and the switch stays
- * disabled until 0.53. [thinkingVisible] is the DeepSeek-family gate; the block is not drawn for any other model.
+ * Every user-visible string the page draws lives here, including the field units, the input rows, the footer and the
+ * delete confirmation (Task 15). The audio row is deliberately a constant, not a stored field: 0.52 has no audio input
+ * path and the switch stays disabled until 0.53 ([AUDIO_ENABLED] is wired to `checked` so the row cannot drift into a
+ * different default). [thinkingVisible] is the DeepSeek-family gate; the block is not drawn for any other model.
  */
 internal object ModelDetailUi {
     const val MODEL_ID = "模型 ID"
     const val DISPLAY_NAME = "显示名"
-    const val WINDOW = "上下文窗口（K）"
+    const val WINDOW = "上下文窗口（最大输入）"
     const val OUTPUT = "最大输出（K）"
+    const val K_TOKENS = "K tokens"
     const val PRESET = "常用档位"
     val PRESETS = listOf(32, 128, 256, 1024)
     const val WINDOW_ERROR = "上下文窗口需为大于 0 的 K tokens 数值"
@@ -186,6 +189,8 @@ internal object ModelDetailUi {
 
     const val INPUTS = "支持的输入"
     const val INPUT_TEXT = "文本（必选）"
+    const val IMAGE = "图片"
+    const val AUDIO = "音频"
     const val IMAGE_SWITCH = "模型图片输入"
     const val AUDIO_SWITCH = "模型音频输入"
     const val AUDIO_DISABLED = "0.52 未接入，0.53 开放"
@@ -200,6 +205,7 @@ internal object ModelDetailUi {
     const val THINKING_MARK = "标记为 DeepSeek 思考模型"
     const val THINKING_MARK_DETAIL = "网关元数据未指明思考能力时手动启用；保存后按 DeepSeek 思考模型处理。"
     const val ADVANCED = "高级"
+    const val COLLAPSE = "收起"
 
     const val TEST_TITLE = "连接测试"
     const val TEST_TEXT = "文本测试"
@@ -218,6 +224,9 @@ internal object ModelDetailUi {
     const val DELETE_MODEL_DETAIL = "将从目录中删除，无法恢复。"
     const val ORIGIN_GATEWAY = "网关"
     const val ORIGIN_MANUAL = "手动"
+    const val FULL_MODEL_ID = "查看完整模型 ID"
+    const val FOOTER = "编辑只影响该模型；保存后立即生效。"
+    const val FOOTER_PROVIDER = "提供商"
 
     fun thinkingVisible(draft: ModelDetailDraft): Boolean = draft.thinkingSupported
 
@@ -235,6 +244,15 @@ internal object ModelDetailUi {
     /** 「上次测试：测试通过 · yyyy-MM-dd HH:mm」; the message is the view model's safe code, never a response body. */
     fun testResultText(result: ModelTestResult): String =
         "$TEST_RESULT_PREFIX：${result.message} · ${ModelCatalogUi.lastSyncText(result.testedAtEpochMillis)}"
+
+    /** The long model id's action description; the id itself is data, the wording is copy. */
+    fun fullModelIdDescription(modelId: String): String = "$FULL_MODEL_ID $modelId"
+
+    /** The delete confirmation's sentence, parameterised by the model's display name. */
+    fun deleteModelText(displayName: String): String = "「$displayName」$DELETE_MODEL_DETAIL"
+
+    /** 「编辑只影响该模型；保存后立即生效。提供商 X」. */
+    fun footer(providerName: String): String = "$FOOTER$FOOTER_PROVIDER $providerName"
 }
 
 /**
@@ -393,7 +411,7 @@ internal fun ModelDetailScreen(
         AlertDialog(
             onDismissRequest = { actions.cancelPending() },
             title = { Text(ModelCatalogUi.DELETE_MODEL_TITLE) },
-            text = { Text("「${pending.displayName}」${ModelDetailUi.DELETE_MODEL_DETAIL}") },
+            text = { Text(ModelDetailUi.deleteModelText(pending.displayName)) },
             confirmButton = {
                 TextButton(onClick = {
                     awaitingDelete = true
@@ -410,7 +428,7 @@ internal fun ModelDetailScreen(
         AlertDialog(
             onDismissRequest = { discardPrompt = false },
             title = { Text(SettingsPageUi.DISCARD_TITLE) },
-            text = { Text("当前页面有未保存的修改。") },
+            text = { Text(SettingsPageUi.DISCARD_BODY) },
             confirmButton = {
                 TextButton(onClick = {
                     discardPrompt = false
@@ -452,7 +470,7 @@ private fun DetailBody(
         Text(ModelDetailUi.MODEL_ID, style = MaterialTheme.typography.labelMedium)
         LongValueText(
             stored.id,
-            description = "查看完整模型 ID ${stored.id}",
+            description = ModelDetailUi.fullModelIdDescription(stored.id),
             modifier = Modifier.weight(1f).padding(start = 8.dp),
             style = MaterialTheme.typography.bodySmall,
         )
@@ -481,7 +499,7 @@ private fun DetailBody(
     OutlinedTextField(
         value = draft.maxInputK,
         onValueChange = { value -> onDraft(draft.copy(maxInputK = value)) },
-        label = { Text("K tokens") },
+        label = { Text(ModelDetailUi.K_TOKENS) },
         singleLine = true,
         isError = errors.window != null,
         supportingText = errors.window?.let { message -> { Text(message) } },
@@ -497,7 +515,7 @@ private fun DetailBody(
     OutlinedTextField(
         value = draft.maxOutputK,
         onValueChange = { value -> onDraft(draft.copy(maxOutputK = value)) },
-        label = { Text("K tokens") },
+        label = { Text(ModelDetailUi.K_TOKENS) },
         singleLine = true,
         isError = errors.output != null,
         supportingText = errors.output?.let { message -> { Text(message) } },
@@ -522,7 +540,7 @@ private fun DetailBody(
         Switch(checked = true, onCheckedChange = null, enabled = false)
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("图片", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Text(ModelDetailUi.IMAGE, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
         Switch(
             checked = InputModality.IMAGE in draft.inputs,
             onCheckedChange = { checked ->
@@ -541,7 +559,7 @@ private fun DetailBody(
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text("音频", style = MaterialTheme.typography.bodyMedium)
+            Text(ModelDetailUi.AUDIO, style = MaterialTheme.typography.bodyMedium)
             Text(
                 ModelDetailUi.AUDIO_DISABLED,
                 style = MaterialTheme.typography.bodySmall,
@@ -549,7 +567,7 @@ private fun DetailBody(
             )
         }
         Switch(
-            checked = false,
+            checked = ModelDetailUi.AUDIO_ENABLED,
             onCheckedChange = null,
             enabled = false,
             // `Switch` only publishes `Disabled` through the toggleable semantics it installs for a change handler;
@@ -592,7 +610,7 @@ private fun DetailBody(
     }
 
     TextButton(onClick = onToggleAdvanced) {
-        Text(if (advanced) "收起${ModelDetailUi.ADVANCED}" else ModelDetailUi.ADVANCED)
+        Text(if (advanced) "${ModelDetailUi.COLLAPSE}${ModelDetailUi.ADVANCED}" else ModelDetailUi.ADVANCED)
     }
     if (advanced) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -660,7 +678,7 @@ private fun DetailBody(
         Text(ModelDetailUi.DELETE_MODEL, color = MaterialTheme.colorScheme.error)
     }
     Text(
-        "编辑只影响该模型；保存后立即生效。提供商 ${provider.name}",
+        ModelDetailUi.footer(provider.name),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

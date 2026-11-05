@@ -44,9 +44,9 @@ class LocalCapabilitiesReasonsTest {
 
         assertEquals("MODELS_UNAVAILABLE", reasons[Capability.SystemOne])
         assertEquals("MODELS_UNAVAILABLE", reasons[Capability.Embedding])
-        // The existing page status path is what renders it, so this is the text the member actually sees.
-        assertEquals("尚不可用（MODELS_UNAVAILABLE）", LocalCapabilitiesUi.modelStatus(reasons[Capability.SystemOne]))
-        assertEquals("尚不可用（MODELS_UNAVAILABLE）", LocalCapabilitiesUi.modelStatus(reasons[Capability.Embedding]))
+        // The existing page status path is what renders it; Task 15 maps the gate code to Chinese copy.
+        assertEquals("尚不可用（模型不可用）", LocalCapabilitiesUi.modelStatus(reasons[Capability.SystemOne]))
+        assertEquals("尚不可用（模型不可用）", LocalCapabilitiesUi.modelStatus(reasons[Capability.Embedding]))
     }
 
     @Test
@@ -55,6 +55,7 @@ class LocalCapabilitiesReasonsTest {
 
         assertEquals("MODELS_PREPARING", reasons[Capability.SystemOne])
         assertEquals("MODELS_PREPARING", reasons[Capability.Embedding])
+        assertEquals("尚不可用（模型准备中）", LocalCapabilitiesUi.modelStatus(reasons[Capability.SystemOne]))
     }
 
     @Test

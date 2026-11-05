@@ -131,9 +131,9 @@ class LocalCapabilitiesTest {
         compose.onNodeWithText(LocalCapabilitiesUi.MODELS_TITLE).assertExists()
         compose.onNodeWithText("决策模型").assertExists()
         compose.onNodeWithText("语义嵌入").assertExists()
-        // Both models come from the one bundle, so both rows name the same gate refusal. The code is not in the
-        // dictionary yet; the helper's documented rule is to keep it visible rather than invent a label.
-        compose.onAllNodesWithText("尚不可用（MODELS_UNAVAILABLE）").assertCountEquals(2)
+        // Both models come from the one bundle, so both rows name the same gate refusal. Task 15 maps the gate code to
+        // the design vocabulary, so the member reads a Chinese reason instead of the raw MODELS_UNAVAILABLE code.
+        compose.onAllNodesWithText("尚不可用（模型不可用）").assertCountEquals(2)
 
         compose.onNodeWithText(LocalCapabilitiesUi.CHANNELS_TITLE).assertExists()
         compose.onNodeWithText("指令执行（Intent）").assertExists()

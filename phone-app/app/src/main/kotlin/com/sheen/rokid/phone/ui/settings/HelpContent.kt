@@ -6,8 +6,8 @@ package com.sheen.rokid.phone.ui.settings
  * **This is a migration, not a rewrite** (design §4.1). Every string below is lifted word for word from appendix
  * A1–A23 of the settings UI inventory, or — for the three entries the appendix does not cover, because 0.52 introduces
  * the model catalog — from design §5.6/§5.7. The qualifiers the appendix marks as un-droppable are kept verbatim:
- * 重启 (完全重启 App), 立即 (保存后立即生效), 下次会话/下次开始会话, and the risk boundaries (the vision upload risk,
- * the no-interception L0–L4 range, the phone-only upload-consent wording). No promise is added.
+ * 重启 (完全重启 App), 立即 (保存后立即生效 / 开启后立即生效), 下次会话/下次开始会话, and the risk boundaries (the vision
+ * upload risk, the no-interception L0–L4 range, the phone-only upload-consent wording). No promise is added.
  *
  * The object is data only: no Compose, no Android, no host types. The surfaces consume it through [HelpIcon];
  * Tasks 9–14 are its only callers.
@@ -16,10 +16,11 @@ object HelpContent {
 
     // ---------------------------------------------------------------------------------------------------------
     // Appendix A1 (restart semantics). The shared sentence is repeated verbatim in each affected option's body so
-    // that a popover read in isolation still carries the restart qualifier.
+    // that a popover read in isolation still carries the restart qualifier. Task 15 aligned the named fields with the
+    // ones that are really read at launch: the 主动辅助 switch is immediate and must not be listed here.
     // ---------------------------------------------------------------------------------------------------------
     private const val RESTART_SEMANTICS =
-        "唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），" +
+        "唤醒词、持续对话、权限上限、白名单、主动辅助冷却、敏感度等设置仅在 App 启动时读取一次（组合为进程级单例），" +
             "修改后需完全重启 App 才会生效，重新开始会话不会重新读取。"
 
     // ---------------------------------------------------------------------------------------------------------
@@ -139,7 +140,7 @@ object HelpContent {
         title = "不拦截",
         body = "开启后 L0–L4 全部工具调用不再确认，并绕过权限上限；关闭 App、被杀或重启后仍保持，只有手动关闭才退出。" +
             "卸载/清数据/删除文件等动作可能无法撤销。",
-        impact = "影响：保存后立即生效；关闭 App、被杀或重启后仍保持",
+        impact = "影响：开启后立即生效；关闭 App、被杀或重启后仍保持",
     )
 
     /** A9, complete and verbatim. */
@@ -182,7 +183,7 @@ object HelpContent {
         title = "支持的输入",
         body = "文本是必选输入；图片可开关；音频预留但 0.52 未接入，0.53 开放。" +
             "关闭图片后，该模型不可用于助手会话，模型列表的该行显示「不支持图片，助手不可用」，单选禁用。" +
-            "图片未实测时显示「未验证」，不影响选择，但会在首页/模型页提示风险。",
+            "图片未测试时显示「未验证」，不影响选择，但会在首页/模型页提示风险。",
         impact = "影响：保存后立即生效",
     )
 

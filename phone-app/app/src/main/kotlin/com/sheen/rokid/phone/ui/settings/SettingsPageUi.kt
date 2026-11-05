@@ -18,8 +18,9 @@ internal object SettingsPageUi {
     /** The row badge on a restart field. */
     const val RESTART_CHIP = "需重启"
 
-    /** The dirty-back confirmation's title and two answers (design §4.4). */
+    /** The dirty-back confirmation's title, body and two answers (design §4.4). */
     const val DISCARD_TITLE = "放弃修改？"
+    const val DISCARD_BODY = "当前页面有未保存的修改。"
     const val DISCARD_CONFIRM = "放弃"
     const val DISCARD_KEEP = "继续编辑"
 

@@ -9,13 +9,19 @@ package com.sheen.rokid.phone.ui
  * simply not come up yet. Printing the reason is what tells those two apart without either advertising something the
  * App cannot answer or hiding a code from the person reading it.
  *
+ * The bundled-model gate's `MODELS_PREPARING`/`MODELS_UNAVAILABLE` codes reach the 本地能力 rows through
+ * `localCapabilityReasons`; they are mapped here (Task 15) so the page never shows a raw readiness code. The retired
+ * user-visible wording 「模型配置不可用」 is now 「模型服务不可用」 (design §4.3).
+ *
  * An unrecognised code is returned unchanged on purpose: a future reason must stay visible instead of being replaced
  * by a label that would quietly mean something else.
  */
 internal fun capabilityReasonLabel(reason: String): String = when (reason) {
     "TRANSPORT_MISSING" -> "眼镜未连接"
     "ENGINE_MISSING" -> "本机引擎未装配"
-    "MODEL_OPERATION_UNAVAILABLE" -> "模型配置不可用"
+    "MODEL_OPERATION_UNAVAILABLE" -> "模型服务不可用"
+    "MODELS_PREPARING" -> "模型准备中"
+    "MODELS_UNAVAILABLE" -> "模型不可用"
     "DISPLAY_MISSING" -> "眼镜显示未就绪"
     "SPEECH_OUTPUT_MISSING" -> "语音输出未装配"
     "HOST_STORAGE_PROVIDER_MISSING" -> "持久存储未装配"

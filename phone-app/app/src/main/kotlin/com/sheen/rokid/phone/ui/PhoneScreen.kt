@@ -232,6 +232,20 @@ internal fun PhoneScreen(
 }
 
 /**
+ * 0.52 design §5.3 / ruling R25: the one-shot pre-catalog upgrade notice's copy.
+ *
+ * The body is the approved user-visible sentence and stays verbatim; it is the only retired-term exception the settings
+ * copy sweep allows. Keeping the strings here lets `SettingsCopyTest` whitelist exactly this body instead of every
+ * string.
+ */
+internal object FirstRunModelUpgradeUi {
+    const val TITLE = "模型配置已升级"
+    const val BODY = "模型配置方式已升级，需要重新填写服务提供商与 API Key；旧档案不会被读取。"
+    const val CONFIRM = "去配置"
+    const val LATER = "稍后"
+}
+
+/**
  * 0.52 design §5.3: the one-shot pre-catalog upgrade notice.
  *
  * Shown once when `LegacyModelConfig` reports old profiles and no v2 catalog and the persisted flag has not been set.
@@ -263,8 +277,8 @@ internal fun FirstRunModelUpgrade(
             current.markPromptShown()
             visible = false
         },
-        title = { Text("模型配置已升级") },
-        text = { Text("模型配置方式已升级，需要重新填写服务提供商与 API Key；旧档案不会被读取。") },
+        title = { Text(FirstRunModelUpgradeUi.TITLE) },
+        text = { Text(FirstRunModelUpgradeUi.BODY) },
         confirmButton = {
             TextButton(onClick = {
                 visible = false
@@ -273,13 +287,13 @@ internal fun FirstRunModelUpgrade(
                     current.markPromptShown()
                     onConfigured()
                 }
-            }) { Text("去配置") }
+            }) { Text(FirstRunModelUpgradeUi.CONFIRM) }
         },
         dismissButton = {
             TextButton(onClick = {
                 current.markPromptShown()
                 visible = false
-            }) { Text("稍后") }
+            }) { Text(FirstRunModelUpgradeUi.LATER) }
         },
     )
 }

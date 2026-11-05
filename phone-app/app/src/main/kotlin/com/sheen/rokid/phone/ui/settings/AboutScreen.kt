@@ -22,6 +22,28 @@ import androidx.compose.ui.unit.dp
 import com.sheen.rokid.phone.BuildConfig
 
 /**
+ * 0.52 design §3.8/§4.3: the About page's copy and its build-version line.
+ *
+ * [versionLine] takes the version as an argument; the page passes `BuildConfig.VERSION_NAME`, so bumping the build
+ * version updates About and the home summary together and no literal can go stale. The privacy statement uses the
+ * 0.52 product term 模型服务 instead of the retired 模型配置 wording.
+ */
+internal object AboutUi {
+    const val MODEL_SERVICE = "模型服务"
+    const val MODEL_SERVICE_DETAIL = "配置提供商与模型"
+    const val OPEN_MODEL_SERVICE = "打开模型服务"
+    const val PRIVACY_TITLE = "隐私说明（只读）"
+    const val PRIVACY_BODY =
+        "模型服务配置与 API Key 只保存在本机加密存储中；屏幕与通知内容只在会话运行时随请求发送到你配置的模型服务。" +
+            "本页只展示信息，不收集、不上传任何数据，也没有任何开关。"
+
+    /** `EDITH 0.5.2 · 预览版`: the same line the home's About row shows. */
+    fun versionLine(versionName: String): String = "EDITH $versionName · 预览版"
+
+    fun buildTypeLine(debug: Boolean): String = "构建类型：${if (debug) "调试版" else "发布版"}"
+}
+
+/**
  * 0.52 design §3.8/§6.3: the About page - version, build type, the model-service entry and the read-only privacy
  * statement. It introduces no setting of its own and does not repeat the home's other entries.
  *
@@ -34,9 +56,9 @@ internal fun AboutScreen(onOpenModelService: () -> Unit) {
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("EDITH ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.titleLarge)
+        Text(AboutUi.versionLine(BuildConfig.VERSION_NAME), style = MaterialTheme.typography.titleLarge)
         Text(
-            "构建类型：${if (BuildConfig.DEBUG) "调试版" else "发布版"}　·　预览版",
+            AboutUi.buildTypeLine(BuildConfig.DEBUG),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -47,25 +69,21 @@ internal fun AboutScreen(onOpenModelService: () -> Unit) {
             elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
         ) {
             ListItem(
-                headlineContent = { Text("模型服务") },
-                supportingContent = { Text("配置提供商与模型") },
+                headlineContent = { Text(AboutUi.MODEL_SERVICE) },
+                supportingContent = { Text(AboutUi.MODEL_SERVICE_DETAIL) },
                 trailingContent = {
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(onClickLabel = "打开模型服务", onClick = onOpenModelService)
+                    .clickable(onClickLabel = AboutUi.OPEN_MODEL_SERVICE, onClick = onOpenModelService)
                     .semantics(mergeDescendants = true) {},
             )
         }
 
         HorizontalDivider(Modifier.padding(vertical = 4.dp))
 
-        Text("隐私说明（只读）", style = MaterialTheme.typography.titleMedium)
-        Text(
-            "模型配置与 API Key 只保存在本机加密存储中；屏幕与通知内容只在会话运行时随请求发送到你配置的模型服务。" +
-                "本页只展示信息，不收集、不上传任何数据，也没有任何开关。",
-            style = MaterialTheme.typography.bodySmall,
-        )
+        Text(AboutUi.PRIVACY_TITLE, style = MaterialTheme.typography.titleMedium)
+        Text(AboutUi.PRIVACY_BODY, style = MaterialTheme.typography.bodySmall)
     }
 }
