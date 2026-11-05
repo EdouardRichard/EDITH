@@ -88,20 +88,14 @@ class ModelProfileProjectionTest {
         assertFalse(ModelProfileProjection.toProfile(provider(), entry(thinkingSupported = false)).thinkingSupported)
     }
 
-    @Test fun `a deepseek id projects as thinking capable even when the stored flag is false`() {
-        // 0.53 T8: an old catalog row that predates the derivation must become thinking-capable on projection only.
-        assertTrue(
+    @Test fun `a deepseek id no longer derives the thinking capability`() {
+        // 0.53 ruling A: the projection passes the stored capability through; the id is not a capability source.
+        assertFalse(
             ModelProfileProjection.toProfile(provider(), entry(id = "deepseek-flash", thinkingSupported = false))
                 .thinkingSupported,
         )
-        assertTrue(
-            "the family rule is case-insensitive",
-            ModelProfileProjection.toProfile(provider(), entry(id = "DeepSeek-V4-Pro", thinkingSupported = false))
-                .thinkingSupported,
-        )
         assertFalse(
-            "a non-DeepSeek id keeps its stored capability",
-            ModelProfileProjection.toProfile(provider(), entry(id = "custom-vl", thinkingSupported = false))
+            ModelProfileProjection.toProfile(provider(), entry(id = "DeepSeek-V4-Pro", thinkingSupported = false))
                 .thinkingSupported,
         )
         assertTrue(

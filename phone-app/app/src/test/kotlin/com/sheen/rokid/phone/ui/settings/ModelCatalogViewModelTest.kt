@@ -834,8 +834,8 @@ class ModelCatalogViewModelTest {
     }
 
     @Test
-    fun `a hand-added model derives its thinking capability from the id`() {
-        // 0.53 T8: manual creation must behave like gateway discovery for a DeepSeek-family id.
+    fun `a hand-added model keeps the capability field out of the decision`() {
+        // 0.53 ruling A: manual creation does not infer the family; the switch starts off and the legacy bit stays off.
         val repository = repository()
         save(repository, provider("p-1", "One", entry("m-1")))
         repository.setActiveProvider("p-1")
@@ -845,18 +845,11 @@ class ModelCatalogViewModelTest {
         model.addManualModel(manual(id = "deepseek-v4-pro"))
 
         assertNull(model.state.value.error)
-        val deepseek = requireNotNull(
+        val added = requireNotNull(
             repository.catalog().activeProvider()?.models?.firstOrNull { it.id == "deepseek-v4-pro" },
         )
-        assertTrue("a hand-added DeepSeek model is thinking-capable", deepseek.thinkingSupported)
-        assertFalse("the switch itself stays off", deepseek.thinkingEnabled)
-
-        model.addManualModel(manual(id = "custom-vl"))
-
-        val custom = requireNotNull(
-            repository.catalog().activeProvider()?.models?.firstOrNull { it.id == "custom-vl" },
-        )
-        assertFalse("an unrelated manual id is not thinking-capable", custom.thinkingSupported)
+        assertFalse("a hand-added DeepSeek id is not marked by inference", added.thinkingSupported)
+        assertFalse("the switch itself stays off", added.thinkingEnabled)
     }
 
     @Test

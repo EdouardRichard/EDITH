@@ -336,7 +336,7 @@ internal object ModelCatalogUi {
     fun chips(entry: ModelEntry, provider: Provider): List<String> = buildList {
         if (entry.origin == ModelOrigin.MANUAL) add(MANUAL_CHIP)
         if (entry.missing) add(MISSING_CHIP)
-        if (entry.thinkingEnabled && entry.thinkingSupported) add(THINKING_CHIP)
+        if (entry.thinkingEnabled) add(THINKING_CHIP)
         if (freshTextVerified(entry, provider.revision)) {
             add(VERIFIED_CHIP)
         } else if (InputModality.IMAGE in entry.inputs && !imageVerified(entry, provider.revision)) {

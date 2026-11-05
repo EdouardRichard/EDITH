@@ -33,7 +33,6 @@ import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.phone.model.catalog.CatalogValidation
 import com.sheen.rokid.phone.model.catalog.ModelEntry
 import com.sheen.rokid.phone.model.catalog.ModelField
@@ -49,9 +48,9 @@ import java.math.RoundingMode
  *
  * The page is host-free, so the value conversion and the two invariants live here: a K-token field round-trips the
  * stored tokens exactly (gateway metadata is not always a whole K), and [toEntry] adds exactly the fields the user
- * changed to [ModelEntry.overrides] so the next gateway refresh cannot silently undo an edit. [thinkingSupported] is
- * the persisted capability: it is derived from the shared DeepSeek-family rule (an id or gateway metadata saying
- * `deepseek`) plus the advanced marker, and an unsupported model can never store an enabled thinking flag.
+ * changed to [ModelEntry.overrides] so the next gateway refresh cannot silently undo an edit. [thinkingSupported] is a
+ * stored 0.52 compatibility field: 0.53 ruling A takes the system out of family judgement, so the switch is writable
+ * for every model and the legacy bit neither gates nor derives it.
  */
 internal data class ModelDetailDraft(
     val modelId: String,
@@ -73,9 +72,8 @@ internal data class ModelDetailDraft(
             inputs = entry.inputs,
             thinkingEnabled = entry.thinkingEnabled,
             thinkingEffort = entry.thinkingEffort,
-            // 0.53 T8: the shared family rule derives the capability, so an old row stored `false` still opens the
-            // switch instead of asking the user to re-mark a model the gateway already identified.
-            thinkingSupported = entry.thinkingSupported || ModelFamilies.isDeepSeekFamily(entry.id),
+            // 0.53 ruling A: pass the stored compatibility bit through unchanged; the model id is not a capability.
+            thinkingSupported = entry.thinkingSupported,
         )
 
         /**
@@ -98,18 +96,16 @@ internal data class ModelDetailDraft(
             if (output != previous.maxOutputTokens) overrides += ModelField.MAX_OUTPUT_TOKENS
             if (inputs != previous.inputs) overrides += ModelField.INPUTS
 
-            // The derived capability is an invariant of the row, not an editable value: a DeepSeek-family id stays
-            // supported even if the draft was un-marked, and an unrelated model keeps what the user marked.
-            val thinkingSupported = draft.thinkingSupported || ModelFamilies.isDeepSeekFamily(previous.id)
+            // 0.53 ruling A: the switch is stored exactly as the user set it. The legacy capability bit is neither
+            // derived nor a gate, so it can never veto an enabled switch.
             return previous.copy(
                 displayName = displayName,
                 contextWindowTokens = window,
                 maxOutputTokens = output,
                 inputs = inputs,
-                // An unsupported row cannot carry enabled thinking; the block is disabled in that case anyway.
-                thinkingEnabled = thinkingSupported && draft.thinkingEnabled,
+                thinkingEnabled = draft.thinkingEnabled,
                 thinkingEffort = draft.thinkingEffort,
-                thinkingSupported = thinkingSupported,
+                thinkingSupported = draft.thinkingSupported,
                 overrides = overrides,
             )
         }
@@ -176,8 +172,8 @@ internal data class ModelDetailErrors(
  * Every user-visible string the page draws lives here, including the field units, the input rows, the footer and the
  * delete confirmation (Task 15). The audio row is deliberately a constant, not a stored field: 0.52 has no audio input
  * path and the switch stays disabled until 0.53 ([AUDIO_ENABLED] is wired to `checked` so the row cannot drift into a
- * different default). 0.53 keeps the thinking block always visible, because "this model cannot think" is information
- * the user needs; [thinkingEditable] is the capability gate and the block states the DeepSeek-only reason when closed.
+ * different default). 0.53 ruling A keeps the thinking block always visible and always operable, with two notices
+ * instead of family detection: DeepSeek-only support, and the official output-default/caveat wording.
  */
 internal object ModelDetailUi {
     const val MODEL_ID = "模型 ID"
@@ -209,14 +205,11 @@ internal object ModelDetailUi {
     const val EFFORT_LOW = "低"
     const val EFFORT_HIGH = "高"
     const val EFFORT_MAX = "最高"
-    const val THINKING_MARK = "标记为 DeepSeek 思考模型"
-    const val THINKING_MARK_DETAIL = "网关元数据未指明思考能力时手动启用；保存后按 DeepSeek 思考模型处理。"
-    const val THINKING_MARK_DERIVED_DETAIL =
-        "该模型属于 DeepSeek 家族（模型 id 或网关元数据），已自动标记为思考模型，不能关闭。"
-    const val THINKING_ONLY_DEEPSEEK = "思考模式仅支持 DeepSeek 模型；当前模型按通用 OpenAI 协议请求。"
-    const val THINKING_SUPPORTED_HINT = "仅支持 DeepSeek 模型；开启后工具回合保留思考，思考历史随请求回传。"
-    const val ADVANCED = "高级"
-    const val COLLAPSE = "收起"
+    const val THINKING_ONLY_DEEPSEEK =
+        "思考模式仅支持 DeepSeek 模型（官方 thinking 协议）；其他模型开启后可能无效或报错。"
+    const val THINKING_DEFAULT_BUDGET_HINT =
+        "开启后工具回合保留思考，输出预算按官方默认 64K/128K。关闭表示不主动请求深度思考；" +
+            "DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。"
 
     const val TEST_TITLE = "连接测试"
     const val TEST_TEXT = "文本测试"
@@ -239,11 +232,8 @@ internal object ModelDetailUi {
     const val FOOTER = "编辑只影响该模型；保存后立即生效。"
     const val FOOTER_PROVIDER = "提供商"
 
-    /** 0.53 T9: the block is information for every model, so it is never hidden. */
+    /** 0.53 T9/ruling A: the block is always drawn for every model. */
     fun thinkingVisible(draft: ModelDetailDraft): Boolean = true
-
-    /** 0.53 T9: only a thinking-capable model can change the switch and the effort. */
-    fun thinkingEditable(draft: ModelDetailDraft): Boolean = draft.thinkingSupported
 
     fun originLabel(entry: ModelEntry): String = when (entry.origin) {
         ModelOrigin.GATEWAY -> ORIGIN_GATEWAY
@@ -298,7 +288,6 @@ internal fun ModelDetailScreen(
     val seed = remember(modelId, state.modelEditEpoch) { stored?.let(ModelDetailDraft::from) }
     var draft by remember(modelId, state.modelEditEpoch) { mutableStateOf(seed) }
     var errors by remember(modelId, state.modelEditEpoch) { mutableStateOf(ModelDetailErrors()) }
-    var advanced by remember { mutableStateOf(false) }
     var pendingTest by remember { mutableStateOf<Boolean?>(null) }
     var restoreConfirm by remember { mutableStateOf(false) }
     var discardPrompt by remember { mutableStateOf(false) }
@@ -351,10 +340,8 @@ internal fun ModelDetailScreen(
                 stored = stored,
                 draft = current,
                 errors = errors,
-                advanced = advanced,
                 help = help,
                 onDraft = { next -> draft = next; errors = ModelDetailErrors() },
-                onToggleAdvanced = { advanced = !advanced },
                 onSave = {
                     val problems = ModelDetailDraft.validate(current)
                     if (problems.any) {
@@ -465,10 +452,8 @@ private fun DetailBody(
     stored: ModelEntry,
     draft: ModelDetailDraft,
     errors: ModelDetailErrors,
-    advanced: Boolean,
     help: HelpState,
     onDraft: (ModelDetailDraft) -> Unit,
-    onToggleAdvanced: () -> Unit,
     onSave: () -> Unit,
     onTest: (Boolean) -> Unit,
     onRestore: () -> Unit,
@@ -595,9 +580,8 @@ private fun DetailBody(
         )
     }
 
-    // 0.53 T9: the block is always drawn. A non-DeepSeek model gets the disabled switch and the reason instead of a
-    // silently missing section.
-    val thinkingEditable = ModelDetailUi.thinkingEditable(draft)
+    // 0.53 ruling A: one switch + one effort row for every model. The notices say what DeepSeek-only support means;
+    // the system does not guess the family and does not disable or lock anything.
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(ModelDetailUi.THINKING, style = MaterialTheme.typography.labelMedium)
         HelpIcon(HelpContent.MODEL_THINKING, help)
@@ -609,84 +593,30 @@ private fun DetailBody(
             style = MaterialTheme.typography.bodyMedium,
         )
         Switch(
-            // A disabled switch announces its inert state explicitly (see the audio row): with no change handler the
-            // toggleable semantics are not installed, so `disabled()` is stated by hand.
-            checked = thinkingEditable && draft.thinkingEnabled,
-            onCheckedChange = if (thinkingEditable) {
-                { checked -> onDraft(draft.copy(thinkingEnabled = checked)) }
-            } else {
-                null
-            },
-            enabled = thinkingEditable,
-            modifier = Modifier.semantics {
-                contentDescription = ModelDetailUi.THINKING_SWITCH
-                if (!thinkingEditable) disabled()
-            },
+            checked = draft.thinkingEnabled,
+            onCheckedChange = { checked -> onDraft(draft.copy(thinkingEnabled = checked)) },
+            modifier = Modifier.semantics { contentDescription = ModelDetailUi.THINKING_SWITCH },
         )
     }
-    if (thinkingEditable) {
-        Text(
-            ModelDetailUi.THINKING_SUPPORTED_HINT,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(ModelDetailUi.THINKING_EFFORT, style = MaterialTheme.typography.labelMedium)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            ThinkingEffort.values().forEach { effort ->
-                FilterChip(
-                    selected = draft.thinkingEffort == effort,
-                    onClick = { onDraft(draft.copy(thinkingEffort = effort)) },
-                    label = { Text(ModelDetailUi.effortLabel(effort)) },
-                )
-            }
-        }
-    } else {
-        Text(
-            ModelDetailUi.THINKING_ONLY_DEEPSEEK,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-
-    TextButton(onClick = onToggleAdvanced) {
-        Text(if (advanced) "${ModelDetailUi.COLLAPSE}${ModelDetailUi.ADVANCED}" else ModelDetailUi.ADVANCED)
-    }
-    if (advanced) {
-        // 0.53 T8: a derived model shows the marker checked and locked, with the derivation named; only a model the
-        // family rule does not cover keeps the editable escape hatch.
-        val derivedThinking = ModelFamilies.isDeepSeekFamily(stored.id)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                ModelDetailUi.THINKING_MARK,
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Switch(
-                checked = derivedThinking || draft.thinkingSupported,
-                // A locked derived capability still needs to announce "checked, disabled": `enabled=false` with no
-                // handler would drop the toggle state entirely, so the inert handler is what installs it.
-                onCheckedChange = if (derivedThinking) {
-                    { }
-                } else {
-                    { checked ->
-                        // Un-marking a thinking model also drops the enabled flag; it can no longer be projected.
-                        onDraft(
-                            draft.copy(
-                                thinkingSupported = checked,
-                                thinkingEnabled = checked && draft.thinkingEnabled,
-                            ),
-                        )
-                    }
-                },
-                enabled = !derivedThinking,
-                modifier = Modifier.semantics { contentDescription = ModelDetailUi.THINKING_MARK },
+    Text(
+        ModelDetailUi.THINKING_ONLY_DEEPSEEK,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(ModelDetailUi.THINKING_EFFORT, style = MaterialTheme.typography.labelMedium)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        ThinkingEffort.values().forEach { effort ->
+            FilterChip(
+                selected = draft.thinkingEffort == effort,
+                onClick = { onDraft(draft.copy(thinkingEffort = effort)) },
+                label = { Text(ModelDetailUi.effortLabel(effort)) },
             )
         }
-        Text(
-            if (derivedThinking) ModelDetailUi.THINKING_MARK_DERIVED_DETAIL else ModelDetailUi.THINKING_MARK_DETAIL,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 
     Text(ModelDetailUi.TEST_TITLE, style = MaterialTheme.typography.labelMedium)

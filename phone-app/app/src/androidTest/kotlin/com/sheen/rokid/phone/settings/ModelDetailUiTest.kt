@@ -55,8 +55,8 @@ import org.junit.Test
  * The host-free draft rules (K round-trip, budget, overrides, thinking defaults, audio reservation) are covered by the
  * JVM `ModelDetailStateTest`; these cases prove what the wearer sees and taps: per-field save errors, the confirmed
  * restore that clears the edit, the upload confirmation before a synthetic probe, the conditional image test, the
- * discard guard, the always-visible thinking block with its DeepSeek-only gate, and the delete affordance that returns
- * to the model service.
+ * discard guard, the single always-visible thinking switch, and the delete affordance that returns to the model
+ * service.
  */
 class ModelDetailUiTest {
 
@@ -392,9 +392,9 @@ class ModelDetailUiTest {
     // ---- thinking / inputs --------------------------------------------------------------------------------------
 
     @Test
-    fun theThinkingBlockIsAlwaysVisibleAndGatedBySupport() {
-        val supported = model(thinkingSupported = true)
-        var current by mutableStateOf(supported)
+    fun theThinkingSwitchIsOperableForEveryModel() {
+        val deepseek = model(thinkingSupported = false)
+        var current by mutableStateOf(deepseek)
         setDetail {
             ModelDetailScreen(
                 state = stateFor(current),
@@ -405,49 +405,28 @@ class ModelDetailUiTest {
             )
         }
 
-        // DeepSeek: the block is editable, off by default, at 低, with the supported hint.
+        // 0.53 ruling A: the block and its switch are always present and operable; both notices are shown.
         compose.onNodeWithText(ModelDetailUi.THINKING).performScrollTo().assertExists()
         compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsOff().assertIsEnabled()
+        compose.onNodeWithText(ModelDetailUi.THINKING_ONLY_DEEPSEEK).assertExists()
+        compose.onNodeWithText(ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT).assertExists()
         compose.onNodeWithText(ModelDetailUi.EFFORT_LOW).assertIsSelected()
-        compose.onNodeWithText(ModelDetailUi.THINKING_SUPPORTED_HINT).assertExists()
 
-        // 0.53: a non-DeepSeek row still shows the block, but the switch is disabled and the reason is on screen.
+        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).performClick()
+        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsOn()
+        compose.onNodeWithText(ModelDetailUi.EFFORT_MAX).performClick().assertIsSelected()
+
+        // A non-DeepSeek model is not disabled and gets the same notice instead of losing the block.
         current = model(id = "custom-vl", thinkingSupported = false)
         compose.waitForIdle()
         compose.onNodeWithText(ModelDetailUi.THINKING).assertExists()
-        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsNotEnabled()
+        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsOff().assertIsEnabled()
         compose.onNodeWithText(ModelDetailUi.THINKING_ONLY_DEEPSEEK).assertExists()
-        compose.onNodeWithText(ModelDetailUi.THINKING_EFFORT).assertDoesNotExist()
 
-        // The advanced marker stays the escape hatch for a non-derived model...
-        compose.onNodeWithText(ModelDetailUi.ADVANCED).performScrollTo().performClick()
-        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_MARK).assertIsEnabled().assertIsOff()
-        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_MARK).performClick()
-        compose.waitForIdle()
-        compose.onNodeWithText(ModelDetailUi.THINKING_ONLY_DEEPSEEK).assertDoesNotExist()
-        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_SWITCH).assertIsEnabled()
+        // The 0.52 advanced marker row is gone.
+        compose.onNodeWithText("标记为 DeepSeek 思考模型").assertDoesNotExist()
 
         compose.onNodeWithContentDescription(ModelDetailUi.AUDIO_SWITCH).performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText(ModelDetailUi.AUDIO_DISABLED).assertExists()
-    }
-
-    @Test
-    fun aDerivedDeepSeekModelCannotBeUnmarked() {
-        // The stored flag is false: 0.53 derives the capability from the id, so the marker shows checked and locked.
-        val derived = model(thinkingSupported = false)
-        setDetail {
-            ModelDetailScreen(
-                state = stateFor(derived),
-                actions = ModelCatalogActions(),
-                help = rememberHelpState(),
-                modelId = derived.id,
-                registerBackGuard = {},
-            )
-        }
-
-        compose.onNodeWithText(ModelDetailUi.ADVANCED).performScrollTo().performClick()
-        compose.onNodeWithContentDescription(ModelDetailUi.THINKING_MARK).assertIsOn().assertIsNotEnabled()
-        compose.onNodeWithText(ModelDetailUi.THINKING_MARK_DERIVED_DETAIL).assertExists()
-        compose.onNodeWithText(ModelDetailUi.THINKING_ONLY_DEEPSEEK).assertDoesNotExist()
     }
 }

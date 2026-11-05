@@ -19,8 +19,8 @@ import org.junit.Test
  *
  * The page is host-free, so the K-token conversion, the budget rule and the `overrides` bookkeeping are the draft's own
  * responsibility. These cases pin the rules the Composable only renders: a window round-trips through K tokens, the
- * safety reserve is enforced, an edit protects exactly the fields it changed, thinking is a DeepSeek-family capability
- * that defaults off/low, and audio is reserved rather than editable.
+ * safety reserve is enforced, an edit protects exactly the fields it changed, thinking is a single user switch that
+ * defaults off/low for every model (0.53 ruling A: no family judgement), and audio is reserved rather than editable.
  */
 class ModelDetailStateTest {
 
@@ -136,57 +136,42 @@ class ModelDetailStateTest {
     }
 
     @Test
-    fun `the thinking block is always visible but only editable for supported models`() {
+    fun `every model shows the thinking block and can switch it on`() {
         val custom = entry(id = "custom-vl", thinkingSupported = false)
         val customDraft = ModelDetailDraft.from(custom)
         assertTrue("0.53 keeps the block visible for every model", ModelDetailUi.thinkingVisible(customDraft))
-        assertFalse("a non-DeepSeek model cannot edit thinking", ModelDetailUi.thinkingEditable(customDraft))
-        assertFalse(customDraft.thinkingSupported)
         assertFalse("thinking defaults off", customDraft.thinkingEnabled)
         assertEquals("the effort defaults to low", ThinkingEffort.LOW, customDraft.thinkingEffort)
 
-        // A model that is not a thinking model can never store an enabled thinking flag.
-        val forced = ModelDetailDraft.toEntry(customDraft.copy(thinkingEnabled = true), custom)
-        assertFalse(forced.thinkingEnabled)
-        assertFalse(forced.thinkingSupported)
+        // 0.53 ruling A: no family judgement. Any model may store the switch, and the switch never writes the legacy
+        // capability bit.
+        val on = ModelDetailDraft.toEntry(
+            customDraft.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX),
+            custom,
+        )
+        assertTrue("a non-DeepSeek model can turn thinking on", on.thinkingEnabled)
+        assertFalse("the switch never writes the legacy capability bit", on.thinkingSupported)
+        assertEquals(ThinkingEffort.MAX, on.thinkingEffort)
 
-        // The advanced marker stays the metadata-missing escape hatch for a non-DeepSeek model.
-        val marked = ModelDetailDraft.toEntry(customDraft.copy(thinkingSupported = true), custom)
-        assertTrue(marked.thinkingSupported)
-        assertTrue(ModelDetailUi.thinkingEditable(ModelDetailDraft.from(marked)))
-
-        // 0.53: a DeepSeek-family id derives the capability even when the stored row says unsupported.
+        // A DeepSeek id is not special-cased either: the stored capability is passed through, never derived.
         val deepseek = entry(id = "deepseek-flash", thinkingSupported = false)
-        val derived = ModelDetailDraft.from(deepseek)
-        assertTrue("a derived DeepSeek model is thinking-capable", derived.thinkingSupported)
-        assertTrue(ModelDetailUi.thinkingEditable(derived))
-        assertFalse("a DeepSeek model still defaults to thinking off", derived.thinkingEnabled)
-        assertEquals(ThinkingEffort.LOW, derived.thinkingEffort)
-
-        val persisted = ModelDetailDraft.toEntry(derived, deepseek)
-        assertTrue("saving a derived model persists the capability", persisted.thinkingSupported)
-        assertTrue(
-            "a derived DeepSeek model cannot be un-marked by the advanced switch",
-            ModelDetailDraft.toEntry(derived.copy(thinkingSupported = false), deepseek).thinkingSupported,
-        )
-
-        val enabled = ModelDetailDraft.toEntry(
-            derived.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX),
-            deepseek,
-        )
-        assertTrue(enabled.thinkingEnabled)
-        assertTrue(enabled.thinkingSupported)
-        assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
+        val deepseekDraft = ModelDetailDraft.from(deepseek)
+        assertTrue(ModelDetailUi.thinkingVisible(deepseekDraft))
+        assertFalse("the id no longer derives the capability", deepseekDraft.thinkingSupported)
+        assertEquals("an untouched draft rebuilds the same row", deepseek, ModelDetailDraft.toEntry(deepseekDraft, deepseek))
     }
 
     @Test
-    fun `the thinking copy names the DeepSeek-only restriction`() {
-        assertEquals("思考模式仅支持 DeepSeek 模型；当前模型按通用 OpenAI 协议请求。", ModelDetailUi.THINKING_ONLY_DEEPSEEK)
-        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("仅支持 DeepSeek 模型"))
-        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("工具回合保留思考"))
-        assertTrue(ModelDetailUi.THINKING_SUPPORTED_HINT.contains("思考历史随请求回传"))
-        assertTrue(ModelDetailUi.THINKING_MARK_DERIVED_DETAIL.contains("DeepSeek"))
-        assertTrue(ModelDetailUi.THINKING_MARK_DERIVED_DETAIL.contains("不能关闭"))
+    fun `the thinking copy states the DeepSeek-only support and the budget default`() {
+        assertEquals(
+            "思考模式仅支持 DeepSeek 模型（官方 thinking 协议）；其他模型开启后可能无效或报错。",
+            ModelDetailUi.THINKING_ONLY_DEEPSEEK,
+        )
+        assertEquals(
+            "开启后工具回合保留思考，输出预算按官方默认 64K/128K。关闭表示不主动请求深度思考；" +
+                "DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。",
+            ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
+        )
     }
 
     // Brief case: `audio is always disabled and labelled for 0.53` (0.53 contains a dot, illegal in a JVM method name).

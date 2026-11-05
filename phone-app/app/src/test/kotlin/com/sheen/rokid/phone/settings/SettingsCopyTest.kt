@@ -381,13 +381,8 @@ class SettingsCopyTest {
                 ModelDetailUi.EFFORT_LOW,
                 ModelDetailUi.EFFORT_HIGH,
                 ModelDetailUi.EFFORT_MAX,
-                ModelDetailUi.THINKING_MARK,
-                ModelDetailUi.THINKING_MARK_DETAIL,
-                ModelDetailUi.THINKING_MARK_DERIVED_DETAIL,
                 ModelDetailUi.THINKING_ONLY_DEEPSEEK,
-                ModelDetailUi.THINKING_SUPPORTED_HINT,
-                ModelDetailUi.ADVANCED,
-                ModelDetailUi.COLLAPSE,
+                ModelDetailUi.THINKING_DEFAULT_BUDGET_HINT,
                 ModelDetailUi.TEST_TITLE,
                 ModelDetailUi.TEST_TEXT,
                 ModelDetailUi.TEST_IMAGE,
@@ -576,7 +571,6 @@ class SettingsCopyTest {
         assertEquals("K tokens", ModelDetailUi.K_TOKENS)
         assertEquals("图片", ModelDetailUi.IMAGE)
         assertEquals("音频", ModelDetailUi.AUDIO)
-        assertEquals("收起", ModelDetailUi.COLLAPSE)
         assertEquals("编辑只影响该模型；保存后立即生效。提供商 DeepSeek", ModelDetailUi.footer("DeepSeek"))
         assertEquals("查看完整模型 ID m-1", ModelDetailUi.fullModelIdDescription("m-1"))
         assertEquals("「Model m-1」将从目录中删除，无法恢复。", ModelDetailUi.deleteModelText("Model m-1"))

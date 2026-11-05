@@ -20,8 +20,8 @@ import org.junit.Test
  * - every one of the 22 explanations has an option-name title and a non-blank body;
  * - the qualifiers the appendix calls out as un-droppable survive verbatim (重启 / 立即 / 下次会话 / 风险边界);
  * - the old user-visible term 「档案」 is gone;
- * - the three post-0.52 model entries follow design §5.6/§5.7 (not the appendix), and `MODEL_THINKING` carries the
- *   tool-turn fallback sentence the plan makes mandatory.
+ * - the three post-0.52 model entries follow design §5.6/§5.7 (not the appendix), and `MODEL_THINKING` states the
+ *   revised 0.53 contract (DeepSeek-only official protocol, official 64K/128K default, session-memory privacy).
  *
  * The comparisons against `DetachUi.SWITCH_SUMMARY`, `DetachUi.PROACTIVE_DETACHED_NOTE`,
  * `SmartSettingsForm.CONTINUE_DIALOGUE_PHONE_ONLY_NOTE` and `NoInterceptionUi.SWITCH_SUMMARY` are intentional: the
@@ -171,13 +171,19 @@ class HelpContentTest {
             "0.53 removed the 0.52 tool-turn fallback sentence",
             HelpContent.MODEL_THINKING.body.contains("工具回合会自动关闭思考"),
         )
-        assertTrue("the restriction is DeepSeek-only", HelpContent.MODEL_THINKING.body.contains("仅 DeepSeek 家族"))
-        assertTrue("both protocols are named", HelpContent.MODEL_THINKING.body.contains("Chat Completions"))
-        assertTrue("both protocols are named", HelpContent.MODEL_THINKING.body.contains("Responses"))
-        assertTrue("thinking is replayed with the request", HelpContent.MODEL_THINKING.body.contains("思考历史随请求回传"))
+        assertTrue(
+            "the revised design names the DeepSeek-only official protocol",
+            HelpContent.MODEL_THINKING.body.contains("仅支持 DeepSeek 官方 thinking 协议"),
+        )
+        assertTrue("the official output default is named", HelpContent.MODEL_THINKING.body.contains("64K/128K"))
+        assertTrue("the tool turn keeps thinking", HelpContent.MODEL_THINKING.body.contains("工具回合保留思考"))
         assertTrue("thinking stays in session memory", HelpContent.MODEL_THINKING.body.contains("会话内存"))
         assertTrue("thinking is never logged", HelpContent.MODEL_THINKING.body.contains("不写日志"))
-        assertTrue("the tool turn keeps thinking", HelpContent.MODEL_THINKING.body.contains("工具回合保留思考"))
+        assertTrue("the closed-state caveat is stated", HelpContent.MODEL_THINKING.body.contains("不主动请求"))
+        assertTrue(
+            "a server-side default thinking is kept and replayed",
+            HelpContent.MODEL_THINKING.body.contains("保留并回传其思考内容"),
+        )
         assertTrue(HelpContent.MODEL_THINKING.body.contains("开启更稳但更慢、消耗更多思考 token"))
         assertTrue(HelpContent.MODEL_THINKING.body.contains("默认关闭以保持当前速度"))
 

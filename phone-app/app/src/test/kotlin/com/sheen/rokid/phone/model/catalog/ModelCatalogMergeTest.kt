@@ -192,33 +192,30 @@ class ModelCatalogMergeTest {
         }
     }
 
-    @Test fun `a deepseek id is thinking capable on add refresh and restore`() {
-        // 0.53 T8: the family rule, not only the gateway metadata, decides the capability.
+    @Test fun `the merge never derives the thinking capability from the model id`() {
+        // 0.53 ruling A: only explicit gateway metadata and the built-in table mark a row; the id proves nothing.
         val added = applied(listOf(GatewayModel("deepseek-chat"))).catalog.providers.single().models.single()
-        assertTrue("a DeepSeek-family id is derived as thinking-capable", added.thinkingSupported)
-        assertFalse("the switch itself stays off", added.thinkingEnabled)
+        assertFalse("adding a DeepSeek id does not mark it", added.thinkingSupported)
 
-        val cased = applied(listOf(GatewayModel("DeepSeek-Chat"))).catalog.providers.single().models.single()
-        assertTrue("the family rule is case-insensitive", cased.thinkingSupported)
+        val declared = applied(listOf(GatewayModel("deepseek-chat", thinkingSupported = true)))
+            .catalog.providers.single().models.single()
+        assertTrue("explicit gateway metadata still marks the row", declared.thinkingSupported)
 
-        val other = applied(listOf(GatewayModel("an-unknown-model"))).catalog.providers.single().models.single()
-        assertFalse("an unrelated id is not thinking-capable", other.thinkingSupported)
+        val known = applied(listOf(GatewayModel("deepseek-v4-pro"))).catalog.providers.single().models.single()
+        assertTrue("the built-in table still declares it", known.thinkingSupported)
 
-        // A legacy row stored as unsupported is repaired by the next refresh.
+        // A legacy row stored as unsupported is not repaired by id on the next refresh.
         val legacy = catalog(provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)))
         val refreshed = applied(listOf(GatewayModel("deepseek-chat")), legacy).catalog.providers.single().models.single()
-        assertTrue(refreshed.thinkingSupported)
+        assertFalse(refreshed.thinkingSupported)
 
-        // Restore defaults reapplies the same derivation without gateway metadata.
         val restored = ModelCatalogMerge.restoreDefaults(legacy, "p-1", "deepseek-chat", GatewayModel("deepseek-chat"))
             .providers.single().models.single()
-        assertTrue(restored.thinkingSupported)
+        assertFalse("restore defaults does not derive it either", restored.thinkingSupported)
 
-        // An explicitly marked non-DeepSeek model keeps its manual capability through a refresh.
-        val manual = catalog(
-            provider(entry(id = "custom-vl", thinkingSupported = true, origin = ModelOrigin.MANUAL, lastSeenAt = 1)),
-        )
-        val kept = applied(listOf(GatewayModel("custom-vl")), manual).catalog.providers.single().models.single()
+        // A user-marked non-DeepSeek row keeps its stored capability through a refresh.
+        val marked = catalog(provider(entry(id = "custom-vl", thinkingSupported = true, lastSeenAt = 1)))
+        val kept = applied(listOf(GatewayModel("custom-vl")), marked).catalog.providers.single().models.single()
         assertTrue(kept.thinkingSupported)
     }
 

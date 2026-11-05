@@ -187,11 +187,14 @@ object HelpContent {
         impact = "影响：保存后立即生效",
     )
 
-    /** 0.53 design §5.7/T9: DeepSeek-only, both protocols, the tool-turn replay, and the session-memory privacy line. */
+    /** 0.53 design §5.7/T9 (ruling A): the notice replaces family detection, plus the budget default and caveat. */
     val MODEL_THINKING = HelpText(
         title = "深度思考",
-        body = "仅 DeepSeek 家族支持；OpenAI Responses 与 Chat Completions 两条协议都支持。" +
-            "开启后工具回合保留思考，思考历史随请求回传（只存会话内存，不写日志）。" +
+        body = "仅支持 DeepSeek 官方 thinking 协议（OpenAI Responses 与 Chat Completions 都可用）；" +
+            "其他模型开启后可能无效或报错。" +
+            "开启后工具回合保留思考，输出预算按官方默认 64K/128K。" +
+            "关闭表示不主动请求深度思考；DeepSeek 服务端可能仍有默认思考，应用会保留并回传其思考内容。" +
+            "思考内容只存本次会话内存、不写日志。" +
             "开启更稳但更慢、消耗更多思考 token；默认关闭以保持当前速度；" +
             "开启后默认「低」，可改为「高 / 最高」。",
         impact = "影响：保存后立即生效",

@@ -11,7 +11,6 @@ import com.sheen.rokid.phone.storage.CatalogProfileRepository
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.sheen.rokid.model.ModelFamilies
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
@@ -35,9 +34,8 @@ import java.util.Properties
  * globally active one, exactly the state the settings UI would produce.
  *
  * 0.53: optional `thinkingEnabled` (`true`/`false`, default `false`) and `thinkingEffort` (`LOW`/`HIGH`/`MAX`, default
- * `LOW`) seed the thinking switch for unattended device verification. The capability is derived with the shared
- * DeepSeek-family rule, so a non-DeepSeek model is never seeded enabled; the log line states the booleans and the
- * effort only, never the key.
+ * `LOW`) seed the thinking switch for unattended device verification. There is no family inference: the properties say
+ * exactly what gets seeded, and the log line states the boolean and the effort only, never the key.
  */
 class DebugProfileCreator : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -77,7 +75,6 @@ class DebugProfileCreator : BroadcastReceiver() {
             val maxOutput = prop("maxOutputTokens").toInt()
             val modelId = prop("model")
             val thinking = debugThinking(
-                modelId = modelId,
                 enabled = props.getProperty("thinkingEnabled"),
                 effort = props.getProperty("thinkingEffort"),
             )
@@ -98,7 +95,6 @@ class DebugProfileCreator : BroadcastReceiver() {
                         outputs = setOf(OutputModality.TEXT),
                         thinkingEnabled = thinking.enabled,
                         thinkingEffort = thinking.effort,
-                        thinkingSupported = thinking.supported,
                         origin = ModelOrigin.MANUAL,
                     ),
                 ),
@@ -111,8 +107,7 @@ class DebugProfileCreator : BroadcastReceiver() {
                 "EdithP5",
                 "DEBUG_CREATE_PROFILE: created provider id=${saved.id} model=$modelId " +
                     "protocol=$protocolId inputs=$inputs revision=${saved.revision} " +
-                    "thinkingSupported=${thinking.supported} thinkingEnabled=${thinking.enabled} " +
-                    "thinkingEffort=${thinking.effort}",
+                    "thinkingEnabled=${thinking.enabled} thinkingEffort=${thinking.effort}",
             )
 
             if (intent.getBooleanExtra(EXTRA_SELECT, false)) {
@@ -169,24 +164,19 @@ class DebugProfileCreator : BroadcastReceiver() {
 }
 
 /**
- * 0.53 design §5.7: the thinking seed this instrument derives from the optional properties.
+ * 0.53 design §5.7 (ruling A): the thinking seed this instrument reads from the explicit optional properties.
  *
- * A DeepSeek-family id is capable; the enabled flag is gated by that capability so the invariant "an unsupported row
- * never carries enabled thinking" also holds for this debug-only path. An unknown effort throws instead of being
- * silently mapped to a different one; the receiver's catch reports the failure.
+ * No family inference: whatever `thinkingEnabled`/`thinkingEffort` say is what gets seeded, so a device run can
+ * exercise thinking on any model. An unknown effort throws instead of being silently mapped to a different one; the
+ * receiver's catch reports the failure.
  */
 internal data class DebugThinking(
-    val supported: Boolean,
     val enabled: Boolean,
     val effort: ThinkingEffort,
 )
 
-internal fun debugThinking(modelId: String, enabled: String?, effort: String?): DebugThinking {
-    val supported = ModelFamilies.isDeepSeekFamily(modelId)
-    return DebugThinking(
-        supported = supported,
-        enabled = supported && (enabled?.trim()?.toBoolean() ?: false),
-        effort = effort?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()?.let(ThinkingEffort::valueOf)
-            ?: ThinkingEffort.LOW,
-    )
-}
+internal fun debugThinking(enabled: String?, effort: String?): DebugThinking = DebugThinking(
+    enabled = enabled?.trim()?.toBoolean() ?: false,
+    effort = effort?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()?.let(ThinkingEffort::valueOf)
+        ?: ThinkingEffort.LOW,
+)

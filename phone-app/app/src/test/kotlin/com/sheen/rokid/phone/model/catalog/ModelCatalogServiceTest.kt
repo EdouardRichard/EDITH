@@ -408,8 +408,8 @@ class ModelCatalogServiceTest {
         assertEquals(42L, repo.stored.providers.single().lastSyncedAtEpochMillis)
     }
 
-    @Test fun `restore defaults derives the thinking capability from the model id`() {
-        // 0.53 T8: a legacy row stored unsupported becomes thinking-capable for a DeepSeek-family id.
+    @Test fun `restore defaults no longer derives the thinking capability from the id`() {
+        // 0.53 ruling A: the service keeps the gateway/known-table rule; the model id proves nothing.
         val repo = FakeRepository(
             catalog(
                 provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)),
@@ -421,7 +421,7 @@ class ModelCatalogServiceTest {
 
         val restored = checkNotNull(service.restoreDefaults("p-1", "deepseek-chat"))
 
-        assertTrue(restored.thinkingSupported)
+        assertFalse(restored.thinkingSupported)
         assertEquals("deepseek-chat", repo.saveModelsCalls.single().selectedModelId)
     }
 
