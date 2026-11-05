@@ -121,7 +121,9 @@ class LoopGuardsWiringTest {
         rig.activate()
         rig.model.onRequest = { request, listener ->
             if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
-                streamText(request, listener, "接下来我会先观察屏幕，然后再提醒。")
+                // 0.5.4 Task 1: a genuine plan under the tightened marker set (no NON_PLAN_MARKERS wording), so the
+                // proactive route's `allowPlanNudge = false` is what the assertion actually exercises.
+                streamText(request, listener, "接下来我会先观察屏幕，然后提醒。")
             } else {
                 streamText(request, listener, "好。")
             }
