@@ -237,9 +237,6 @@ internal object ModelDetailUi {
     const val FOOTER = "编辑只影响该模型；保存后立即生效。"
     const val FOOTER_PROVIDER = "提供商"
 
-    /** 0.53 T9/ruling A: the block is always drawn for every model. */
-    fun thinkingVisible(draft: ModelDetailDraft): Boolean = true
-
     fun originLabel(entry: ModelEntry): String = when (entry.origin) {
         ModelOrigin.GATEWAY -> ORIGIN_GATEWAY
         ModelOrigin.MANUAL -> ORIGIN_MANUAL

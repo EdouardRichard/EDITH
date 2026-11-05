@@ -136,10 +136,9 @@ class ModelDetailStateTest {
     }
 
     @Test
-    fun `every model shows the thinking block and can switch it on`() {
+    fun `every model can switch thinking on and the save path keeps it`() {
         val custom = entry(id = "custom-vl", thinkingSupported = false)
         val customDraft = ModelDetailDraft.from(custom)
-        assertTrue("0.53 keeps the block visible for every model", ModelDetailUi.thinkingVisible(customDraft))
         assertFalse("thinking defaults off", customDraft.thinkingEnabled)
         assertEquals("the effort defaults to low", ThinkingEffort.LOW, customDraft.thinkingEffort)
 
@@ -156,9 +155,32 @@ class ModelDetailStateTest {
         // A DeepSeek id is not special-cased either: the stored capability is passed through, never derived.
         val deepseek = entry(id = "deepseek-flash", thinkingSupported = false)
         val deepseekDraft = ModelDetailDraft.from(deepseek)
-        assertTrue(ModelDetailUi.thinkingVisible(deepseekDraft))
         assertFalse("the id no longer derives the capability", deepseekDraft.thinkingSupported)
         assertEquals("an untouched draft rebuilds the same row", deepseek, ModelDetailDraft.toEntry(deepseekDraft, deepseek))
+    }
+
+    @Test
+    fun `an unrelated edit keeps a non-DeepSeek row's thinking switch`() {
+        // No Compose needed: the detail page renders the block unconditionally and only the draft/save pair carries
+        // the switch, so a round-trip proves the block's state survives every model.
+        val previous = entry(
+            id = "custom-vl",
+            thinkingSupported = false,
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.HIGH,
+        )
+        val saved = ModelDetailDraft.toEntry(
+            ModelDetailDraft.from(previous).copy(displayName = "Renamed"),
+            previous,
+        )
+        assertTrue("the switch survives an unrelated edit", saved.thinkingEnabled)
+        assertEquals("the effort survives an unrelated edit", ThinkingEffort.HIGH, saved.thinkingEffort)
+        assertFalse("the compatibility bit is neither invented nor derived", saved.thinkingSupported)
+        assertEquals(
+            "only the edited field is protected from the next refresh",
+            setOf(ModelField.DISPLAY_NAME),
+            saved.overrides,
+        )
     }
 
     @Test

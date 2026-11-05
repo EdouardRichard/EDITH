@@ -375,7 +375,8 @@ class ModelCatalogServiceTest {
         assertTrue(repo.saveModelsCalls.isEmpty())
     }
 
-    @Test fun `restore defaults without a gateway fetch falls back to the known table`() {        val repo = FakeRepository(
+    @Test fun `restore defaults without a gateway fetch falls back to the known table`() {
+        val repo = FakeRepository(
             catalog(
                 provider(
                     entry(
@@ -401,28 +402,29 @@ class ModelCatalogServiceTest {
         assertEquals(1_048_576, restored.contextWindowTokens)
         assertEquals(393_216, restored.maxOutputTokens)
         assertEquals(setOf(InputModality.TEXT), restored.inputs)
-        assertTrue(restored.thinkingSupported)
+        assertFalse("the known table fills the window, never the thinking bit", restored.thinkingSupported)
         val save = repo.saveModelsCalls.single()
         assertEquals("deepseek-v4-pro", save.selectedModelId)
         assertNull(save.lastSyncedAtEpochMillis)
         assertEquals(42L, repo.stored.providers.single().lastSyncedAtEpochMillis)
     }
 
-    @Test fun `restore defaults no longer derives the thinking capability from the id`() {
-        // 0.53 ruling A: the service keeps the gateway/known-table rule; the model id proves nothing.
+    @Test fun `restore defaults never derives the thinking capability`() {
+        // A known id (in the built-in table, which declares thinking) with a stored false must stay false: the field
+        // is storage-only, so this fails if the derivation ever returns.
         val repo = FakeRepository(
             catalog(
-                provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)),
-                selectedModelId = "deepseek-chat",
-                lastSelectedModelIdByProvider = mapOf("p-1" to "deepseek-chat"),
+                provider(entry(id = "deepseek-v4-pro", thinkingSupported = false, lastSeenAt = 1)),
+                selectedModelId = "deepseek-v4-pro",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "deepseek-v4-pro"),
             ),
         )
         val service = ModelCatalogService(repo, FakeSource(ModelListResult.Failure(ModelListError.NETWORK))) { now }
 
-        val restored = checkNotNull(service.restoreDefaults("p-1", "deepseek-chat"))
+        val restored = checkNotNull(service.restoreDefaults("p-1", "deepseek-v4-pro"))
 
         assertFalse(restored.thinkingSupported)
-        assertEquals("deepseek-chat", repo.saveModelsCalls.single().selectedModelId)
+        assertEquals("deepseek-v4-pro", repo.saveModelsCalls.single().selectedModelId)
     }
 
     @Test fun `refresh propagates the gateway truncation flag`() {

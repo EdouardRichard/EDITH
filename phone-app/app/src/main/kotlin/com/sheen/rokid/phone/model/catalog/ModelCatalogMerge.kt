@@ -114,9 +114,9 @@ object ModelCatalogMerge {
             contextWindowTokens = window,
             maxOutputTokens = output,
             inputs = inputs,
-            thinkingSupported = previous.thinkingSupported ||
-                gatewayForModel?.thinkingSupported == true ||
-                known?.thinkingSupported == true,
+            // 0.53 ruling A: the stored compatibility bit is pass-through only - restore defaults never re-derives it
+            // from the id, the gateway flag or the built-in table.
+            thinkingSupported = previous.thinkingSupported,
             overrides = emptySet(),
         )
         val models = provider.models.toMutableList().also { it[modelIndex] = restored }
@@ -147,7 +147,9 @@ object ModelCatalogMerge {
             outputs = setOf(OutputModality.TEXT),
             thinkingEnabled = false,
             thinkingEffort = ThinkingEffort.LOW,
-            thinkingSupported = gateway.thinkingSupported || known?.thinkingSupported == true,
+            // 0.53 ruling A: a new row never derives the compatibility bit; the gateway flag and the built-in table
+            // cannot write it.
+            thinkingSupported = false,
             origin = ModelOrigin.GATEWAY,
             lastSeenAtEpochMillis = nowEpochMillis,
         )
@@ -189,7 +191,8 @@ object ModelCatalogMerge {
             contextWindowTokens = window,
             maxOutputTokens = output,
             inputs = inputs,
-            thinkingSupported = previous.thinkingSupported || gateway.thinkingSupported,
+            // 0.53 ruling A: a refresh never derives the compatibility bit; the stored value is kept as-is.
+            thinkingSupported = previous.thinkingSupported,
             missing = false,
             lastSeenAtEpochMillis = nowEpochMillis,
         )

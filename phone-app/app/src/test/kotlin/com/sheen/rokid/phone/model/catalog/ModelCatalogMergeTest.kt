@@ -192,31 +192,34 @@ class ModelCatalogMergeTest {
         }
     }
 
-    @Test fun `the merge never derives the thinking capability from the model id`() {
-        // 0.53 ruling A: only explicit gateway metadata and the built-in table mark a row; the id proves nothing.
-        val added = applied(listOf(GatewayModel("deepseek-chat"))).catalog.providers.single().models.single()
-        assertFalse("adding a DeepSeek id does not mark it", added.thinkingSupported)
+    @Test fun `the merge never derives the thinking capability`() {
+        // 0.53 ruling A: the entry's compatibility bit is storage-only. The model id, the built-in table and the
+        // gateway flag must not write it: only a stored value survives.
+        val known = applied(listOf(GatewayModel("deepseek-v4-pro"))).catalog.providers.single().models.single()
+        assertFalse("a known DeepSeek id does not mark a new row", known.thinkingSupported)
 
         val declared = applied(listOf(GatewayModel("deepseek-chat", thinkingSupported = true)))
             .catalog.providers.single().models.single()
-        assertTrue("explicit gateway metadata still marks the row", declared.thinkingSupported)
+        assertFalse("the gateway capability flag does not write the entry", declared.thinkingSupported)
 
-        val known = applied(listOf(GatewayModel("deepseek-v4-pro"))).catalog.providers.single().models.single()
-        assertTrue("the built-in table still declares it", known.thinkingSupported)
+        // A stored true survives a refresh and a restore-defaults.
+        val stored = catalog(provider(entry(id = "deepseek-chat", thinkingSupported = true, lastSeenAt = 1)))
+        val refreshed = applied(listOf(GatewayModel("deepseek-chat")), stored).catalog.providers.single().models.single()
+        assertTrue("a refresh keeps the stored bit", refreshed.thinkingSupported)
 
-        // A legacy row stored as unsupported is not repaired by id on the next refresh.
-        val legacy = catalog(provider(entry(id = "deepseek-chat", thinkingSupported = false, lastSeenAt = 1)))
-        val refreshed = applied(listOf(GatewayModel("deepseek-chat")), legacy).catalog.providers.single().models.single()
-        assertFalse(refreshed.thinkingSupported)
-
-        val restored = ModelCatalogMerge.restoreDefaults(legacy, "p-1", "deepseek-chat", GatewayModel("deepseek-chat"))
+        val restored = ModelCatalogMerge.restoreDefaults(stored, "p-1", "deepseek-chat", GatewayModel("deepseek-chat"))
             .providers.single().models.single()
-        assertFalse("restore defaults does not derive it either", restored.thinkingSupported)
+        assertTrue("restore defaults keeps the stored bit", restored.thinkingSupported)
 
-        // A user-marked non-DeepSeek row keeps its stored capability through a refresh.
-        val marked = catalog(provider(entry(id = "custom-vl", thinkingSupported = true, lastSeenAt = 1)))
-        val kept = applied(listOf(GatewayModel("custom-vl")), marked).catalog.providers.single().models.single()
-        assertTrue(kept.thinkingSupported)
+        // A stored false stays false even for a known DeepSeek id whose gateway row declares the capability.
+        val legacy = catalog(provider(entry(id = "deepseek-v4-pro", thinkingSupported = false, lastSeenAt = 1)))
+        val restoredLegacy = ModelCatalogMerge.restoreDefaults(
+            legacy,
+            "p-1",
+            "deepseek-v4-pro",
+            GatewayModel("deepseek-v4-pro", thinkingSupported = true),
+        ).providers.single().models.single()
+        assertFalse("restore defaults never derives it", restoredLegacy.thinkingSupported)
     }
 
     @Test fun `blank duplicate and control-character gateway ids are skipped`() {
