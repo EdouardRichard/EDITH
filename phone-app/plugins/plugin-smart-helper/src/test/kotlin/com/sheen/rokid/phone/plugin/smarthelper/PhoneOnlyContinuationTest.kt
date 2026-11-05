@@ -410,4 +410,70 @@ class PhoneOnlyContinuationTest {
             "the queue evidence carries counts only, never the wearer's words: $lines",
         )
     }
+
+    /**
+     * 0.5.4 Task 5 fix round (review Important 1): the exit's queue predicate is freshness-aware.
+     *
+     * The take behind `openContinuation` drops a sentence older than `CONTINUATION_QUEUE_TTL_NANOS`, so a route-only
+     * predicate would log `queue_consumed` and open an **empty** listening round while that same take silently dropped
+     * the sentence - the close would no longer close. A stale slot must take the ordinary close branch instead: the
+     * close clears it via `cancelTurn`, and no continuation (empty or otherwise) is opened.
+     */
+    @Test
+    fun `continue off with a stale queued utterance closes instead of opening an empty continuation`() {
+        val (rig, display) = rig(continueDialogue = true, continueAfterAnswer = false, phoneOnly = true)
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "第一轮回答。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第一句", turnId = "asr-1")))
+        rig.tick()
+        assertEquals("第一轮回答。", rig.output.hints.single().text, "the first answer is on screen")
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
+        assertFalse(rig.plugin.canAcceptTypedMessage(), "a fresh queue owns the round while it is consumable")
+
+        val hintId = rig.output.hints.single().hintId
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            // Acknowledge while the hint is fresh: that is what arms the 1 s exit.
+            rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+            assertTrue(display.closes.isEmpty(), "the continue-off exit is one second away")
+            assertEquals(1, rig.model.requests.size, "the stale sentence has not been answered")
+
+            // Age the slot to 121 s old before the exit fires - a sentence captured during a >2 min tool round, with the
+            // fake clock standing in for the wait. Moving the clock here is safe because the exit is the only live
+            // deadline: the ack cancelled the wake's 10 s window and no speech wait is armed.
+            rig.clock.advance(121_000_000_000L)
+
+            rig.tick(1)
+        } finally {
+            P3Log.sink = previous
+        }
+
+        assertEquals(
+            listOf(AssistantRoute.WAKE),
+            display.closes,
+            "a stale queue takes the normal close branch: ${display.closes}",
+        )
+        assertEquals(1, rig.model.requests.size, "the close opens no continuation, empty or otherwise")
+        assertEquals(
+            1,
+            display.statuses.count { it == OfficialStatus.LISTENING.wire },
+            "no second, empty listening round is opened for an unanswerable sentence: ${display.statuses}",
+        )
+        assertTrue(
+            lines.any { it.contains("P3_CONV close route=WAKE reason=continue_off") },
+            "the stale slot closes on the ordinary continue-off reason: $lines",
+        )
+        assertFalse(
+            lines.any { it.contains("P3_CONV queue_consumed") },
+            "a dropped sentence must never be reported as consumed: $lines",
+        )
+        assertTrue(
+            rig.plugin.canAcceptTypedMessage(),
+            "the close cleared the stale slot; a live one would still keep the typed/BALL path busy",
+        )
+    }
 }

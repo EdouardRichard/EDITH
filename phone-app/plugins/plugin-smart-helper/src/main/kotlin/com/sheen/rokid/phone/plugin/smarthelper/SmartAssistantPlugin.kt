@@ -1120,9 +1120,18 @@ class SmartAssistantPlugin(
         cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },
         // 0.5.4 Task 5: the continue-off exit asks the plugin's single queue slot. The wearer's next sentence, said
         // while this answer was being produced, is consumed by the continuation the exit opens instead of being dropped
-        // with a close. Read under `gate`; this class never calls the cycle while holding `gate`, so the two locks
-        // keep their established order (cycle -> gate).
-        hasQueuedUtterance = { route -> synchronized(gate) { queuedUtterance?.route == route } },
+        // with a close. The predicate is **freshness-aware** (review Important 1): a slot older than the continuation
+        // TTL would be dropped by `takeQueuedUtteranceLocked` as `stale`, so claiming it here would log `queue_consumed`
+        // and open an empty continuation while the sentence vanished. A stale slot must take the ordinary close branch,
+        // which clears it through `cancelTurn`. Read under `gate`; this class never calls the cycle while holding
+        // `gate`, so the two locks keep their established order (cycle -> gate).
+        hasQueuedUtterance = { route ->
+            synchronized(gate) {
+                val queued = queuedUtterance
+                queued != null && queued.route == route &&
+                    clock.nowNanos() - queued.capturedNanos <= CONTINUATION_QUEUE_TTL_NANOS
+            }
+        },
     )
 
     // ---------------------------------------------------------------- proactive state (P3.2)
@@ -2170,8 +2179,10 @@ class SmartAssistantPlugin(
     private fun canAcceptTypedLocked(): Boolean {
         if (context == null) return false
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
-        // Since 0.5.4 Task 5 this holds in phone-only mode too: the continue-off exit opens the continuation that
-        // consumes it, so there is no dead-queue exception left to ignore.
+        // Since 0.5.4 Task 5 this holds in phone-only mode too. The point is not that both turns would answer the same
+        // sentence: a typed/BALL turn is `!continuation`, so `openTurn` clears the queue (`queuedUtterance = null`) and
+        // the sentence would be **silently dropped** inside the exit's ≤1 s window. Keeping the queue live here lets the
+        // continue-off exit consume it; there is no dead-queue exception left to ignore.
         if (queuedUtterance != null) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified

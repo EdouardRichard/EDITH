@@ -80,12 +80,14 @@ internal class ConversationCycle(
      */
     private val cancelTurn: (route: AssistantRoute, turnId: String) -> Unit = { _, _ -> },
     /**
-     * 0.5.4 Task 5: whether the plugin has a next sentence queued for [route].
+     * 0.5.4 Task 5: whether the plugin has a **fresh** next sentence queued for [route].
      *
      * The official continue-off branch closes after 1 s, but the wearer may already have said the next sentence while
      * the answer was being produced. That sentence is not a reason to end the conversation: when this is true the exit
-     * opens the continuation that consumes it instead of closing. The plugin owns the single queue slot, so the cycle
-     * only asks; `{ false }` keeps every pre-0.5.4 direct caller (including this package's tests) on the close branch.
+     * opens the continuation that consumes it instead of closing. The plugin owns the single queue slot and its TTL, so
+     * the cycle only asks; a slot past that TTL is neither consumable nor a reason to continue, and the plugin answers
+     * `false` for it so the exit takes the normal close branch (which clears it). `{ false }` keeps every pre-0.5.4
+     * direct caller (including this package's tests) on the close branch.
      */
     private val hasQueuedUtterance: (route: AssistantRoute) -> Boolean = { false },
     /** Evidence lines only; tests substitute a recorder. */
