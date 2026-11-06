@@ -286,11 +286,13 @@ anywhere and pass `-PbundledModelsDir=<dir>`; the same directory serves both the
 task and the KWS asset task. Every file is checked against the bytes and SHA-256 in
 `tools/scripts/p2/model-bundles.json`; a missing or mismatched file fails the build.
 
-**Signing.** When `.local/signing/p2-debug.keystore` exists, the debug build uses that key; otherwise
-Gradle falls back to the standard AGP debug keystore, so a fresh clone builds without extra setup. To
-use the project's debug key, place that keystore file at the path above — a newly generated key is
-valid but yields a different signature. The `release` variant is built unsigned; sign it with
-a key of your choice if you need one.
+**Signing.** The project keeps its debug signing keys in the standard Android `keystore/` folder:
+`keystore/phone-debug.keystore` for the phone app and `keystore/glasses-debug.keystore` for the glasses
+app. When a key is present the debug build uses it (that is the key the K40's installed apps were signed
+with); when it is absent Gradle falls back to the standard AGP debug keystore, so a fresh clone builds
+without extra setup. The key files are machine-local and git-ignored — copy them into `keystore/` if you
+need signature-compatible updates; a newly generated key is valid but yields a different signature.
+The `release` variant is built unsigned; sign it with a key of your choice if you need one.
 
 **Commands.**
 

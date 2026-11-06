@@ -133,8 +133,9 @@ data class KeywordHit(val keyword: String, val tokens: List<String>, val timesta
  * `OnlineStream.acceptWaveform(FloatArray, Int)` / `inputFinished()`. The same javap shows the file-based
  * entry point `newFromFile(KeywordSpotterConfig)` is **private native**, so the public route is assets only.
  *
- * Since 2026-10-09 a real KWS model (user-approved download, zh-en zipformer 3M) is present under the
- * git-ignored `.local/p3-kws-model/`; `audio-android`'s `generateKwsModelAssets` task packages it as `kws/`
+ * Since 2026-10-09 a real KWS model (user-approved download, zh-en zipformer 3M) has been provisioned in the
+ * project's model bundle (`<bundledModelsDir>/kws`, default `<repo>/../EDITH_model/k40/kws`);
+ * `audio-android`'s `generateKwsModelAssets` task packages it as `kws/`
  * assets when it is there and packages nothing when it is not (the app then reports `KWS_MODEL_MISSING`).
  * `tools/p2/engine-manifest.json` still declares only the ASR/VAD/speaker roles.
  *

@@ -86,11 +86,16 @@ androidComponents.onVariants { variant ->
 // --- KWS model assets: optional but verified ---------------------------------------------------------
 // `javap -p` on the pinned AAR shows the only public constructor is
 // `KeywordSpotter(AssetManager, KeywordSpotterConfig)` and that the file-based `newFromFile` is private
-// native, so the KWS model has to be read from `assets/`. The user-approved download lives OUTSIDE version
-// control under the git-ignored `.local/`; when it is absent this task packages nothing and a fresh clone
-// still builds and tests (the app then reports `KWS_MODEL_MISSING`).
-val kwsModelDirectory = rootProject.layout.projectDirectory
-    .dir(".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20")
+// native, so the KWS model has to be read from `assets/`. The user-approved model files live in the
+// project's model bundle (outside version control, like the other model groups): the `<bundledModelsDir>/kws`
+// directory below `-PbundledModelsDir`, defaulting to `<repo>/../EDITH_model/k40/kws`, exactly as recorded by
+// `tools/scripts/p2/model-bundles.json` and as the release tree reads it (D262/D265). When the bundle is
+// absent this task packages nothing and a fresh clone still builds and tests (the app then reports
+// `KWS_MODEL_MISSING`).
+val kwsModelDirectory = providers.gradleProperty("bundledModelsDir")
+    .map { rootProject.file(it) }
+    .getOrElse(rootProject.layout.projectDirectory.dir("../EDITH_model/k40").asFile)
+    .resolve("kws")
 
 /** The five files to ship and their measured SHA-256 (2026-10-09); any mismatch fails the build. */
 val kwsPinnedFiles = mapOf(
@@ -140,7 +145,7 @@ abstract class KwsModelAssets : DefaultTask() {
                 "the local KWS model bundle is incomplete; missing ${missing.map { it.name }.sorted()}"
             }
             logger.lifecycle(
-                "KWS model bundle absent under .local; packaging no kws/ assets " +
+                "KWS model bundle absent under ${expectedDirectory.get()}; packaging no kws/ assets " +
                     "(the app reports KWS_MODEL_MISSING)")
             return
         }
@@ -170,7 +175,7 @@ abstract class KwsModelAssets : DefaultTask() {
 }
 
 val kwsModelAssets = tasks.register<KwsModelAssets>("generateKwsModelAssets") {
-    modelFiles.from(kwsPinnedFiles.keys.map { kwsModelDirectory.file(it) })
+    modelFiles.from(kwsPinnedFiles.keys.map { kwsModelDirectory.resolve(it) })
     keywordsTemplate.set(layout.projectDirectory.file("kws/keywords.txt"))
     pinnedDigests.set(kwsPinnedFiles)
     // The app's complete build sets this root property; a standalone audio-module build keeps the old
@@ -178,7 +183,7 @@ val kwsModelAssets = tasks.register<KwsModelAssets>("generateKwsModelAssets") {
     requireBundledModels.set(project.provider {
         project.rootProject.findProperty("edithRequireBundledModels")?.toString()?.toBoolean() ?: false
     })
-    expectedDirectory.set(kwsModelDirectory.asFile.absolutePath)
+    expectedDirectory.set(kwsModelDirectory.absolutePath)
     buildDirectory.set(layout.buildDirectory)
     outputDirectory.set(layout.buildDirectory.dir("generated/kwsAssets"))
 }

@@ -37,10 +37,17 @@ android {
     }
     signingConfigs {
         getByName("debug") {
-            storeFile = rootProject.file(".local/signing/p2-debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            // Android convention: project signing material lives in the repo-root `keystore/` folder, and the
+            // keys themselves stay out of version control (see `keystore/.gitignore`). The shared debug key
+            // keeps `adb install -r` signature-compatible with the phone app already installed on the K40;
+            // when it is absent (fresh clone / CI) Gradle falls back to the AGP default debug keystore.
+            val projectDebugKeystore = rootProject.file("keystore/phone-debug.keystore")
+            if (projectDebugKeystore.isFile) {
+                storeFile = projectDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
     // `aidl` is what compiles the `IRemoteShell` interface the UserService is reached through (P3.3 Task 8).

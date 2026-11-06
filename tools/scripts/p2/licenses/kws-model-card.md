@@ -19,8 +19,8 @@ distribution audit. The project's `distributionReview` stays **Incomplete**.
 - `keywords.txt` is not part of the upstream archive. It is project-authored and
   tracked at `phone-app/perception/audio-android/kws/keywords.txt`; its exact bytes
   are pinned in `model-bundles.json`.
-- Local source directory: `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/`
-  (repo-outside build input, like the other model groups).
+- Local source directory: `<bundledModelsDir>/kws/` (on this machine
+  `D:\Project_new\EDITH_model\k40\kws/`) — a repo-outside build input, like the other model groups.
 - APK layout is unchanged from earlier releases: the five runtime files and
   `keywords.txt` are packaged as `assets/kws/` by
   `:phone-app:perception:audio-android:generateKwsModelAssets`, which keeps the

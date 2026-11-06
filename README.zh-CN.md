@@ -258,8 +258,10 @@ flowchart LR
 `-PbundledModelsDir=<目录>` 指定（App 的模型打包任务与 KWS 资产任务都读它）。每个文件都按
 `tools/scripts/p2/model-bundles.json` 校验字节数与 SHA-256，缺失或不一致会构建失败。
 
-**签名**：存在 `.local/signing/p2-debug.keystore` 时 debug 构建使用该项目密钥；不存在则回退到 AGP
-标准 debug keystore，干净克隆无需额外准备即可构建。要用项目调试密钥，把该 keystore 放到上述路径
+**签名**：项目调试密钥按 Android 常规放在仓库根 `keystore/` 目录：手机端
+`keystore/phone-debug.keystore`、眼镜端 `keystore/glasses-debug.keystore`。存在时 debug 构建使用该密钥
+（即 K40 上已装 App 的签名）；不存在则回退到 AGP 标准 debug keystore，干净克隆无需额外准备即可构建。
+密钥文件是本机文件且被 git 忽略，需要签名兼容的覆盖安装时把它们复制到 `keystore/`
 （自己新生成的密钥可用，但签名不同）。`release` 变体为未签名产物，需要时自行签名。
 
 **命令**：

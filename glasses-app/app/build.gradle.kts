@@ -22,6 +22,22 @@ android {
         }
     }
 
+    // Same Android convention as the phone app: project signing material lives in the repo-root `keystore/`
+    // folder and the keys stay out of version control. The shared glasses debug key keeps `adb install -r`
+    // signature-compatible with the glasses app already installed on the K40; when it is absent (fresh clone)
+    // Gradle falls back to the AGP default debug keystore.
+    signingConfigs {
+        getByName("debug") {
+            val projectDebugKeystore = rootProject.file("keystore/glasses-debug.keystore")
+            if (projectDebugKeystore.isFile) {
+                storeFile = projectDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     // 0.24 S2 Task 9: the debug-only Activity test host seam is gated on BuildConfig.DEBUG. AGP 9 no longer generates
     // BuildConfig unless asked, so the seam (and its release-build guard) would otherwise not compile.
     buildFeatures {

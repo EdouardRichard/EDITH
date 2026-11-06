@@ -37,8 +37,9 @@ internal interface KeywordAssetReader {
  * tokenisation only**: nothing at runtime reads it, so it is not part of [REQUIRED_FILES] and no path here
  * refers to it.
  *
- * The bundle is optional by design: the model lives outside version control under the git-ignored
- * `.local/p3-kws-model/`, so [load] returns `null` on a fresh clone and the caller reports `KWS_MODEL_MISSING`
+ * The bundle is optional by design: the model lives outside version control in the project's model bundle
+ * (`<bundledModelsDir>/kws`, default `<repo>/../EDITH_model/k40/kws`), so [load] returns `null` on a fresh
+ * clone and the caller reports `KWS_MODEL_MISSING`
  * instead of starting a wake path that cannot work.
  */
 data class KeywordAssetBundle(

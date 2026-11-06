@@ -131,8 +131,9 @@ private class OwnedKeywordStream(val stream: OnlineStream) : KeywordStreamPort {
  * `libsherpa-onnx-jni.so`, but it is not reachable from Kotlin without reflection — so the model ships as
  * `assets/kws/` (see [KeywordAssetBundle]).
  *
- * **The model is optional.** A user-approved KWS bundle is downloaded outside version control to
- * `.local/p3-kws-model/`; `generateKwsModelAssets` packages it into `assets/kws/` when present and packages
+ * **The model is optional.** A user-approved KWS bundle is downloaded outside version control into the
+ * project's model bundle (`<bundledModelsDir>/kws`, default `<repo>/../EDITH_model/k40/kws`);
+ * `generateKwsModelAssets` packages it into `assets/kws/` when present and packages
  * nothing when absent, so a fresh clone still builds and tests.
  *
  * @param bundle the packaged assets, or `null` when the local model was not packaged.
