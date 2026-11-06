@@ -3254,9 +3254,6 @@ class HostCompositionRoot internal constructor(
     }
     @Synchronized fun stop() {
         if (closed) return
-        // A stopped session has no acknowledgement in the air; the next session's first wake must not be treated as
-        // its tail (the 10 s audible ceiling is only a lost-terminal backstop).
-        wakeAckGate.reset()
         pendingStart = null
         // `D53`② (2026-10-11): stopping does **not** touch the 「主动辅助」 switch. It is a persisted global setting -
         // the user configures it once and it holds across sessions, reconnects, App restarts and phone restarts - so
@@ -3271,6 +3268,9 @@ class HostCompositionRoot internal constructor(
         // Before `host.stop()`: the epoch named by `runningAudioEpoch` is the one the loop is polling under, and
         // after teardown the input port may no longer be able to answer for it.
         disarmAudioEpoch()
+        // The next session must not inherit the previous acknowledgement's tail; reset after the input epoch is torn
+        // down so a duplicate KWS wake during teardown is still covered.
+        wakeAckGate.reset()
         try {
             host.stop()
         } finally {

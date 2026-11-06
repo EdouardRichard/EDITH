@@ -538,6 +538,21 @@ class DetachedStartTest {
     }
 
     @Test
+    fun stoppingTheSessionDropsTheAcknowledgementTail() {
+        Rig(detached = true).use { rig ->
+            rig.attach()
+            rig.start()
+            rig.root.wakeAckGate.started(rig.clock.nowNanos())
+            assertTrue("the ack is audible before the stop", rig.root.wakeAckGate.shouldSuppress(rig.clock.nowNanos()))
+
+            rig.root.stop()
+
+            assertFalse("the next session must not inherit the ack tail",
+                rig.root.wakeAckGate.shouldSuppress(rig.clock.nowNanos()))
+        }
+    }
+
+    @Test
     fun aGlassesWakeKeepsItsChimeAndNeverAsksForTheDetachedAcknowledgement() {
         Rig(detached = false).use { rig ->
             rig.attach()

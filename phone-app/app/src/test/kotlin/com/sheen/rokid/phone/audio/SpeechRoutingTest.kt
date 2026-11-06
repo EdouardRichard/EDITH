@@ -12,6 +12,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.PlaybackGate
+import com.sheen.rokid.phone.session.WakeAckGate
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.CancellationHandle
@@ -263,6 +264,14 @@ class SpeechRoutingTest {
             }
             assertTrue("the gate follows the real end, not the 150 ms echo window",
                 tail.any { it == "P3_WAKE suppressed reason=ack_echo" })
+
+            // Distinguish the FINISHED mapping from a dropped terminal: a dropped terminal leaves the gate in the
+            // audible branch for up to 10 s, while the real end + tail is over now.
+            clock.advance(WakeAckGate.DEFAULT_TAIL_NANOS)
+            assertFalse(
+                "FINISHED must move the gate out of the audible branch; a dropped terminal would still suppress",
+                root.wakeAckGate.shouldSuppress(clock.nowNanos()),
+            )
         } finally {
             root.close()
         }
