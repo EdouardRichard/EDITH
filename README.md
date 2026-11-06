@@ -20,21 +20,20 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview (version `0.5.2`). Its features are usable, but
-> performance, stability and the overall experience still need optimization. Some checks in this
-> build are partial or failed; the [0.5.2 evidence](docs/project/evidence/2026-11-04-0.52-settings-and-model-catalog.md)
-> records the exact matrix.
+> **Development status:** EDITH is under active development. Interfaces and on-device behaviour may
+> change between builds; the per-build scope, verification status and known limitations are recorded
+> in the release notes, not here.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
 operates Android apps through the accessibility service and Shizuku's shell, and communicates with
-the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run in
-**phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
-ball on the home screen and independent translucent message bubbles for replies and tool steps.
-0.5.2 rebuilds Settings around a seven-entry home page and adds a provider-based model service with
-gateway model catalogs.
+the user through text on the glasses HUD and TTS audio. The phone can also run in **phone-only
+mode**, using its own microphone and screen: a draggable EDITH-icon floating ball on the home
+screen plus independent translucent message bubbles for replies and tool steps. Settings covers the
+model service (a provider plus a gateway model catalog), assistant behaviour, runtime and
+appearance, permissions and security, local capabilities, the audit log and about.
 
 - **Phone-only mode** — Enable it in Settings and a draggable EDITH-icon ball appears on the home
   screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
@@ -70,7 +69,7 @@ gateway model catalogs.
   </a>
 </div>
 
-**Phone-only mode (0.4; renamed and extended in 0.5)** — no glasses link; wake-word wake and floating-ball dictation.
+**Phone-only mode** — no glasses link; wake-word wake and floating-ball dictation.
 
 <div align="center">
   <a href="docs/assets/videos/detached-wake.mp4">
@@ -99,10 +98,10 @@ launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-fil
 
 ## Technical routes
 
-0.4 keeps both routes and adds a phone-only mode variant of the wake route, a text/dictation
-input row on the phone, and model provisioning from APK assets. 0.5 adds the home-screen floating
-ball and independent message bubbles to phone-only mode. The default glasses configuration
-described first is unchanged.
+Both routes share the same agent turn, tools and prompts. The phone-only variant of the wake route
+uses the phone's own microphone and screen, adds the floating ball and message bubbles, and takes
+the model bundle from the APK assets. The default glasses configuration described first is
+unchanged.
 
 ### Wake-word route
 
@@ -213,11 +212,14 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
-### Phone-only mode (0.4; renamed and corrected in 0.5.1)
+### Phone-only mode
 
-The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s. In phone-only mode an answer no longer opens the automatic 10 s continuation; the next turn is dictated by long-pressing the ball.
-
-Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged. The 0.5.1 correction is a checkpoint: see the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md) for the JVM/device readings and the remaining `NotMeasured` items.
+The **phone-only mode** setting makes the wake route independent of the glasses. It also shows the
+EDITH-icon floating ball and the separate translucent message bubbles described above: drag and
+edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at
+a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s.
+In phone-only mode an answer does not open the automatic 10 s continuation; the next turn is
+dictated by long-pressing the ball.
 
 ```mermaid
 flowchart LR
@@ -235,22 +237,78 @@ With the setting off, the glasses routes above are unchanged: CXR connection, gl
 display and follow-up behavior keep their existing semantics. Phone-only mode is a local
 input/display choice, not a second CXR protocol.
 
-### Settings and model service (0.5.2)
+### Settings and model service
 
 - **Settings home**: seven entries in four groups — Model service, Assistant behavior, Runtime & appearance, Permissions & security, Local capabilities, Audit log, About. Explanations live in `(?)` popovers (close by tapping outside, pressing Back, or opening another); save/restart semantics are unchanged, restart-required rows carry a chip, and the audit page loads only when opened.
 - **Model service**: add a provider with a name, gateway base URL and API key. EDITH fetches the gateway's `GET /models` catalog, keeps user-edited fields across refreshes, supports manually added models, and marks models the gateway no longer returns instead of deleting them. Multiple providers can be stored, but only one is active globally. The catalog is stored in an encrypted v2 blob and the API key stays in Android Keystore. Old model profiles are **not migrated**: a one-time prompt asks you to re-enter a provider and key.
-- **DeepSeek thinking**: an off-by-default switch with low/high/max levels. In 0.5.2 any request that carries tools forces thinking off because reasoning history is not replayed yet; the switch applies to non-tool turns only. Full reasoning history is planned for 0.5.3.
+- **DeepSeek thinking**: an off-by-default switch with low/high/max levels. Reasoning history is captured (even with the switch off) and replayed in full on tool turns for both Chat and Responses protocols; with the switch on the build does not send `max_tokens`/`max_output_tokens` and leaves the provider's default budget in place.
 
-Version 0.5.2 is a preview checkpoint. JVM and settings UI tests pass, but the device evidence includes a failed 720×1280 / fontScale 1.5 settings-home layout and several `NotMeasured` items; do not read this as a version-level pass.
+### Agent turns and tools
+
+- **Tool surface**: 25 default tools, including `deep_link` (open an app deep link or URL through the system resolver) and `media` (play/pause/next/previous on the active media session).
+- **Turn lifecycle**: a turn can end in `AWAITING_USER` when `notify_user` asks a question (`awaiting_reply`); the next user utterance resumes the same context. Each model request has a 45 s first-token bound, tools have their own 20 s/90 s bounds, and a whole turn is capped at five minutes.
+- **Screen actions**: `read_screen` reports descriptions, bounds and centres with an offset, coordinates are validated fail-closed, the element limit is 120, and a stale element reference is re-bound once after 45 s (`STALE_REF`); text a target app did not apply reports `TEXT_NOT_APPLIED`/`SNAPSHOT_STALE` instead of pretending success.
+- **Observability**: `P3_MODEL_REQ` / `P3_ACT` / `P3_PERCEPTION` / `P3_CONV` counters and the prompt set (25 tools / app-entry recipe) are covered by JVM tests.
 
 ## Project structure
 
 - `phone-app/` — Android phone host: session and plugin host, perception, speech, model runtime, native action channels (accessibility / Shizuku)
 - `glasses-app/` — glasses CustomApp: CXR-S bridge, overlay panel and rendering
 - `common/` — contracts and presentation / output modules shared by both ends
-- `tools/` — probes, evaluation harness and scripts (not shipped)
-- `third_party/` — vendored build inputs such as the CXR SDK
-- `docs/` — project documents, evidence, brand and demo assets
+- `tools/` — probes, evaluation harness and build scripts (not shipped in the APKs)
+- `third_party/` — vendored build inputs (the CXR SDK AARs are tracked here)
+- `assets/` — README brand and demo media (logo, preview GIFs, full demo videos)
+
+## Build from source
+
+Everything the build needs is tracked in this repository except the on-device model bundle, which is
+distributed separately (it is about 1.0 GiB and never enters git).
+
+**Toolchain.** JDK 17 on `JAVA_HOME` (or `java` on `PATH`), Android SDK Platform 35 through
+`ANDROID_HOME`/`ANDROID_SDK_ROOT` or `sdk.dir` in `local.properties`, and the tracked Gradle wrapper
+9.4.1. The first build resolves dependencies from `google()` and `mavenCentral()`, so it needs network
+access; later builds work offline.
+
+**Vendored SDK binaries.** The CXR-Link SDK AARs and the sherpa-onnx runtime are tracked because the
+build hash-checks them:
+
+| Path | Bytes | SHA-256 (prefix) |
+| --- | ---: | --- |
+| `third_party/cxr/vendor/client-l-1.1.2.aar` | 171,307 | `4E79963F...` |
+| `third_party/cxr/vendor/cxr-service-bridge-1.0-20260715.121510-107.aar` | 1,126,241 | `0A76387E...` |
+| `phone-app/perception/audio-android/libs/sherpa-onnx-1.13.8.aar` | 50,129,134 | `633C2432...` |
+
+**Model bundle.** Download the K40 model bundle from the public share
+(<https://pan.quark.cn/s/d53caa9e395f?pwd=veEd>) and unpack it so the layout is
+`<repo>/../EDITH_model/k40/` (a sibling of the repository) with `engine-models-import/`, `files/`,
+`embeddinggemma/` and `kws/` inside — 20 pinned files, about 1.06 GiB. Alternatively keep the bundle
+anywhere and pass `-PbundledModelsDir=<dir>`; the same directory serves both the app's bundled-model
+task and the KWS asset task. Every file is checked against the bytes and SHA-256 in
+`tools/scripts/p2/model-bundles.json`; a missing or mismatched file fails the build.
+
+**Signing.** When `.local/signing/p2-debug.keystore` exists, the debug build uses that key; otherwise
+Gradle falls back to the standard AGP debug keystore, so a fresh clone builds without extra setup. To
+use the project's debug key, place that keystore file at the path above — a newly generated key is
+valid but yields a different signature. The `release` variant is built unsigned; sign it with
+a key of your choice if you need one.
+
+**Commands.**
+
+```powershell
+# Complete phone APK (with the model bundle)
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=<path-to>/EDITH_model/k40
+
+# Glasses CustomApp
+.\gradlew.bat :glasses-app:app:assembleDebug
+
+# JVM tests (no device attached)
+.\gradlew.bat test
+
+# Development/CI phone build without the model bundle (release variants refuse it)
+.\gradlew.bat :phone-app:app:assembleDebug -PwithoutBundledModels=true
+```
+
+The APKs land under `phone-app/app/build/outputs/apk/` and `glasses-app/app/build/outputs/apk/`.
 
 ## Notes
 
@@ -317,17 +375,19 @@ file digest always changes the receipt. The license and declaration texts (15 te
 `assets/models/licenses/`. On first launch and each APK update that changes the bundle, the app
 verifies and materializes the assets again; an unchanged bundle is reused.
 
-**Development builds.** The model binaries are not committed. To build a complete APK, stage them
-and point `-PbundledModelsDir` at the staging directory:
+**Development builds.** The model binaries are not committed. Download the K40 bundle from the public
+share (link in [Build from source](#build-from-source)), then stage it and point
+`-PbundledModelsDir` at the staging directory:
 
 ```powershell
-.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=D:\Project_new\EDITH_model\k40
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=<path-to>/EDITH_model/k40
 ```
 
-The default is `<repo>/../EDITH_model/k40` (the K40 bundle), with `engine-models-import/`, `files/`
-and `embeddinggemma/` subdirectories plus `kws/` for the KWS models. The tracked `keywords.txt`
-stays in `phone-app/perception/audio-android/kws/`. A complete build requires every file; a missing
-or mismatched file fails the build.
+The default is `<repo>/../EDITH_model/k40` (the K40 bundle), with `engine-models-import/`, `files/`,
+`embeddinggemma/` and `kws/` subdirectories. The KWS asset task reads `kws/` from the same directory
+(or the same `-PbundledModelsDir` override). The tracked `keywords.txt` stays in
+`phone-app/perception/audio-android/kws/`. A complete build requires every file; a missing or
+mismatched file fails the build.
 
 For development/CI only, `-PwithoutBundledModels=true` omits `assets/models/**` and sets
 `BuildConfig.BUNDLED_MODELS=false`. **Release variants reject this switch**; it must never produce
