@@ -13,6 +13,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
+import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
@@ -245,9 +246,23 @@ class SpeechRoutingTest {
             engine.fireStart("detached-wake-ack")
             assertTrue("the audible interval is muted", window.covers(clock.nowNanos()))
 
+            val audible = withP3Sink { captured ->
+                root.emitWake(root.host, "伊迪丝", 1.0)
+                captured.toList()
+            }
+            assertTrue("the production player callback arms the ack gate",
+                audible.any { it == "P3_WAKE suppressed reason=ack_echo" })
+
             engine.fireDone("detached-wake-ack")
             clock.advance(151_000_000L)
             assertFalse("one reverb tail after the end, the mic is live again", window.covers(clock.nowNanos()))
+
+            val tail = withP3Sink { captured ->
+                root.emitWake(root.host, "伊迪丝", 1.0)
+                captured.toList()
+            }
+            assertTrue("the gate follows the real end, not the 150 ms echo window",
+                tail.any { it == "P3_WAKE suppressed reason=ack_echo" })
         } finally {
             root.close()
         }

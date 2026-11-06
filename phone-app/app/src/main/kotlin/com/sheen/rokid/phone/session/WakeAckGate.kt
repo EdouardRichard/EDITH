@@ -14,7 +14,7 @@ package com.sheen.rokid.phone.session
  * A wake while audible, or within [tailNanos] after the real end, is dropped whole: no acknowledgement and no
  * `WakeDetected` event (a second admit would open a ten-second turn with no user speech).
  *
- * Not thread-safe by lock; both fields are [Volatile] because the player's callbacks run on its playback thread while
+ * Not thread-safe by lock; all three fields are [Volatile] because the player's callbacks run on its playback thread while
  * [shouldSuppress] is read on the audio loop. Only monotonic timestamps are expected; a backwards clock fails open
  * (no suppression) rather than muting forever.
  */

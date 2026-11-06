@@ -2784,7 +2784,7 @@ class HostCompositionRoot internal constructor(
         // open a ten-second wake turn with no user speech. The gate is driven by the player's STARTED/FINISHED
         // callbacks, so a cold TTS start that takes seconds does not shorten it and a never-audible ack arms nothing.
         val now = clock.nowNanos()
-        if (wakeAckGate.shouldSuppress(now)) {
+        if (detachGate.enabled.value && wakeAckGate.shouldSuppress(now)) {
             P3Log.line("P3_WAKE suppressed reason=ack_echo")
             return
         }
@@ -3254,6 +3254,9 @@ class HostCompositionRoot internal constructor(
     }
     @Synchronized fun stop() {
         if (closed) return
+        // A stopped session has no acknowledgement in the air; the next session's first wake must not be treated as
+        // its tail (the 10 s audible ceiling is only a lost-terminal backstop).
+        wakeAckGate.reset()
         pendingStart = null
         // `D53`② (2026-10-11): stopping does **not** touch the 「主动辅助」 switch. It is a persisted global setting -
         // the user configures it once and it holds across sessions, reconnects, App restarts and phone restarts - so
