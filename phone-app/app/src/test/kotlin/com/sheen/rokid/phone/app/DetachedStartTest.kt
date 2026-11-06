@@ -501,6 +501,29 @@ class DetachedStartTest {
         }
     }
 
+    /**
+     * A KWS false hit from the acknowledgement's own tail arrives a few hundred ms after the player reports the end
+     * (K70 2026-11-06: 145 ms), i.e. just inside the current 150 ms echo tail, and the second wake spoke "我在" again
+     * even though the plugin refused a second turn. The ack is not a wake the wearer asked for twice.
+     */
+    @Test
+    fun aSecondWakeInsideTheAckDebounceDoesNotSpeakTheAcknowledgementAgain() {
+        Rig(detached = true).use { rig ->
+            rig.attach()
+            rig.start()
+            val acks = mutableListOf<String>()
+            val speak: (String) -> Boolean = { text -> acks += text; true }
+
+            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+            assertEquals("the acknowledgement's own tail must not shout it again", listOf("我在"), acks)
+
+            rig.clock.advance(4_000_000_000L)
+            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+            assertEquals("after the debounce a real second wake is acknowledged", listOf("我在", "我在"), acks)
+        }
+    }
+
     @Test
     fun aGlassesWakeKeepsItsChimeAndNeverAsksForTheDetachedAcknowledgement() {
         Rig(detached = false).use { rig ->

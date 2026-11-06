@@ -2739,6 +2739,9 @@ class HostCompositionRoot internal constructor(
 
     private var wakeAckPlayer: AndroidSpeechPlayer? = null
 
+    /** Last detached acknowledgement onset; a wake inside [WAKE_ACK_DEBOUNCE_NANOS] is the ack's own tail, not a user. */
+    @Volatile private var lastWakeAckAtNanos: Long = Long.MIN_VALUE
+
     /**
      * 0.5.1 C5: the composition's one echo-mute window, handed to every player [create] and [setSpeechEnabled] build.
      *
@@ -2774,15 +2777,23 @@ class HostCompositionRoot internal constructor(
         // plays, and the turn times out with no `P3_ASR` while KWS keeps working (K70 2026-11-06; only force-stop
         // repaired it). `rearmPipeline` is a no-op unless the pipeline is actually paused.
         audioChain?.rearmPipeline("wake")
+        // The acknowledgement's own tail can be detected as a second wake just after the player reports the end
+        // (K70: 145 ms after onDone). Do not speak another acknowledgement for it; the plugin still receives the
+        // wake event and decides whether a turn may open.
+        val now = clock.nowNanos()
+        val duplicateAck = detachGate.enabled.value &&
+            lastWakeAckAtNanos != Long.MIN_VALUE &&
+            now - lastWakeAckAtNanos < WAKE_ACK_DEBOUNCE_NANOS
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
             // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
             // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the installed player opens at the
             // audible onset (0.5.1 C5: the ack must not open it itself - the player is the single owner).
-            val acknowledged = detachGate.enabled.value &&
+            val acknowledged = detachGate.enabled.value && !duplicateAck &&
                 runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
-            if (!acknowledged) chime()
+            if (acknowledged) lastWakeAckAtNanos = now
+            if (!acknowledged && !duplicateAck) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
@@ -3437,6 +3448,13 @@ class HostCompositionRoot internal constructor(
     companion object {
         /** Detached mode's one fixed wake acknowledgement (owner decision 2026-10-27). */
         internal const val DETACHED_WAKE_ACK_TEXT = "我在"
+
+        /**
+         * No second acknowledgement inside this window: the acknowledgement is ~2.8 s and KWS can report its tail
+         * ~150 ms after the player's end. A real second wake is still delivered as an event; only the spoken copy is
+         * suppressed.
+         */
+        internal const val WAKE_ACK_DEBOUNCE_NANOS = 4_000_000_000L
 
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
