@@ -52,8 +52,9 @@ class ContextManagerTest {
     }
 
     /**
-     * The fixture profile's limits. The defaults match `smartProfile`: a 2 000-token hard input out of a 4 000-token
-     * usable window after the output and safety reservations.
+     * The fixture profile's limits for this suite's policy math: a 2 000-token hard input out of a 4 000-token usable
+     * window after the output and safety reservations. They are passed explicitly so the assertions do not depend on
+     * the plugin rig fixture's own window.
      */
     private fun policy(
         inputBudgetTokens: Int = 2_000,

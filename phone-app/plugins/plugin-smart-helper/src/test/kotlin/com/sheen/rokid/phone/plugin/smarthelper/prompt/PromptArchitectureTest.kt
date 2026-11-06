@@ -23,7 +23,7 @@ import kotlin.test.assertTrue
  * 3. prompt resources live only in the allowed directories;
  * 4. `RequestLayout` rejects a dynamic segment **and** a runtime placeholder in the system slot;
  * 5. `PromptCatalog` rejects unresolved placeholders and static/dynamic slot mixing;
- * 6. the prompt names exactly the 24 tools `ToolLabelMap` registers (descriptor prose coverage is
+ * 6. the prompt names exactly the 25 tools `ToolLabelMap` registers (descriptor prose coverage is
  *    A5's `ToolContractTest`; this test pins the prompt ↔ face coupling instead of duplicating it).
  *
  * Rules 1–2 reuse [ProductionSourceScan], the same scanner [SourceHardcodeGuardTest] exercises, so
@@ -254,12 +254,12 @@ class PromptArchitectureTest {
         PromptCatalog.parseManifest("x\t$file\t$kind\t1\tdescription") { body }
 
     private companion object {
-        /** The 23-tool default face after the 2026-10-22 retirement, the same set A5's `ToolContractTest` owns. */
+        /** The 25-tool default face after 0.5.4's `deep_link`/`media`, the same set A5's `ToolContractTest` owns. */
         val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
             "read_screen", "tap", "long_press", "scroll", "input_text",
             "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
             "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-            "list_apps", "system_action",
+            "list_apps", "system_action", "deep_link", "media",
             "device", "shell", "open", "dial",
             "notify_user", "load_skill",
         )

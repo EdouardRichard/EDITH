@@ -20,13 +20,16 @@ import kotlin.test.assertTrue
  * - the same route + profile is deterministic (same text, same hash);
  * - each of the three routes selects exactly its own posture, and the manifest must list all three;
  * - the loop/pinned/summarizer resources load through their accessors and never enter a system plan;
- * - `core/20-tools.md` describes exactly the 24-tool default face (0.3 Phase 4A).
+ * - `core/20-tools.md` describes exactly the 25-tool default face (0.3 Phase 4A, plus 0.5.4's `deep_link`/`media`).
+ * - `core/15-app-entry.md` carries the app task flow: SKILL catalog first, verified steps, fallback and no invented
+ *   deep-link target (0.5.4 Task 16).
  */
 class PromptCatalogTest {
 
     private val coreIds = listOf(
         "core.identity",
         "core.operating",
+        "core.app-entry",
         "core.tools",
         "core.safety",
         "core.output",
@@ -86,6 +89,7 @@ class PromptCatalogTest {
         listOf(
             "core/00-identity.md",
             "core/10-operating.md",
+            "core/15-app-entry.md",
             "core/20-tools.md",
             "core/30-safety.md",
             "core/40-output.md",
@@ -106,7 +110,7 @@ class PromptCatalogTest {
             kindOf["pinned/proactive-gate-options.md"],
             "the gate options are frozen with the question they belong to",
         )
-        assertEquals(18, entries.size, "the 0.5.1 catalog has exactly eighteen resources")
+        assertEquals(19, entries.size, "the 0.5.4 catalog has exactly nineteen resources")
     }
 
     @Test
@@ -154,13 +158,60 @@ class PromptCatalogTest {
     }
 
     @Test
-    fun `the tools prompt names the twenty three tool face and no route only tool`() {
+    fun `the tools prompt names the twenty five tool face and no route only tool`() {
         val tools = promptText("core/20-tools.md")
 
         DEFAULT_TOOL_NAMES.forEach { name ->
             assertTrue(mentions(tools, name), "core/20-tools.md must name the advertised tool '$name'")
         }
         assertFalse(mentions(tools, "propose_hint"), "propose_hint is advertised only on the hint turn, not in core")
+    }
+
+    @Test
+    fun `the app entry section runs the SKILL catalog first and verifies every step`() {
+        val entry = promptText("core/15-app-entry.md")
+
+        assertTrue("SKILL 目录" in entry, "the app task starts from the injected SKILL catalog")
+        assertTrue("load_skill" in entry, "a matching SKILL must be pulled before acting")
+        listOf("deep_link", "media", "read_screen").forEach {
+            assertTrue(it in entry, "the app entry rules must name the '$it' leg")
+        }
+        assertTrue("验证" in entry, "each step must be verified, not assumed")
+        assertTrue("回退" in entry, "a missing entry needs a fallback order")
+    }
+
+    @Test
+    fun `the app entry section forbids invented deep link targets and requires confirmation for transactions`() {
+        val entry = promptText("core/15-app-entry.md")
+
+        assertTrue("uri" in entry && "package" in entry, "deep_link's uri/package are the values that must never be invented")
+        assertTrue("不要自己拼" in entry, "a URI must not be assembled from memory")
+        assertTrue("猜" in entry, "a package or scheme must not be guessed")
+        assertTrue(
+            "交易" in entry && "支付" in entry && "确认" in entry,
+            "a transactional deep link needs explicit user confirmation before it opens",
+        )
+    }
+
+    @Test
+    fun `the app entry section keeps the lock screen inside the platform unlock gate`() {
+        val entry = promptText("core/15-app-entry.md")
+
+        assertTrue("锁屏" in entry, "the app flow must name the locked-phone case")
+        assertTrue("解锁" in entry, "the locked phone is opened by the platform unlock gate")
+        assertTrue("shell" in entry && "绕过" in entry, "shell must not be used to bypass the lock screen")
+    }
+
+    @Test
+    fun `the operating loop asks the user and changes strategy after two failures`() {
+        val operating = promptText("core/10-operating.md")
+
+        assertTrue("awaiting_reply" in operating, "a question must pause the turn on notify_user.awaiting_reply")
+        assertTrue("进度" in operating, "progress reporting must not set awaiting_reply")
+        assertTrue("ASR" in operating, "the input is ASR and its entities can be misheard")
+        assertTrue("确认" in operating, "an uncertain entity is confirmed before acting")
+        assertTrue("两次" in operating, "the same action stops after two failures")
+        assertTrue("策略" in operating, "a repeated failure must change strategy or ask the user")
     }
 
     @Test
@@ -205,6 +256,7 @@ class PromptCatalogTest {
             listOf(
                 "core.identity",
                 "core.operating",
+                "core.app-entry",
                 "core.tools",
                 "core.safety",
                 "core.output",
@@ -386,12 +438,12 @@ class PromptCatalogTest {
     }
 
     private companion object {
-        /** The 23-tool default face after the 2026-10-22 retirement; the same set `ToolFaceFixture` reads from production. */
+        /** The 25-tool default face after 0.5.4's `deep_link`/`media`; the same set `ToolFaceFixture` reads from production. */
         val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
             "read_screen", "tap", "long_press", "scroll", "input_text",
             "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
             "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-            "list_apps", "system_action",
+            "list_apps", "system_action", "deep_link", "media",
             "device", "shell", "open", "dial",
             "notify_user", "load_skill",
         )

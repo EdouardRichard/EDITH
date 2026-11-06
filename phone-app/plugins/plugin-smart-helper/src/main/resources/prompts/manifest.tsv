@@ -1,6 +1,7 @@
 core.identity	core/00-identity.md	STATIC	1	身份与两条链路
-core.operating	core/10-operating.md	STATIC	1	工作循环与证据规则
-core.tools	core/20-tools.md	STATIC	3	工具纪律（24 工具两档路由）
+core.operating	core/10-operating.md	STATIC	2	工作循环与证据规则
+core.app-entry	core/15-app-entry.md	STATIC	1	应用任务流：SKILL 目录、深链与媒体、锁屏与回退
+core.tools	core/20-tools.md	STATIC	4	工具纪律（25 工具两档路由）
 core.safety	core/30-safety.md	STATIC	1	安全与确认
 core.output	core/40-output.md	STATIC	2	输出契约
 core.memory-policy	core/50-memory-policy.md	STATIC	1	记忆策略
