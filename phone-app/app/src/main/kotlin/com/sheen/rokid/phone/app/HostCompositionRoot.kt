@@ -2769,6 +2769,11 @@ class HostCompositionRoot internal constructor(
         ack: (String) -> Boolean = { false },
         chime: () -> Unit = {},
     ) {
+        // A KWS hit is an explicit new input, not a continuation of the turn that faulted. A provider fault pauses
+        // the process-lifetime pipeline for the whole session; without this re-arm the wake turn opens, the ack
+        // plays, and the turn times out with no `P3_ASR` while KWS keeps working (K70 2026-11-06; only force-stop
+        // repaired it). `rearmPipeline` is a no-op unless the pipeline is actually paused.
+        audioChain?.rearmPipeline("wake")
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase

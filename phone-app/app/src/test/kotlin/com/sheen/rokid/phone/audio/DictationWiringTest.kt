@@ -465,6 +465,39 @@ class DictationWiringTest {
     }
 
     /**
+     * A KWS hit is an explicit new input: a pipeline paused by a provider fault must be re-armed for the wake,
+     * otherwise the wake turn opens, the acknowledgement plays and the turn times out with no `P3_ASR` while KWS
+     * keeps working - the exact K70 failure (2026-11-06) that only force-stop repaired.
+     */
+    @Test
+    fun aKwsWakeReArmsAPipelinePausedByAProviderFault() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            rig.pipelineVad.failure = IllegalStateException("synthetic provider failure")
+            rig.feedPhone()
+            rig.pipelineVad.failure = null
+            val framesAtPause = rig.asr.frames.size
+            rig.feedPhone()
+            assertEquals("the fault paused intake for this session", framesAtPause, rig.asr.frames.size)
+
+            val lines = withP3Sink { captured ->
+                rig.root.emitWake(rig.root.host, "伊迪丝", 1.0)
+                rig.pipelineVad.decision = VadDecision(true, true)
+                rig.feedPhone()
+                captured.toList()
+            }
+            assertTrue(
+                "a wake must re-arm the paused pipeline; lines=" + lines.joinToString(" | "),
+                lines.any { it == "P3_PIPELINE state=rearmed reason=wake" },
+            )
+            assertTrue(
+                "the wake turn's audio must reach the recognizer; frames=${rig.asr.frames.size}",
+                rig.asr.frames.size > framesAtPause,
+            )
+        }
+    }
+
+    /**
      * The keyword-spotting hit is the other explicit input that re-opens the route: the composition's `wakeEmit`
      * calls exactly this chain method on the same frame the detector fires, before the wake turn's ASR final lands.
      */
