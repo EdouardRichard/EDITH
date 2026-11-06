@@ -294,10 +294,15 @@ class AnswerEmitIdentityIntegrationTest {
         val display = RecordingDisplay()
         val device = DeferredHintDevice()
         val model = ScriptedModel()
+        // 0.5.4 Task 18: test-only fixture widening. The 25-tool + app-entry system prompt is a fixed, non-trimmable
+        // cost that no longer fits the legacy 2 048-token hard input, so every turn was refused with
+        // PROMPT_EXCEEDS_BUDGET before the model request (0 requests, 0 notifications). These tests assert emission
+        // identity, not budget trimming; the 32k/16k window matches the fixture the prompt tests use. No production
+        // profile is changed.
         val profile = ModelProfile(
             "p-1", 3, "Synthetic", "Synthetic", "https://synthetic.example/v1", "DEEPSEEK_RESPONSES",
             "synthetic-model", object : SecretHandle { override val id = "draft-placeholder" },
-            4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList(),
+            32000, 16000, 2000, 1000, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList(),
         )
         val settings = SmartSettings(
             wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),

@@ -514,9 +514,9 @@ class SettingsCopyTest {
 
     @Test
     fun `the version in about is the build version`() {
-        assertEquals("0.5.3", BuildConfig.VERSION_NAME)
-        assertEquals(7, BuildConfig.VERSION_CODE)
-        assertEquals("EDITH 0.5.3 · 预览版", AboutUi.versionLine(BuildConfig.VERSION_NAME))
+        assertEquals("0.5.4", BuildConfig.VERSION_NAME)
+        assertEquals(8, BuildConfig.VERSION_CODE)
+        assertEquals("EDITH 0.5.4 · 预览版", AboutUi.versionLine(BuildConfig.VERSION_NAME))
         // A literal in AboutUi would ignore the argument; the 9.9.9 case is what proves the build version is read.
         assertEquals("EDITH 9.9.9 · 预览版", AboutUi.versionLine("9.9.9"))
 
