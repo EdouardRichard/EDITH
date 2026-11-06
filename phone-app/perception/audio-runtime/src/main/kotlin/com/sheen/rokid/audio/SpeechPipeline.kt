@@ -58,7 +58,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     private val emitSink = AtomicReference(emit)
     private var closed = false
     private var paused = false
-    /** The session whose provider fault paused intake, so only a **different** session may re-arm it. */
+    /** The session whose provider fault paused intake; automatic frame-path rearm needs a different session. */
     private var faultedSession: Pair<SessionId, Generation>? = null
     private var identity: Identity? = null
     private var fence = 0L

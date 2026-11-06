@@ -22,11 +22,13 @@ internal class WakeAckGate(
     private val tailNanos: Long = DEFAULT_TAIL_NANOS,
 ) {
     @Volatile private var audible = false
+    @Volatile private var audibleSinceNanos = Long.MIN_VALUE
     @Volatile private var endedAtNanos = Long.MIN_VALUE
 
     /** The player's audible onset. */
-    fun started() {
+    fun started(nowNanos: Long) {
         audible = true
+        audibleSinceNanos = nowNanos
         endedAtNanos = Long.MIN_VALUE
     }
 
@@ -42,7 +44,13 @@ internal class WakeAckGate(
 
     /** True while the ack is audible, or during the echo tail after its real end. */
     fun shouldSuppress(nowNanos: Long): Boolean {
-        if (audible) return true
+        if (audible) {
+            val since = audibleSinceNanos
+            // A lost terminal must not silence every later wake forever: after a generous ceiling the gate fails
+            // open. A backwards clock also fails open instead of extending the quiet.
+            return since != Long.MIN_VALUE && nowNanos >= since &&
+                nowNanos - since < MAX_AUDIBLE_NANOS
+        }
         val ended = endedAtNanos
         return ended != Long.MIN_VALUE && nowNanos >= ended && nowNanos - ended < tailNanos
     }
@@ -50,6 +58,7 @@ internal class WakeAckGate(
     /** A new session/mode starts with no remembered ack. */
     fun reset() {
         audible = false
+        audibleSinceNanos = Long.MIN_VALUE
         endedAtNanos = Long.MIN_VALUE
     }
 
@@ -59,5 +68,12 @@ internal class WakeAckGate(
          * half a second of the ack's end is indistinguishable from the echo and is safer dropped than admitted.
          */
         internal const val DEFAULT_TAIL_NANOS: Long = 500_000_000L
+
+        /**
+         * If the player never reports its terminal (closed while playing, listener takeover, engine dropped the
+         * callback), the ack cannot be audible forever. Ten seconds is well beyond the ~3 s engine init + a short
+         * phrase; after it the gate fails open and a later wake is admitted rather than silenced for the session.
+         */
+        internal const val MAX_AUDIBLE_NANOS: Long = 10_000_000_000L
     }
 }

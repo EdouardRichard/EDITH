@@ -517,7 +517,7 @@ class DetachedStartTest {
 
             val lines = withP3Sink { captured ->
                 rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
-                rig.root.wakeAckGate.started()
+                rig.root.wakeAckGate.started(rig.clock.nowNanos())
                 rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
                 rig.root.wakeAckGate.finished(rig.clock.nowNanos())
                 rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)

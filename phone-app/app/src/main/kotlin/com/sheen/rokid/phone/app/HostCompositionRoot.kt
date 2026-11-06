@@ -650,6 +650,7 @@ class HostCompositionRoot internal constructor(
             // mic", so the tail is dropped too; otherwise a lost end callback could leave the only mute source behind now
             // that the 120 s watchdog is gone.
             echoMute?.clear()
+            wakeAckGate.reset()
             P3Log.line("P5_TTS state=off")
         }
         val target = smartSettingsStore
@@ -2825,7 +2826,7 @@ class HostCompositionRoot internal constructor(
                 val accepted = runCatching {
                     player.speakText(text, "detached-wake-ack") { state ->
                         when (state) {
-                            SpeechPlayback.STARTED -> wakeAckGate.started()
+                            SpeechPlayback.STARTED -> wakeAckGate.started(clock.nowNanos())
                             SpeechPlayback.FINISHED, SpeechPlayback.FAILED ->
                                 wakeAckGate.finished(clock.nowNanos())
                         }
@@ -3441,6 +3442,7 @@ class HostCompositionRoot internal constructor(
             stop()
         } finally {
             closed = true
+            wakeAckGate.reset()
             // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an
             // arm that never reached a disarm, and is a no-op when nothing is held.
             releaseDetachedWakeLock()
