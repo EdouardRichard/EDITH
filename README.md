@@ -20,25 +20,20 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview (version `0.5.4`, phone `versionCode` 8). Its
-> features are usable, but performance, stability and the overall experience still need optimization.
-> This checkpoint passed its JVM test gate, but the device matrix is not complete: several acceptance
-> rows are `Partial` or `NotMeasured`. See [Verification status](#verification-status-054) — do not
-> read this build as a version-level pass.
+> **Development status:** EDITH is under active development. Interfaces and on-device behaviour may
+> change between builds; the per-build scope, verification status and known limitations are recorded
+> in the release notes, not here.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
 operates Android apps through the accessibility service and Shizuku's shell, and communicates with
-the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run in
-**phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
-ball on the home screen and independent translucent message bubbles for replies and tool steps.
-0.5.2 rebuilds Settings around a seven-entry home page and adds a provider-based model service with
-gateway model catalogs. 0.5.3 adds DeepSeek thinking-mode support to the agent loop (reasoning is
-replayed across tool turns), and 0.5.4 hardens multi-step task reliability: a 25-tool surface with
-`deep_link` and `media`, explicit per-stage timeouts and a five-minute turn budget, a wait-for-user
-terminal state, and stale-reference recovery for screen actions.
+the user through text on the glasses HUD and TTS audio. The phone can also run in **phone-only
+mode**, using its own microphone and screen: a draggable EDITH-icon floating ball on the home
+screen plus independent translucent message bubbles for replies and tool steps. Settings covers the
+model service (a provider plus a gateway model catalog), assistant behaviour, runtime and
+appearance, permissions and security, local capabilities, the audit log and about.
 
 - **Phone-only mode** — Enable it in Settings and a draggable EDITH-icon ball appears on the home
   screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
@@ -74,7 +69,7 @@ terminal state, and stale-reference recovery for screen actions.
   </a>
 </div>
 
-**Phone-only mode (0.4; renamed and extended in 0.5)** — no glasses link; wake-word wake and floating-ball dictation.
+**Phone-only mode** — no glasses link; wake-word wake and floating-ball dictation.
 
 <div align="center">
   <a href="assets/videos/detached-wake.mp4">
@@ -103,10 +98,10 @@ launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-fil
 
 ## Technical routes
 
-0.4 keeps both routes and adds a phone-only mode variant of the wake route, a text/dictation
-input row on the phone, and model provisioning from APK assets. 0.5 adds the home-screen floating
-ball and independent message bubbles to phone-only mode. The default glasses configuration
-described first is unchanged.
+Both routes share the same agent turn, tools and prompts. The phone-only variant of the wake route
+uses the phone's own microphone and screen, adds the floating ball and message bubbles, and takes
+the model bundle from the APK assets. The default glasses configuration described first is
+unchanged.
 
 ### Wake-word route
 
@@ -217,11 +212,14 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
-### Phone-only mode (0.4; renamed and corrected in 0.5.1)
+### Phone-only mode
 
-The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s. In phone-only mode an answer no longer opens the automatic 10 s continuation; the next turn is dictated by long-pressing the ball.
-
-Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged. The 0.5.1 correction is a checkpoint, not a version-level release; the [verification status](#verification-status-054) below records the current limits.
+The **phone-only mode** setting makes the wake route independent of the glasses. It also shows the
+EDITH-icon floating ball and the separate translucent message bubbles described above: drag and
+edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at
+a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s.
+In phone-only mode an answer does not open the automatic 10 s continuation; the next turn is
+dictated by long-pressing the ball.
 
 ```mermaid
 flowchart LR
@@ -239,20 +237,18 @@ With the setting off, the glasses routes above are unchanged: CXR connection, gl
 display and follow-up behavior keep their existing semantics. Phone-only mode is a local
 input/display choice, not a second CXR protocol.
 
-### Settings and model service (0.5.2)
+### Settings and model service
 
 - **Settings home**: seven entries in four groups — Model service, Assistant behavior, Runtime & appearance, Permissions & security, Local capabilities, Audit log, About. Explanations live in `(?)` popovers (close by tapping outside, pressing Back, or opening another); save/restart semantics are unchanged, restart-required rows carry a chip, and the audit page loads only when opened.
 - **Model service**: add a provider with a name, gateway base URL and API key. EDITH fetches the gateway's `GET /models` catalog, keeps user-edited fields across refreshes, supports manually added models, and marks models the gateway no longer returns instead of deleting them. Multiple providers can be stored, but only one is active globally. The catalog is stored in an encrypted v2 blob and the API key stays in Android Keystore. Old model profiles are **not migrated**: a one-time prompt asks you to re-enter a provider and key.
-- **DeepSeek thinking**: an off-by-default switch with low/high/max levels. Since 0.5.3 reasoning history is captured (even with the switch off) and replayed in full on tool turns for both Chat and Responses protocols; with the switch on the build does not send `max_tokens`/`max_output_tokens` and leaves the provider's default budget in place.
+- **DeepSeek thinking**: an off-by-default switch with low/high/max levels. Reasoning history is captured (even with the switch off) and replayed in full on tool turns for both Chat and Responses protocols; with the switch on the build does not send `max_tokens`/`max_output_tokens` and leaves the provider's default budget in place.
 
-### Agent reliability (0.5.4)
+### Agent turns and tools
 
-- **Tool surface**: 25 default tools — the 0.5.3 surface plus `deep_link` (open an app deep link or URL through the system resolver) and `media` (play/pause/next/previous on the active media session).
+- **Tool surface**: 25 default tools, including `deep_link` (open an app deep link or URL through the system resolver) and `media` (play/pause/next/previous on the active media session).
 - **Turn lifecycle**: a turn can end in `AWAITING_USER` when `notify_user` asks a question (`awaiting_reply`); the next user utterance resumes the same context. Each model request has a 45 s first-token bound, tools have their own 20 s/90 s bounds, and a whole turn is capped at five minutes.
 - **Screen actions**: `read_screen` reports descriptions, bounds and centres with an offset, coordinates are validated fail-closed, the element limit is 120, and a stale element reference is re-bound once after 45 s (`STALE_REF`); text a target app did not apply reports `TEXT_NOT_APPLIED`/`SNAPSHOT_STALE` instead of pretending success.
-- **Observability**: `P3_MODEL_REQ` / `P3_ACT` / `P3_PERCEPTION` / `P3_CONV` counters and the prompt set (0.5.4 / 25 tools / app-entry recipe) are covered by JVM tests.
-
-Version 0.5.4 is a preview checkpoint. The JVM gate passed (18 product/tool modules: 491 XML reports, 5,246 tests, 0 failures, 21 skipped); for this build the K40 device matrix rows are `NotMeasured`, and one K70 wake-ack hotfix is owner-verified. Do not read this as a version-level pass.
+- **Observability**: `P3_MODEL_REQ` / `P3_ACT` / `P3_PERCEPTION` / `P3_CONV` counters and the prompt set (25 tools / app-entry recipe) are covered by JVM tests.
 
 ## Project structure
 
@@ -292,8 +288,8 @@ task and the KWS asset task. Every file is checked against the bytes and SHA-256
 
 **Signing.** When `.local/signing/p2-debug.keystore` exists, the debug build uses that key; otherwise
 Gradle falls back to the standard AGP debug keystore, so a fresh clone builds without extra setup. To
-use the project's preview-debug key, place that keystore file at the path above — a newly generated
-key is valid but yields a different signature. The `release` variant is built unsigned; sign it with
+use the project's debug key, place that keystore file at the path above — a newly generated key is
+valid but yields a different signature. The `release` variant is built unsigned; sign it with
 a key of your choice if you need one.
 
 **Commands.**
@@ -457,24 +453,6 @@ access), and that authorization must be accepted.
   It is stored only on this phone with an Android Keystore AES/GCM key and is used only to let
   device tools pass a locked screen while a session is running. Pattern locks and non-ASCII
   passwords are intentionally not supported.
-
-## Verification status (0.5.4)
-
-This build is a preview checkpoint, not a version-level release:
-
-- **JVM gate: passed.** 18 product/tool modules: 491 XML reports, 5,246 tests, 0 failures, 0 errors,
-  21 skipped (the 15 probe reports/152 tests are tracked separately).
-- **K40 device matrix: `NotMeasured` for this build.** The K40 (`2696813b`) was not connected when
-  0.5.4 was closed, so the turn-lifecycle, live-gateway first-token timing, `deep_link`, `media`,
-  coordinate/focus-window actions, text read-back and ASR entity-confirmation rows are unmeasured.
-- **One device item is verified:** the K70 wake-acknowledgement hotfix (owner-confirmed on 2026-11-06).
-- **Earlier checkpoints** (0.5.1–0.5.3) keep their own partial/`NotMeasured` rows; they are not
-  upgraded by this build.
-
-Known non-blocking gaps recorded at closure: `ToolLabelMap` still has 23 entries (`deep_link`/`media`
-are not registered there; the live `ToolDescriptor.title` wins), the safety prompt's "waiting for the
-user reply" wording still has tension with the `awaiting_reply` turn end, and the Help text does not
-state the 90 s tool hard limit.
 
 ## License
 
