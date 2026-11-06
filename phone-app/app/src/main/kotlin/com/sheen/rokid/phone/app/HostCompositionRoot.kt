@@ -95,6 +95,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
 import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
 import com.sheen.rokid.phone.session.EchoMuteWindow
+import com.sheen.rokid.phone.session.WakeAckGate
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
@@ -2739,8 +2740,8 @@ class HostCompositionRoot internal constructor(
 
     private var wakeAckPlayer: AndroidSpeechPlayer? = null
 
-    /** Last detached acknowledgement onset; a wake inside [WAKE_ACK_DEBOUNCE_NANOS] is the ack's own tail, not a user. */
-    @Volatile private var lastWakeAckAtNanos: Long = Long.MIN_VALUE
+    /** Drops a KWS hit that is the detached ack's own tail; driven by the player's real start/end callbacks. */
+    internal val wakeAckGate = WakeAckGate()
 
     /**
      * 0.5.1 C5: the composition's one echo-mute window, handed to every player [create] and [setSpeechEnabled] build.
@@ -2777,23 +2778,24 @@ class HostCompositionRoot internal constructor(
         // plays, and the turn times out with no `P3_ASR` while KWS keeps working (K70 2026-11-06; only force-stop
         // repaired it). `rearmPipeline` is a no-op unless the pipeline is actually paused.
         audioChain?.rearmPipeline("wake")
-        // The acknowledgement's own tail can be detected as a second wake just after the player reports the end
-        // (K70: 145 ms after onDone). Do not speak another acknowledgement for it; the plugin still receives the
-        // wake event and decides whether a turn may open.
+        // The acknowledgement's own tail can be reported as a second wake just after the player's real end
+        // (K70: 145 ms after onDone). Drop the whole duplicate - not just its spoken copy - because admitting it can
+        // open a ten-second wake turn with no user speech. The gate is driven by the player's STARTED/FINISHED
+        // callbacks, so a cold TTS start that takes seconds does not shorten it and a never-audible ack arms nothing.
         val now = clock.nowNanos()
-        val duplicateAck = detachGate.enabled.value &&
-            lastWakeAckAtNanos != Long.MIN_VALUE &&
-            now - lastWakeAckAtNanos < WAKE_ACK_DEBOUNCE_NANOS
+        if (wakeAckGate.shouldSuppress(now)) {
+            P3Log.line("P3_WAKE suppressed reason=ack_echo")
+            return
+        }
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
             // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
             // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the installed player opens at the
             // audible onset (0.5.1 C5: the ack must not open it itself - the player is the single owner).
-            val acknowledged = detachGate.enabled.value && !duplicateAck &&
+            val acknowledged = detachGate.enabled.value &&
                 runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
-            if (acknowledged) lastWakeAckAtNanos = now
-            if (!acknowledged && !duplicateAck) chime()
+            if (!acknowledged) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
@@ -2821,7 +2823,13 @@ class HostCompositionRoot internal constructor(
         runCatching {
             Thread({
                 val accepted = runCatching {
-                    player.speakText(text, "detached-wake-ack")
+                    player.speakText(text, "detached-wake-ack") { state ->
+                        when (state) {
+                            SpeechPlayback.STARTED -> wakeAckGate.started()
+                            SpeechPlayback.FINISHED, SpeechPlayback.FAILED ->
+                                wakeAckGate.finished(clock.nowNanos())
+                        }
+                    }
                 }.getOrDefault(false)
                 P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
             }, "edith-wake-ack").apply { isDaemon = true }.start()
@@ -3448,13 +3456,6 @@ class HostCompositionRoot internal constructor(
     companion object {
         /** Detached mode's one fixed wake acknowledgement (owner decision 2026-10-27). */
         internal const val DETACHED_WAKE_ACK_TEXT = "我在"
-
-        /**
-         * No second acknowledgement inside this window: the acknowledgement is ~2.8 s and KWS can report its tail
-         * ~150 ms after the player's end. A real second wake is still delivered as an event; only the spoken copy is
-         * suppressed.
-         */
-        internal const val WAKE_ACK_DEBOUNCE_NANOS = 4_000_000_000L
 
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
@@ -5103,12 +5104,14 @@ internal class CxrAudioChain private constructor(
     }
 
     /**
-     * Re-arms the shared speech pipeline after a provider fault, for a **new** session (0.4 Task 13d).
+     * Re-arms the shared speech pipeline after a provider fault: for a **new session**, and since the 2026-11-06 K70
+     * hotfix for an **explicit KWS wake** (a user-initiated new input).
      *
      * The pipeline is process-lifetime (its ASR/VAD/speaker models cost a full load), and a fault pauses it for the
      * session that produced it. Without this the first transient fault silenced ASR for every later session until the
      * App was force-stopped (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake turn with no
-     * `P3_ASR`, restored by cold launch). Called when a new audio epoch is armed.
+     * `P3_ASR`, restored by cold launch). A KWS wake now re-arms the same session once; a persistent fault remains
+     * visible (`P3_PIPELINE state=fault`/`state=paused`) and is retried only on the next explicit wake, not in a loop.
      */
     internal fun rearmPipeline(reason: String) {
         val rearmed = runCatching { pipeline.rearm() }.getOrDefault(false)

@@ -88,14 +88,16 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     }
 
     /**
-     * Clears a provider-fault pause and resets the engines so a **new session** can use the same pipeline.
+     * Clears a provider-fault pause and resets the engines so the pipeline can serve again.
      *
      * A fault pauses intake for the session that produced it ([fault]); the host keeps one pipeline per process
      * because the ASR/VAD/speaker models are large, so without this seam a single transient provider failure
      * silenced ASR for every later session (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake
-     * turn with no `P3_ASR`, restored only by force-stop). Recovery is deliberately session-scoped, not a retry
-     * loop: the same session keeps rejecting audio (pinned by its own test), and only a different
-     * session/generation may re-arm. Calling it on a healthy pipeline is a no-op.
+     * turn with no `P3_ASR`, restored only by force-stop). The host calls it for a **new session** and, since the
+     * 2026-11-06 K70 hotfix, for an **explicit KWS wake** (a user-initiated new input). Automatic frame-path recovery
+     * remains session-scoped: the same session's frames keep rejecting audio unless the host explicitly re-arms, so a
+     * persistent fault stays visible and is retried only on the next explicit input. Calling it on a healthy pipeline
+     * is a no-op.
      *
      * @return true when a paused pipeline was actually re-armed.
      */
@@ -128,7 +130,10 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         return true
     }
 
-    /** Must hold [worker]: true when [frame] belongs to a session other than the one whose fault paused intake. */
+    /**
+     * Must hold [worker]: automatic frame-path recovery, only for a frame from a different session than the faulted
+     * one. An explicit user input in the same session (a KWS wake) uses [rearm] through the host instead.
+     */
     private fun rearmForNextSessionLocked(frame: PcmFrame, actions: MutableList<() -> Unit>): Boolean {
         val faulted = synchronized(admission) { faultedSession } ?: return false
         if (faulted.first == frame.epoch.sessionId && faulted.second == frame.epoch.generation) return false

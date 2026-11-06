@@ -494,6 +494,19 @@ class DictationWiringTest {
                 "the wake turn's audio must reach the recognizer; frames=${rig.asr.frames.size}",
                 rig.asr.frames.size > framesAtPause,
             )
+
+            // A fault that persists after the wake re-arm must not be retried in a loop; it stays paused and is
+            // retried only on the next explicit wake (or a new session).
+            rig.pipelineVad.failure = IllegalStateException("persistent provider failure")
+            rig.feedPhone()
+            rig.pipelineVad.failure = null
+            val framesAtSecondPause = rig.asr.frames.size
+            rig.feedPhone()
+            assertEquals(
+                "a persistent fault stays paused instead of auto-retrying every frame",
+                framesAtSecondPause,
+                rig.asr.frames.size,
+            )
         }
     }
 

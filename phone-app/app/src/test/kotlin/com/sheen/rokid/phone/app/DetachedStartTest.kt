@@ -22,6 +22,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
+import com.sheen.rokid.phone.session.WakeAckGate
 import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -503,24 +504,36 @@ class DetachedStartTest {
 
     /**
      * A KWS false hit from the acknowledgement's own tail arrives a few hundred ms after the player reports the end
-     * (K70 2026-11-06: 145 ms), i.e. just inside the current 150 ms echo tail, and the second wake spoke "我在" again
-     * even though the plugin refused a second turn. The ack is not a wake the wearer asked for twice.
+     * (K70 2026-11-06: 145 ms), so the duplicate is dropped whole while the ack is audible and through its tail -
+     * no second "我在" and no second WakeDetected/turn.
      */
     @Test
-    fun aSecondWakeInsideTheAckDebounceDoesNotSpeakTheAcknowledgementAgain() {
+    fun aWakeWhileTheAcknowledgementIsAudibleIsDroppedWhole() {
         Rig(detached = true).use { rig ->
             rig.attach()
             rig.start()
             val acks = mutableListOf<String>()
             val speak: (String) -> Boolean = { text -> acks += text; true }
 
-            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
-            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
-            assertEquals("the acknowledgement's own tail must not shout it again", listOf("我在"), acks)
+            val lines = withP3Sink { captured ->
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                rig.root.wakeAckGate.started()
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                rig.root.wakeAckGate.finished(rig.clock.nowNanos())
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                captured.toList()
+            }
 
-            rig.clock.advance(4_000_000_000L)
+            assertEquals("the ack must be spoken once", listOf("我在"), acks)
+            assertEquals("the duplicate must not deliver a wake event",
+                1, lines.count { it.startsWith("P3_WAKE word=") })
+            assertEquals("both duplicates are named, count-only",
+                2, lines.count { it == "P3_WAKE suppressed reason=ack_echo" })
+
+            rig.clock.advance(WakeAckGate.DEFAULT_TAIL_NANOS)
             rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
-            assertEquals("after the debounce a real second wake is acknowledged", listOf("我在", "我在"), acks)
+            assertEquals("after the real end + tail a real second wake is acknowledged",
+                listOf("我在", "我在"), acks)
         }
     }
 
