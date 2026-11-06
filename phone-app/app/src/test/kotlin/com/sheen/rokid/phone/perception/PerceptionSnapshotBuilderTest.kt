@@ -392,6 +392,61 @@ class PerceptionSnapshotBuilderTest {
     }
 
     @Test
+    fun theDefaultElementLimitIs120() {
+        assertEquals(120, PerceptionPolicy().elementLimit)
+
+        val observation = observation(
+            (0 until 120).map { index ->
+                node(text = "节点$index", bounds = Bounds(0, index * 100, 100, index * 100 + 80))
+            },
+        )
+
+        val result = build(observation = observation)
+
+        assertEquals(120, result.elements.size)
+        assertEquals("a screen that fits the default limit was not cut", "ok", result.coverage.screen)
+        assertFalse(result.truncated)
+    }
+
+    @Test
+    fun theDefaultRefTtlIs45Seconds() {
+        // 0.5.4 Task 13: a single model/thinking step can outlive 20 s, so the turn's ref TTL is 45 s. The registry
+        // itself is value-agnostic (the caller passes the TTL); this pins the policy default the host injects.
+        assertEquals(45_000L, PerceptionPolicy().refTtlMillis)
+    }
+
+    @Test
+    fun aCallerLimitAboveTheDefaultPolicyIsClampedTo120() {
+        val observation = observation(
+            (0 until 130).map { index ->
+                node(text = "节点$index", bounds = Bounds(0, index * 100, 100, index * 100 + 80))
+            },
+        )
+
+        val result = build(observation = observation, limit = 999)
+
+        assertEquals(120, result.elements.size)
+        assertEquals("节点119", result.elements.last().text)
+        assertEquals("truncated", result.coverage.screen)
+        assertTrue(result.truncated)
+    }
+
+    @Test
+    fun aScreenCutAtTheDefaultLimitEndsWithTheTruncationMarker() {
+        val observation = observation(
+            (0 until 121).map { index ->
+                node(text = "节点$index", bounds = Bounds(0, index * 100, 100, index * 100 + 80))
+            },
+        )
+
+        val result = build(observation = observation, limit = 999)
+        val lines = CompactSnapshotRenderer.render(result).lines()
+
+        assertEquals("120 elements plus exactly one marker line", 121, lines.size)
+        assertEquals(CompactSnapshotRenderer.TRUNCATION_MARKER, lines.last())
+    }
+
+    @Test
     fun theEffectiveElementLimitIsTheSmallerOfTheCallerLimitAndThePolicy() {
         val observation = observation(
             (0 until 5).map { index ->

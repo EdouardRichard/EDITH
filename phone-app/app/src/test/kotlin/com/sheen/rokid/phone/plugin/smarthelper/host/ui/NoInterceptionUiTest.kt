@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host.ui
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -38,6 +39,23 @@ class NoInterceptionUiTest {
             val needle = if (expected == "STOP") "急停" else expected
             assertTrue("confirmation copy must mention 「$needle」, was:\n$copy", copy.contains(needle))
         }
+    }
+
+    @Test
+    fun theEnabledWarningUsesTheSettledImmediateSwitchCopy() {
+        // appendix A7 / 0.52 Task 15: the switch is immediate, so the conditional red sentence says 开启后 rather than
+        // the old 保存后. It is red, conditional, and never replaces the always-visible risk summary.
+        assertEquals(
+            "当前已选择开启：开启后会立即更新宿主的「不拦截」门，并在关闭 App、被杀或重启后保持。",
+            NoInterceptionUi.ENABLED_WARNING,
+        )
+        assertFalse(
+            "the switch applies on tap; the warning must not promise a save-time update",
+            NoInterceptionUi.ENABLED_WARNING.contains("保存后"),
+        )
+        assertTrue(NoInterceptionUi.ENABLED_WARNING.contains("「不拦截」门"))
+        assertTrue(NoInterceptionUi.ENABLED_WARNING.contains("关闭 App、被杀或重启后保持"))
+        assertFalse("the enabled warning must not be the dialog title", NoInterceptionUi.ENABLED_WARNING == NoInterceptionUi.CONFIRM_TITLE)
     }
 
     @Test

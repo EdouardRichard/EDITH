@@ -54,6 +54,8 @@ enum class SegmentRole { USER, ASSISTANT }
  * [role] is the speaker of a conversation-flow segment, or `null` for every segment that is not
  * conversation flow. `role` 只对会话流段有意义；系统槽与记忆段为 `null`。
  * [images] 是本段附带的图片 artifact 引用（0.25 spec §5.3），默认空以保持旧段形状不变。
+ * [reasoning] 是该 assistant 回合的思考内容（0.53）：只由 `TRANSCRIPT`/assistant 段携带，与 [text] **同生共死**，
+ * 随请求回传但不计入渲染文本、不进摘要、不落盘。默认 `null`，旧段形状与字节不变。
  */
 data class Segment(
     val origin: SegmentOrigin,
@@ -61,8 +63,19 @@ data class Segment(
     val text: String,
     val role: SegmentRole? = null,
     val images: List<ImageRef> = emptyList(),
+    val reasoning: String? = null,
 ) {
     init {
         require(text.isNotBlank()) { "Segment text must not be blank" }
+        require(reasoning == null || role == SegmentRole.ASSISTANT) {
+            "only an assistant segment can carry reasoning"
+        }
     }
+
+    /**
+     * Content-free by construction: origin and speaker only. The generated `toString()` of a data class prints every
+     * member, which would put [text], [reasoning] and the image references into any stray log line or assertion
+     * message; a request segment carries untrusted content that must not leak.
+     */
+    override fun toString(): String = "Segment(origin=$origin, role=$role, redacted)"
 }

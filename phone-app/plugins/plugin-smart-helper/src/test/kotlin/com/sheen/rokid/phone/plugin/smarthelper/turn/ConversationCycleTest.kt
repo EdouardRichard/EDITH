@@ -87,6 +87,10 @@ class ConversationCycleTest {
         val continuationRoutes = mutableListOf<AssistantRoute>()
         val cancelled = mutableListOf<Pair<AssistantRoute, String>>()
         val logs = mutableListOf<String>()
+
+        /** The plugin's single queue slot as the cycle observes it: a route with a queued next sentence. */
+        val queued = mutableSetOf<AssistantRoute>()
+
         val cycle = ConversationCycle(
             clock = clock,
             scheduler = scheduler,
@@ -95,9 +99,12 @@ class ConversationCycleTest {
             openContinuation = { route, turnId ->
                 continuationRoutes += route
                 continuations += turnId
+                // Production's opener consumes the route's queued sentence; the rig models exactly that release.
+                queued.remove(route)
             },
             isPanelVisible = { panelVisible },
             cancelTurn = { route, turnId -> cancelled += route to turnId },
+            hasQueuedUtterance = { route -> route in queued },
             log = { line -> logs += line },
         )
 
@@ -586,6 +593,75 @@ class ConversationCycleTest {
         assertEquals(1, rig.display.closed)
         assertEquals(emptyList(), rig.continuations)
         assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled)
+    }
+
+    @Test
+    fun `continue off with a queued utterance opens a continuation instead of closing`() {
+        val rig = rig(panelVisible = true, continueOn = false)
+        rig.queued += AssistantRoute.WAKE
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+
+        rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = false)
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses,
+            "the continue-off branch must not claim status 5",
+        )
+        assertEquals(emptyList(), rig.continuations, "the exit is scheduled, not immediate")
+
+        rig.advance(999)
+        assertEquals(0, rig.display.closed, "the official scheduleExit is 1_000 ms")
+        assertEquals(emptyList(), rig.continuations)
+
+        rig.advance(1)
+        assertEquals(
+            listOf("turn-1"),
+            rig.continuations,
+            "the queued sentence is the next turn: the finished turn's continuation consumes it",
+        )
+        assertEquals(
+            listOf(AssistantRoute.WAKE),
+            rig.continuationRoutes,
+            "the continuation is opened for the route whose answer just finished",
+        )
+        assertEquals(0, rig.display.closed, "a consumable queue keeps the conversation open")
+        assertEquals(emptyList(), rig.cancelled, "the finished turn is continued, not torn down")
+        assertTrue(rig.queued.isEmpty(), "the opener releases the queued utterance")
+        assertTrue(
+            rig.logs.any { it.contains("P3_CONV queue_consumed route=WAKE reason=continue_off") },
+            "the consumed queue is named evidence: ${rig.logs}",
+        )
+        assertFalse(
+            rig.logs.any { it.contains("P3_CONV close route=WAKE reason=continue_off") },
+            "the close branch must not run when the queue is consumed: ${rig.logs}",
+        )
+
+        // No deadline is left behind: the round was continued, not closed and not re-armed.
+        rig.advance(60_000)
+        assertEquals(1, rig.continuations.size)
+        assertEquals(0, rig.display.closed)
+    }
+
+    @Test
+    fun `continue off with an empty queue still closes`() {
+        val rig = rig(panelVisible = true, continueOn = false)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+
+        rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = false)
+        rig.advance(1_000)
+
+        assertEquals(1, rig.display.closed, "with nothing queued the official exit still closes")
+        assertEquals(emptyList(), rig.continuations, "no queue means no continuation")
+        assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled, "the closed turn is cancelled once")
+        assertTrue(
+            rig.logs.any { it.contains("P3_CONV close route=WAKE reason=continue_off") },
+            "the empty-queue close is named evidence: ${rig.logs}",
+        )
+        assertFalse(
+            rig.logs.any { it.contains("queue_consumed") },
+            "no queue, so no consumption may be claimed: ${rig.logs}",
+        )
     }
 
     @Test

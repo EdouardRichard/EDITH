@@ -70,6 +70,12 @@ class GatewayCacheMetricTest {
         listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, usage, null))
     }
 
+    /**
+     * The `P3_CACHE` lines of [lines]. 0.53 added a second per-request line on the same sink (`P3_THINKING`); this class
+     * pins the cache line's exact shape, so it filters its own line and leaves the other one to its own test.
+     */
+    private fun cacheLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P3_CACHE") }
+
     @Test
     fun `a frame request reports its cache counts and the frame's system and dynamic sizes`() {
         val lines = mutableListOf<String>()
@@ -88,13 +94,13 @@ class GatewayCacheMetricTest {
 
         assertEquals(
             listOf("P3_CACHE cached=64 miss=36 inputTokens=100 outputTokens=20 systemChars=3 dynamicChars=16"),
-            lines,
+            cacheLines(lines),
         )
         // Counts and sizes only: no tail text or user text may ride the line (`systemChars` is a field name, so the
         // system slot is asserted by its count, never by a substring check on the word "sys").
-        assertFalse(lines.single().contains("perception-block"), lines.single())
-        assertFalse(lines.single().contains("question"), lines.single())
-        assertFalse(lines.single().contains("now"), lines.single())
+        assertFalse(cacheLines(lines).single().contains("perception-block"), cacheLines(lines).single())
+        assertFalse(cacheLines(lines).single().contains("question"), cacheLines(lines).single())
+        assertFalse(cacheLines(lines).single().contains("now"), cacheLines(lines).single())
     }
 
     @Test
@@ -120,7 +126,7 @@ class GatewayCacheMetricTest {
                 "P3_CACHE cached=20 miss=10 inputTokens=30 outputTokens=8 " +
                     "systemChars=16 dynamicChars=16",
             ),
-            lines,
+            cacheLines(lines),
         )
     }
 
@@ -132,7 +138,7 @@ class GatewayCacheMetricTest {
 
         assertEquals(
             listOf("P3_CACHE cached=- miss=- inputTokens=10 outputTokens=5 systemChars=14 dynamicChars=0"),
-            lines,
+            cacheLines(lines),
         )
     }
 
@@ -143,7 +149,7 @@ class GatewayCacheMetricTest {
 
         gateway(terminalClient(null), lines).turn(turn(frame))
 
-        assertTrue(lines.isEmpty(), "no usage is not a zero measurement: $lines")
+        assertTrue(cacheLines(lines).isEmpty(), "no usage is not a zero measurement: $lines")
     }
 
     @Test
@@ -153,7 +159,7 @@ class GatewayCacheMetricTest {
             .turn(turn(frame(system = "sys", Segment(SegmentOrigin.USER_INPUT, true, "now"))))
         assertEquals(
             listOf("P3_CACHE cached=- miss=- inputTokens=100 outputTokens=20 systemChars=3 dynamicChars=0"),
-            dashes,
+            cacheLines(dashes),
         )
 
         val zeros = mutableListOf<String>()
@@ -161,7 +167,7 @@ class GatewayCacheMetricTest {
             .turn(turn(frame(system = "sys", Segment(SegmentOrigin.USER_INPUT, true, "now"))))
         assertEquals(
             listOf("P3_CACHE cached=0 miss=0 inputTokens=0 outputTokens=0 systemChars=3 dynamicChars=0"),
-            zeros,
+            cacheLines(zeros),
         )
     }
 
@@ -185,7 +191,7 @@ class GatewayCacheMetricTest {
                 "P3_CACHE cached=64 miss=36 inputTokens=100 outputTokens=20 systemChars=3 dynamicChars=0",
                 "P3_CACHE cached=6 miss=4 inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=0",
             ),
-            lines,
+            cacheLines(lines),
         )
     }
 
@@ -229,7 +235,7 @@ class GatewayCacheMetricTest {
                 "P3_CACHE cached=64 miss=36 inputTokens=100 outputTokens=20 systemChars=3 dynamicChars=0",
                 "P3_CACHE cached=6 miss=4 inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=0",
             ),
-            lines,
+            cacheLines(lines),
         )
     }
 
@@ -257,7 +263,7 @@ class GatewayCacheMetricTest {
         assertEquals(2, reply.overflowRecoveries)
         assertEquals(
             listOf("P3_CACHE cached=- miss=- inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=1038"),
-            lines,
+            cacheLines(lines),
             "the sent request reports the shortened tail (2 × 519 chars), not the assembled 3,100-char one",
         )
     }

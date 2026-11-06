@@ -121,9 +121,10 @@ class ResponsesDecoderTest {
 
     @Test fun `unknown reasoning and future events emit nothing while tool events surface`() {
         // Drift correction (spec §4.2 claimed the decoder already parsed `function_call`): it did not — the type fell
-        // into `else -> emptyList()`. Reasoning stays silent; tool events now produce ToolCall*.
+        // into `else -> emptyList()`. Tool events now produce ToolCall*. 0.53 makes the *text* reasoning event
+        // (`response.reasoning_text.delta`) legal; the summary variants and unknown events stay silent.
         val decoder = ResponsesDecoder("q")
-        for ((i, type) in listOf("response.reasoning.delta", "future.event").withIndex()) {
+        for ((i, type) in listOf("response.reasoning_summary_text.delta", "future.event").withIndex()) {
             assertTrue(decoder.accept(frame(type, (i + 10).toString(), """, "delta":"private reasoning"""")).isEmpty())
         }
         val tool = decoder.accept(frame("response.function_call_arguments.delta", "12",
@@ -132,6 +133,48 @@ class ResponsesDecoderTest {
         assertTrue(tool.filterIsInstance<ModelStreamEvent.TextDelta>().isEmpty())
         assertEquals(ModelEnd.INCOMPLETE, ends(decoder.endOfInput()).single().end)
         assertTrue(decoder.endOfInput().isEmpty())
+    }
+
+    // ------------------------------------------------------------ 0.53 DeepSeek thinking (design §5.3)
+
+    @Test fun `reasoning text deltas surface as reasoning events and never as answer text`() {
+        val decoder = ResponsesDecoder("q")
+
+        val events = decoder.accept(frame("response.reasoning_text.delta", "1",
+            ", \"item_id\":\"rs_1\",\"delta\":\"先想\""))
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "先想")), events)
+
+        val answer = decoder.accept(delta("2", "好"))
+        assertEquals(listOf("好"), texts(answer), "the answer stream is unaffected")
+        assertTrue(answer.filterIsInstance<ModelStreamEvent.ReasoningDelta>().isEmpty())
+    }
+
+    @Test fun `an empty reasoning fragment emits nothing and reasoning does not satisfy the text delivery check`() {
+        val decoder = ResponsesDecoder("q")
+        assertTrue(decoder.accept(frame("response.reasoning_text.delta", "1",
+            ", \"item_id\":\"rs_1\",\"delta\":\"\"")).isEmpty(), "an empty fragment is not an event")
+        decoder.accept(frame("response.reasoning_text.delta", "2", ", \"item_id\":\"rs_1\",\"delta\":\"想\""))
+        assertEquals(
+            ModelEnd.COMPLETED,
+            ends(decoder.accept(terminal("completed", "3", """{"id":"r","status":"completed"}"""))).single().end,
+            "reasoning is not answer text: a text-free turn with no output still completes",
+        )
+    }
+
+    @Test fun `a whitespace-only reasoning fragment is ignored and the turn survives`() {
+        // `ReasoningDelta` requires a non-blank text; a whitespace chunk used to throw inside the decoder and become
+        // FAILED/MALFORMED_JSON. It must simply be ignored like an empty fragment.
+        val decoder = ResponsesDecoder("q")
+        assertTrue(decoder.accept(frame("response.reasoning_text.delta", "1",
+            ", \"item_id\":\"rs_1\",\"delta\":\" \"")).isEmpty(), "a space is not a fragment")
+        assertTrue(decoder.accept(frame("response.reasoning_text.delta", "2",
+            ", \"item_id\":\"rs_1\",\"delta\":\"\\n\"")).isEmpty(), "a newline is not a fragment")
+        decoder.accept(frame("response.reasoning_text.delta", "3", ", \"item_id\":\"rs_1\",\"delta\":\"想\""))
+        assertEquals(listOf("好"), texts(decoder.accept(delta("4", "好"))))
+        assertEquals(
+            ModelEnd.COMPLETED,
+            ends(decoder.accept(terminal("completed", "5", """{"id":"r","status":"completed"}"""))).single().end,
+        )
     }
 
     @Test fun `multiple items and content indices validate done separately`() {

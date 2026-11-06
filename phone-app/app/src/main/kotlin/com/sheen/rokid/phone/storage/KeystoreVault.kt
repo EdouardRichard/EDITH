@@ -75,7 +75,12 @@ class KeystoreVault(private val blobs: EncryptedBlobStore) : SecretResolver {
             handle = opaqueSecret("credential-${UUID.randomUUID()}")
             blobs.write(handle.id, bytes)
             return handle
-        } catch (_: Exception) { handle?.let { runCatching { blobs.delete(it.id) } }; unavailable() }
+        } catch (_: Exception) {
+            handle?.let { runCatching { blobs.delete(it.id) } }
+            // I7: a credential-staging refusal is not catalog corruption. Keep its own contract code so the UI never
+            // tells the user to reset (and orphan) the whole model catalog for a Keystore problem.
+            credentialStagingFailure()
+        }
         finally { bytes?.fill(0); value.fill('\u0000') }
     }
     internal fun authorize(authority: (String) -> Boolean) { synchronized(lock) { this.authority = authority } }
@@ -111,6 +116,11 @@ internal fun opaqueSecret(value: String): SecretHandle = object : SecretHandle {
     override fun toString() = "SecretHandle(redacted)"
 }
 internal fun unavailable(): Nothing = throw ContractError.ConfigurationRejected("Storage unavailable; reconfigure")
+
+/** 0.52 I7: the distinct staging contract code; its UI copy must not suggest resetting the catalog. */
+internal const val CREDENTIAL_STAGING_FAILED = "Credential staging failed"
+internal fun credentialStagingFailure(): Nothing =
+    throw ContractError.ConfigurationRejected(CREDENTIAL_STAGING_FAILED)
 internal fun credentialId(id: String) = id.matches(Regex("credential-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
 
 internal interface BlobKeys {

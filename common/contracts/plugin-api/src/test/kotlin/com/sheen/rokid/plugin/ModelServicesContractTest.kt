@@ -111,4 +111,46 @@ class ModelServicesContractTest {
         assertEquals("c", terminal.callId)
         assertNull(ModelStreamEvent.ToolCallDelta("q", "i", null, "{}").name)
     }
+
+    @Test fun `thinking defaults are off and low and stay out of toString`() {
+        val profile = profile()
+        assertFalse(profile.thinkingEnabled)
+        assertEquals(ThinkingEffort.LOW, profile.thinkingEffort)
+        // R21: the DeepSeek-native thinking fields are gated on this capability bit, so it defaults off and safe.
+        assertFalse(profile.thinkingSupported)
+
+        val enabled = profile.copy(
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.MAX,
+            thinkingSupported = true,
+        )
+        assertTrue(enabled.thinkingEnabled)
+        assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
+        assertTrue(enabled.thinkingSupported)
+        assertFalse(enabled.toString().contains("thinking", ignoreCase = true))
+        assertFalse(enabled.toString().contains("MAX"))
+    }
+
+    @Test fun `an assistant text may carry reasoning and a user text may not`() {
+        val withReasoning = ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "想")
+        assertEquals("想", withReasoning.reasoning)
+        assertNull(ModelHistoryItem.Text(MessageRole.ASSISTANT, "答").reasoning)
+        assertFailsWith<IllegalArgumentException> {
+            ModelHistoryItem.Text(MessageRole.USER, "问", reasoning = "想")
+        }
+        assertFailsWith<IllegalArgumentException> {
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "   ")
+        }
+        // A hand-built history without the new field keeps its exact shape: the default is null.
+        assertEquals(withReasoning.copy(reasoning = null), ModelHistoryItem.Text(MessageRole.ASSISTANT, "答"))
+    }
+
+    @Test fun `reasoning never appears in toString and ReasoningDelta requires text`() {
+        val text = ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "private-thought")
+        assertFalse(text.toString().contains("private-"))
+        assertFalse(ModelStreamEvent.ReasoningDelta("r", "private-thought").toString().contains("private-"))
+        assertFailsWith<IllegalArgumentException> { ModelStreamEvent.ReasoningDelta("r", "  ") }
+        assertFailsWith<IllegalArgumentException> { ModelStreamEvent.ReasoningDelta("", "想") }
+        assertEquals("private-thought", ModelStreamEvent.ReasoningDelta("r", "private-thought").text)
+    }
 }

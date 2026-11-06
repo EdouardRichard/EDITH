@@ -100,7 +100,9 @@ class LoopGuardsWiringTest {
                     listener(smartToolCall("c1", "device", """{"action":"status"}""", requestId = request.requestId))
                     listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
                 }
-                1 -> streamText(request, listener, "接下来我会先观察当前屏幕，然后再点按确认。")
+                1 ->
+                    // 0.5.4 Task 1: no "然后再" — the tightened plan nudge rejects that phrase; the nudge itself is the subject.
+                    streamText(request, listener, "接下来我会先观察当前屏幕，然后点按确认。")
                 else -> streamText(request, listener, "已经点好了。")
             }
         }
@@ -114,12 +116,13 @@ class LoopGuardsWiringTest {
     }
 
     @Test
-    fun `the proactive route answers a plan-like text with silence and no nudge`() {
+    fun `the proactive route answers a plan-like text with silence`() {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
             if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
-                streamText(request, listener, "接下来我会先观察屏幕，然后再提醒。")
+                // 0.5.4 Task 1: a genuine plan under the tightened marker set (no NON_PLAN_MARKERS wording).
+                streamText(request, listener, "接下来我会先观察屏幕，然后提醒。")
             } else {
                 streamText(request, listener, "好。")
             }
@@ -132,8 +135,11 @@ class LoopGuardsWiringTest {
         val proactiveRequests = rig.model.requests.filter { request ->
             request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
         }
-        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; the hint loop may not nudge a plan")
-        assertTrue(rig.output.hints.isEmpty(), "a plan without the propose_hint call is silence, not a hint")
+        // `allowPlanNudge = false` is covered by `AgentLoopGuardTest.no plan nudge fires when the request does not
+        // allow it` (successful tool + plan text). A text-only PROACTIVE reply cannot satisfy the nudge precondition
+        // (`successfulToolExecutions > 0`), so this test only asserts the proactive route's silence.
+        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; the plan-like text only produces silence")
+        assertTrue(rig.output.hints.isEmpty(), "a plan-like text without the propose_hint call is silence, not a hint")
     }
 
     private fun awaitProactive(rig: SmartTestRig, millis: Long = 2_000) {

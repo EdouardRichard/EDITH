@@ -6,7 +6,6 @@ import android.content.Intent
 import com.sheen.rokid.phone.app.EdithApplication
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.platform.P3Log
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
 
 /**
  * Debug-only 「纯手机模式」 gate setter and state readback (0.4 Task 9).
@@ -54,12 +53,13 @@ class DebugDetachControl : BroadcastReceiver() {
 
     private fun readback(root: HostCompositionRoot) {
         val settings = runCatching { root.storedSettings() }.getOrNull()
-        val selected = (root.profiles as? AndroidProfileRepository)?.selections()?.get("smart-assistant")
+        // 0.52: the catalog is the only model configuration; its active projection is the profile the next turn uses.
+        val selected = runCatching { root.activeCatalogProfile()?.id }.getOrNull() ?: "none"
         line(
             "P4_SETTINGS_READBACK glasses_detached=${settings?.glassesDetached} " +
                 "proactive_stored=${settings?.proactiveEnabled} " +
                 "proactive_effective=${root.proactiveArming.effectiveProactiveArmed} " +
-                "speech=${settings?.speechEnabled} profile=${selected ?: "none"}",
+                "speech=${settings?.speechEnabled} profile=$selected",
         )
         val state = root.state.value
         line("P4_SESSION_READBACK session=${state.session} error=${state.errorCode ?: "none"}")

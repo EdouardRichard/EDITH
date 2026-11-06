@@ -20,7 +20,6 @@ class SmartSettingsFormTest {
         wakeWords: List<String> = listOf("伊迪丝", "edith"),
         maxLevel: String = "L1",
         whitelist: List<String> = emptyList(),
-        profileId: String? = null,
         cooldownMillis: Long = 3000L,
         proactiveCooldownMillis: Long = 60_000L,
         proactiveSensitivity: String = "LOW",
@@ -28,7 +27,7 @@ class SmartSettingsFormTest {
         continueDialogue: Boolean = true,
         visionEnabled: Boolean = true,
         noInterception: Boolean = false,
-    ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
+    ) = SmartSettings(wakeWords, maxLevel, whitelist, cooldownMillis,
         proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue,
         visionEnabled = visionEnabled, noInterception = noInterception)
 
@@ -62,6 +61,38 @@ class SmartSettingsFormTest {
         assertTrue(result.errors.toString(), result.errors.isEmpty())
         assertTrue("an unrelated save must keep the mode on", result.settings.noInterception)
         assertEquals("L2", result.settings.maxLevel)
+    }
+
+    // ---- 0.52 design §3.5: the permission page's own restart scope ----------------------------------
+
+    @Test
+    fun thePermissionScopeCountsOnlyTheTwoToolPermissionFields() {
+        // 0.52 design §3.5/§4.2: the 权限与安全 form restarts on exactly `maxLevel` and `whitelist`. The count is a
+        // separate function from `needsRestartCount` (the assistant page's four fields); mixing the scopes would make
+        // one page claim another page's restart needs.
+        val base = settings(maxLevel = "L1", whitelist = listOf("launch|app"))
+
+        assertEquals("an untouched permission form needs no restart",
+            0, SmartSettingsForm.permissionRestartCount(base, base))
+        assertEquals("the level alone is one restart field",
+            1, SmartSettingsForm.permissionRestartCount(base, base.copy(maxLevel = "L3")))
+        assertEquals("the whitelist alone is one restart field",
+            1, SmartSettingsForm.permissionRestartCount(base, base.copy(whitelist = listOf("note|storage"))))
+        assertEquals("both fields are two",
+            2, SmartSettingsForm.permissionRestartCount(
+                base, base.copy(maxLevel = "L3", whitelist = listOf("note|storage"))))
+        assertEquals("the assistant page's fields are outside the permission scope",
+            0, SmartSettingsForm.permissionRestartCount(
+                base,
+                base.copy(
+                    wakeWords = listOf("小艾"),
+                    continueDialogue = false,
+                    proactiveCooldownMillis = 120_000L,
+                    proactiveSensitivity = "HIGH",
+                    visionEnabled = false,
+                    noInterception = true,
+                ),
+            ))
     }
 
     // ---- 0.3 Phase 2 Task 10: the perception-screenshot switch ---------------------------------------
@@ -171,7 +202,7 @@ class SmartSettingsFormTest {
     @Test
     fun fromSettingsFormatsEveryFieldAndToSettingsRebuildsTheSameSettings() {
         val original = settings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L2",
-            whitelist = listOf("launch|app", "note|storage"), profileId = "p-1", cooldownMillis = 2500L)
+            whitelist = listOf("launch|app", "note|storage"), cooldownMillis = 2500L)
 
         val draft = SmartSettingsForm.fromSettings(original)
         assertEquals("伊迪丝,edith", draft.wakeWords)
@@ -184,15 +215,14 @@ class SmartSettingsFormTest {
         assertEquals(listOf("伊迪丝", "edith"), result.settings.wakeWords)
         assertEquals("L2", result.settings.maxLevel)
         assertEquals(listOf("launch|app", "note|storage"), result.settings.whitelist)
-        // The profile selection and the cooldown are not fields of this form: they must survive untouched.
-        assertEquals("p-1", result.settings.profileId)
+        // The cooldown is not a field of this form: it must survive untouched.
         assertEquals(2500L, result.settings.cooldownMillis)
     }
 
     @Test
     fun fromSettingsAndToSettingsRoundTripAFullSettingsValue() {
         val original = settings(wakeWords = listOf("小艾"), maxLevel = "L4",
-            whitelist = listOf("call|contacts"), profileId = "p-2", cooldownMillis = 1500L)
+            whitelist = listOf("call|contacts"), cooldownMillis = 1500L)
 
         // The form owns three of the five fields; the other two are the base's, so a real round trip starts from
         // the value being edited (which is what the screen does: it loads the stored settings as the base).
@@ -363,12 +393,11 @@ class SmartSettingsFormTest {
 
     @Test
     fun aDraftAlwaysProducesUsableSettings() {
-        val base = settings(profileId = "p-1", cooldownMillis = 7000L)
+        val base = settings(cooldownMillis = 7000L)
 
         val result = SmartSettingsForm.toSettings(SmartSettingsForm.Draft("1234", "L9", "launch"), base)
 
         assertNotEquals("a rejected level must not become a level the plugin refuses", "L9", result.settings.maxLevel)
-        assertEquals("p-1", result.settings.profileId)
         assertEquals(7000L, result.settings.cooldownMillis)
     }
 

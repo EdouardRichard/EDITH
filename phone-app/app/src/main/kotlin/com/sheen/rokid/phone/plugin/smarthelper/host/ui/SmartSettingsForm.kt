@@ -13,8 +13,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
  *   lose the level they chose in the same edit, so [toSettings] returns a usable [SmartSettings] *and* the list of
  *   problems; nothing is silently coerced. The only field that keeps its previous value wholesale is the one whose
  *   entry was rejected (an unknown level, or a wake-word list where nothing survived validation).
- * - **The fields this form does not own survive.** `profileId` and `cooldownMillis` are not text fields here, so
- *   they are copied from `base` untouched.
+ * - **The fields this form does not own survive.** `cooldownMillis` is not a text field here, so it is copied from
+ *   `base` untouched. (The model selection is not part of this form or of [SmartSettings] at all: 0.52 moved it into the
+ *   model catalog.)
  * - **The all-invalid asymmetry (deliberate, stated here so it is not mistaken for a bug).** When nothing in the
  *   wake-word field survives validation, the previous words are kept: wake words are not optional (the plugin
  *   refuses a configuration with an empty word list), so falling back is the only usable answer. When nothing in
@@ -89,6 +90,36 @@ object SmartSettingsForm {
         visionEnabled = settings.visionEnabled,
         noInterception = settings.noInterception,
     )
+
+    /**
+     * How many of the four launch-read fields actually changed between [before] and [after] (0.52 design §3.3).
+     *
+     * The composition is assembled once per process, so the plugin sees these fields only after a full App restart:
+     * `wakeWords`, `continueDialogue`, `proactiveCooldownMillis` and `proactiveSensitivity`. The two live switches -
+     * `visionEnabled` (the host's vision gate) and `proactiveEnabled` (the immediate arming gate) - deliberately do
+     * not count, and neither do the fields this page does not edit (`maxLevel`, `whitelist`, `cooldownMillis`,
+     * `noInterception`, `glassesDetached`, appearance). The value is what the page shows after a successful save
+     * ([SettingsFeedback.savedRestartText]); comparing the stored fields directly is the only honest count.
+     */
+    fun needsRestartCount(before: SmartSettings, after: SmartSettings): Int = listOf(
+        before.wakeWords != after.wakeWords,
+        before.continueDialogue != after.continueDialogue,
+        before.proactiveCooldownMillis != after.proactiveCooldownMillis,
+        before.proactiveSensitivity != after.proactiveSensitivity,
+    ).count { it }
+
+    /**
+     * How many of the 权限与安全 page's two launch-read fields changed between [before] and [after] (design §3.5).
+     *
+     * The tool-permission form restarts on exactly `maxLevel` and `whitelist`; the page's 「不拦截」 switch is the
+     * immediate one and deliberately does not count. This is a separate function from [needsRestartCount] because the
+     * two pages own different scopes: reusing the assistant count here would report four fields the permission page
+     * never edits, and merging the scopes would let one page's save claim the other page's restart needs.
+     */
+    fun permissionRestartCount(before: SmartSettings, after: SmartSettings): Int = listOf(
+        before.effectiveMaxLevel() != after.effectiveMaxLevel(),
+        before.whitelist != after.whitelist,
+    ).count { it }
 
     /**
      * Parses one edit against [base].

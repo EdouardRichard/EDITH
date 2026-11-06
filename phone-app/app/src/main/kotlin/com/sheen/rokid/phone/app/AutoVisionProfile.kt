@@ -6,18 +6,13 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.VerificationState
 
 /**
- * The profile that applies to one plugin's turn: the repository's per-plugin selection first, the settings fallback
- * only when the selection is absent or unreadable.
+ * The profile that applies to one plugin's turn: the caller's selection first, the fallback only when the selection is
+ * absent or unreadable.
  *
- * This is the same resolution `HostCompositionRoot` uses to build a plugin's configuration
- * (`configurationFor`/`applyProfileSelection`). The App stores one selection per plugin in
- * `AndroidProfileRepository.selections()`; the settings-resolved profile (`SmartWiring.selectedProfile()`) is only
- * the assembly-time choice stored in the settings blob, so it can name a different profile than the user's current
- * selection. Reading the selection is deliberately a caller-supplied lambda: every call re-reads it, so a selection
- * change applies to the next turn/capture instead of being frozen at assembly.
- *
- * A repository that refuses (locked keystore, deleted payload) yields `null` rather than propagating: the fallback is
- * tried, and a caller that finds no profile fails closed.
+ * 0.52 moved the only model selection into the catalog: the production call site passes the **active catalog
+ * projection** as `selection` and resolves it through the repository, so there is no second selection source to
+ * disagree with. The three lambdas stay because the same resolution rules are what make a repository refusal
+ * (locked keystore, deleted payload) `null` rather than an exception; a caller that finds no profile fails closed.
  */
 internal fun resolveTurnProfile(
     selection: () -> String?,
@@ -47,9 +42,9 @@ internal fun resolveTurnProfile(
  * `testedAtEpochMillis`, list index as the tie-break); the two must not drift. A verification for an older revision,
  * a failed/unverified probe, or no probe at all reads `false`.
  *
- * Turn configuration resolves the repository selection first (see [resolveTurnProfile]); using only
- * `SmartWiring.selectedProfile()` here silently disabled auto vision whenever the settings profile was text-only while
- * the user had selected an image profile. Null/exception at any step is `false` (fail closed, no image).
+ * Turn configuration resolves the active catalog projection first (see [resolveTurnProfile]); the resolution is
+ * deliberately re-read per call, so a provider/model switch applies to the next capture instead of being frozen at
+ * assembly. Null/exception at any step is `false` (fail closed, no image).
  */
 internal fun autoVisionProfileSupportsImage(
     selection: () -> String?,

@@ -2457,4 +2457,169 @@ class SmartAssistantPluginTest {
         assertEquals(listOf(AssistantRoute.WAKE), display.closes)
         assertEquals(requestsAfterRun, rig.model.requests.size, "continue off opens no next round")
     }
+
+    // ------------------------------------------------- 0.5.4 Task 4: settling an awaiting-user turn
+
+    /**
+     * The five fixed honest sentences [FAILURE_HINTS] can submit.
+     *
+     * An awaiting-user run is **not** a failure: the model asked a question and stopped. None of these sentences may be
+     * its answer, its closing text or its recorded assistant half.
+     */
+    private val failureSentences = listOf(
+        "我没听清这句请求，再说一次试试。",
+        "这个操作一直没能推进，我先停下。",
+        "回答超时了，稍后再试。",
+        "已按你的要求取消。",
+        "智能助手这次没能给出结果。",
+    )
+
+    /**
+     * The production awaiting-user shape (0.5.4 Task 3): the model's question is `notify_user(awaiting_reply = true)`.
+     *
+     * The notification is emitted **while the run is `Running`**, so the run ends `AWAITING_USER` with `finalText=null`
+     * and the question is the only thing the wearer was given. The terminal after the call is what the transport sends
+     * for the tool-call turn; the loop ends at the tool result and never asks for a second request.
+     */
+    private fun awaitingQuestion(
+        rig: SmartTestRig,
+        text: String = "要现在开始吗？",
+        channel: String = "screen",
+    ) {
+        rig.model.onRequest = { request, listener ->
+            listener(
+                smartToolCall(
+                    "c1", "notify_user",
+                    """{"text":"$text","channel":"$channel","awaiting_reply":true}""",
+                    requestId = request.requestId,
+                ),
+            )
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+    }
+
+    /**
+     * An awaiting-user run whose tool is **not** `notify_user`, so nothing reached the wearer.
+     *
+     * Task 2's projection is generic: any successful `ActionResult.awaitingUser` ends the run as `AWAITING_USER`, not
+     * only `notify_user`'s. With no notification behind it this is the shape that reaches `submitOutcome`'s
+     * `ModelEnd.FAILED` fallback and `recordTurnAndCompress`'s failure-hint reply - the two settlement sites that must
+     * not invent a failure sentence for a turn that simply waits for the wearer.
+     */
+    private fun awaitingAction(rig: SmartTestRig, name: String = "ask_wearer") {
+        rig.actions.descriptors += smartAction(name)
+        rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "asked", awaitingUser = true) }
+        rig.model.onRequest = { request, listener ->
+            listener(smartToolCall("c1", name, requestId = request.requestId))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+    }
+
+    @Test fun `an awaiting-user run does not append a failure hint`() {
+        val rig = SmartTestRig()
+        rig.activate()
+        awaitingQuestion(rig)
+
+        rig.wakeAndFinal("开始吧")
+
+        assertEquals(listOf("要现在开始吗？"), rig.hintTexts, "the model's own question is the only hint")
+        assertTrue(
+            rig.hintTexts.none { it in failureSentences },
+            "an awaiting-user turn is not a failure: ${rig.hintTexts}",
+        )
+    }
+
+    @Test fun `an awaiting-user run settles the notification as the final answer`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        awaitingQuestion(rig)
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("开始吧")))
+        rig.tick()
+
+        val question = rig.output.hints.single()
+        assertEquals("要现在开始吗？", question.text, "the question is the answer, not a failure sentence")
+        assertTrue(rig.hintTexts.none { it in failureSentences })
+
+        // The closing fallback must not be added on top of the notification: the run end settles the question itself.
+        rig.tick(500)
+        assertEquals(1, rig.output.hints.size, "an awaiting-user run emits exactly one answer")
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), question.hintId, OutputStatus.Displayed, question.emitId))
+
+        assertEquals(
+            OfficialStatus.AUDIO_FINISHED.wire,
+            display.statuses[display.statuses.size - 2],
+            "the notification is the final answer, so it settles like one: ${display.statuses}",
+        )
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the question opens the answer round")
+        assertTrue(display.closes.isEmpty())
+    }
+
+    @Test fun `an awaiting-user run leaves the turn ready for the next utterance`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        awaitingQuestion(rig)
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("开始吧")))
+        rig.tick()
+        val question = rig.output.hints.single()
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), question.hintId, OutputStatus.Displayed, question.emitId))
+        val requestsAfterRun = rig.model.requests.size
+
+        // The wearer answers the question: their sentence is the next utterance, no second wake required.
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好的。") }
+        rig.plugin.handle(TranscriptEvent(rig.transcript("好，现在开始", turnId = "asr-2")))
+        rig.tick()
+
+        assertEquals(requestsAfterRun + 1, rig.model.requests.size, "the answer is accepted as the next utterance")
+        assertEquals("asr-2", rig.model.requests.last().turnId, "the turn stayed open for the wearer's answer")
+        assertTrue(OfficialStatus.LISTENING.wire in display.statuses, "the round waits for the wearer")
+    }
+
+    @Test fun `an awaiting-user run with no notification submits no fabricated failure sentence`() {
+        // The two settlement sites the review named: `submitOutcome` would append FAILURE_HINTS[FAILED] and finish with
+        // `ModelEnd.FAILED` for a successful action that only waits for the wearer. Nothing failed and nothing was
+        // said, so the honest settlement is silence plus a closed round - never "智能助手这次没能给出结果。".
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        awaitingAction(rig)
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我个忙")))
+        rig.tick()
+
+        assertTrue(rig.hintTexts.isEmpty(), "nothing was said, so no sentence may be shown: ${rig.hintTexts}")
+        assertEquals(
+            listOf(AssistantRoute.WAKE),
+            display.closes,
+            "nothing visible means nothing to continue: the round closes instead of hanging",
+        )
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "there is no displayed answer to continue from: ${display.statuses}",
+        )
+    }
+
+    @Test fun `an awaiting-user run with no notification records no fabricated transcript reply`() {
+        // `recordTurnAndCompress` assembles the assistant half; its failure-hint fallback is the other settlement site.
+        // Recording the failure sentence would keep a conversation the wearer never had.
+        val stores = com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute.entries
+            .associateWith { com.sheen.rokid.agent.ConversationStore() }
+        val rig = SmartTestRig(conversationStores = stores).also {
+            it.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
+        }
+        awaitingAction(rig)
+
+        rig.wakeAndFinal("帮我个忙")
+
+        val history = stores.getValue(com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute.WAKE).history()
+        val assistantTexts = history
+            .filterIsInstance<com.sheen.rokid.plugin.ModelHistoryItem.Text>()
+            .filter { it.role == com.sheen.rokid.plugin.MessageRole.ASSISTANT }
+            .map { it.text }
+        assertTrue(
+            assistantTexts.none { it in failureSentences },
+            "no fabricated failure sentence may be recorded: $assistantTexts",
+        )
+    }
 }

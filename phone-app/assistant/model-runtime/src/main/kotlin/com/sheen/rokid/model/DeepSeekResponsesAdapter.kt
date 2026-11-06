@@ -20,7 +20,7 @@ import java.util.Locale
  * (`ToolOutput.images`, restored by `ModelClientGateway`), never in `TOOL_ROUND` JSON (R6).
  */
 class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
-    val support = ProtocolSupport("DEEPSEEK_RESPONSES",
+    val support = ProtocolSupport(ProtocolIds.OPENAI_RESPONSES,
         setOf(InputModality.TEXT, InputModality.IMAGE), setOf(OutputModality.TEXT))
 
     /**
@@ -32,17 +32,28 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
      * carried by the budgeted overload below.
      */
     fun encode(profile: ModelProfile, frame: RequestFrame): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
         require(InputModality.TEXT in profile.inputs && OutputModality.TEXT in profile.outputs)
         val tools = frame.tools.map(::descriptor)
         val body = buildJsonObject {
             put("model", profile.model)
             put("instructions", frame.systemText)
             put("stream", true)
-            put("max_output_tokens", profile.maxOutputTokens)
+            // 0.53 design (revised) §T3/§T5: the user switch is the only behaviour switch. With it on, the official
+            // `reasoning.effort` goes out on every request (tools included) and `max_output_tokens` is **omitted** so
+            // the provider's documented 64K/128K default applies. With it off, no thinking field at all is sent.
+            if (!profile.thinkingEnabled) {
+                put("max_output_tokens", profile.maxOutputTokens)
+                // 0.5.4: an explicit off is required where the provider's default is thinking on; omitting the field
+                // left DeepSeek reasoning, so the off switch was a no-op there.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("reasoning", buildJsonObject { put("effort", "none") })
+                }
+            } else {
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
+            }
             if (tools.isNotEmpty()) {
                 put("tool_choice", "auto")
-                put("reasoning", buildJsonObject { put("effort", "none") })
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }
             put("input", buildJsonArray {
@@ -97,7 +108,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     } catch (_: Exception) { null }
 
     fun encode(profile: ModelProfile, budgeted: BudgetedRequest): ByteArray {
-        require(profile.protocolId == support.id && budgeted.request.profileId == profile.id && budgeted.request.profileRevision == profile.revision)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id && budgeted.request.profileId == profile.id && budgeted.request.profileRevision == profile.revision)
         require(InputModality.TEXT in profile.inputs && OutputModality.TEXT in profile.outputs)
         require(budgeted.request.output == OutputModality.TEXT)
         // 0.25 §4.10: this version sends TEXT + IMAGE. An audio part is refused visibly rather than dropped, and the
@@ -115,19 +126,28 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("model", profile.model)
             put("instructions", budgeted.request.instructions)
             put("stream", true)
-            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
-            // when the request declares no cap of its own (every pre-0.3 caller).
-            put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            // 0.3 design §5.2: with the switch off the turn policy's cap wins, and the profile's value is only the
+            // window reservation used when the request declares no cap of its own. 0.53 (revised) §T5: with the
+            // switch on no `max_output_tokens` is sent at all, so the official 64K/128K default applies.
+            if (!profile.thinkingEnabled) {
+                put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+                // Both overloads write the same mapping; an explicit off is required where the provider defaults to
+                // thinking on.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("reasoning", buildJsonObject { put("effort", "none") })
+                }
+            } else {
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile)) })
+            }
             if (tools.isNotEmpty()) {
-                // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
-                // back `incomplete/max_output_tokens`: the deliberation is charged against the output budget and the
-                // call never arrives. `tool_choice` is `auto` only — the endpoint answered HTTP 400 to `required`.
+                // `tool_choice` is `auto` only — the endpoint answered HTTP 400 to `required`. The effort decision is
+                // made above by the user switch alone; a tool request is no longer forced to `none`.
                 put("tool_choice", "auto")
-                put("reasoning", buildJsonObject { put("effort", "none") })
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }
             put("input", buildJsonArray {
-                budgeted.request.history.forEach { add(historyItem(it)) }
+                val replayReasoning = budgeted.request.tools.isNotEmpty()
+                budgeted.request.history.forEach { item -> historyItems(item, replayReasoning).forEach { add(it) } }
                 // The current turn. Text alone keeps the proven plain-string message shape; any image makes the whole
                 // turn one user message whose content is the content-item array (text and images in caller order).
                 val input = budgeted.request.input
@@ -152,17 +172,31 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
         return Json.encodeToString(JsonObject.serializer(), body).toByteArray(Charsets.UTF_8)
     }
 
-    private fun historyItem(item: ModelHistoryItem) = when (item) {
-        is ModelHistoryItem.Text -> message(item.role.name.lowercase(Locale.ROOT), item.text)
+    /**
+     * 0.53 design (revised) §T4: one history item becomes one or two wire items.
+     *
+     * When the request carries `tools`, an assistant item's captured `reasoning` is replayed as a `reasoning` input
+     * item **immediately before** the assistant message it belongs to; without tools it is not replayed. The capture is
+     * not gated on a capability guess (owner ruling A) — a turn whose switch was off may still have been given reasoning
+     * by the server, and the next tool request must carry it. The item's inner shape is kept in the one [reasoningItem]
+     * helper so a gateway-probe correction changes a single place.
+     */
+    private fun historyItems(item: ModelHistoryItem, replayReasoning: Boolean): List<JsonElement> = when (item) {
+        is ModelHistoryItem.Text -> buildList {
+            if (replayReasoning && item.role == MessageRole.ASSISTANT) {
+                item.reasoning?.let { add(reasoningItem(it)) }
+            }
+            add(message(item.role.name.lowercase(Locale.ROOT), item.text))
+        }
         // The wire shape the proven probe sent: the model's own function_call item, echoed verbatim.
-        is ModelHistoryItem.ToolCall -> buildJsonObject {
+        is ModelHistoryItem.ToolCall -> listOf(buildJsonObject {
             put("type", "function_call")
             put("id", item.itemId)
             put("call_id", item.callId)
             put("name", item.name)
             put("arguments", item.argsJson)
-        }
-        is ModelHistoryItem.ToolOutput -> buildJsonObject {
+        })
+        is ModelHistoryItem.ToolOutput -> listOf(buildJsonObject {
             put("type", "function_call_output")
             put("call_id", item.callId)
             // A text-only result is byte-for-byte the pre-0.25 item. A result with images becomes the content-item
@@ -178,7 +212,22 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
                     else add(inputImagePart(resolved))
                 }
             })
-        }
+        })
+    }
+
+    /**
+     * 0.53 design §T11: the reasoning input item. The official docs only state that plain-text content merges into the
+     * adjacent assistant message; the inner shape below is the one the real-gateway probe accepts. It lives in this one
+     * helper so a probe correction touches a single place (and its matching test).
+     */
+    private fun reasoningItem(reasoning: String) = buildJsonObject {
+        put("type", "reasoning")
+        put("content", buildJsonArray {
+            add(buildJsonObject {
+                put("type", "reasoning_text")
+                put("text", reasoning)
+            })
+        })
     }
 
     /**
@@ -205,6 +254,16 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     private fun resolveImage(artifactId: String): ResolvedImage =
         media?.resolveImage(artifactId)
             ?: throw ContractError.CapabilityMissing("image ref unresolvable: $artifactId")
+
+    /**
+     * 0.53 design (revised) §T5: the official effort names for the three catalog levels. Only called when the user
+     * switch is on; the switched-off request carries no reasoning field at all.
+     */
+    private fun reasoningEffort(profile: ModelProfile): String = when (profile.thinkingEffort) {
+        ThinkingEffort.LOW -> "low"
+        ThinkingEffort.HIGH -> "high"
+        ThinkingEffort.MAX -> "max"
+    }
 
     /**
      * The flattened descriptor proven against the endpoint: `{type, name, description, parameters}` at the top level.

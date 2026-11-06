@@ -446,6 +446,28 @@ class SmartPerceptionRendererTest {
     }
 
     @Test
+    fun `the telemetry names the include set and the request index`() {
+        // 0.5.4 Task 8 (§6.2.2): `elements=0` needs attribution. The line says which sources the request asked for and
+        // whether it was the opening request or a continuation, before the existing counts.
+        val text = SmartPerceptionRenderer.render(snapshot(), state(), PerceptionPolicy(), full = false)
+
+        val telemetry = SmartPerceptionRenderer.telemetry(
+            snapshot(),
+            text,
+            include = "ambient",
+            request = 1,
+        )
+
+        assertEquals(
+            "P3_PERCEPTION include=ambient request=1 snap=snap-004 elements=2 notifications=2 calendar=1 " +
+                "images=0 screenChars=${text.length} truncated=false " +
+                "coverage=screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok " +
+                "vision=ok glasses=ok device=ok",
+            telemetry,
+        )
+    }
+
+    @Test
     fun `a truncated screen keeps its marker and an unavailable source keeps its token`() {
         val cut = snapshot(
             elements = listOf(

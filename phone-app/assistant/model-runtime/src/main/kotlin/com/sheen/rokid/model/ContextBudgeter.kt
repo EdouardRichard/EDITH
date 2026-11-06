@@ -84,15 +84,21 @@ class ContextBudgeter {
                 is InputPart.Audio -> throw ContractError.CapabilityMissing("Audio estimator and encoder unavailable")
             }
             fun itemCost(item: ModelHistoryItem): Long = when (item) {
-                is ModelHistoryItem.Text -> message(item.text)
+                // 0.53 §T6: reasoning is part of the online request (the adapter replays it with the assistant
+                // message), so the budgeter must price it; an unpriced reasoning block would let the trimmer hand
+                // the provider a request larger than the window this stage just accepted.
+                is ModelHistoryItem.Text -> Math.addExact(message(item.text), estimateText(item.reasoning ?: ""))
                 is ModelHistoryItem.ToolCall -> message(item.name + item.argsJson)
                 is ModelHistoryItem.ToolOutput -> Math.addExact(message(item.output), imageCost(item.images))
             }
             var total = Math.addExact(32L, message(request.instructions))
             input.forEach { total = Math.addExact(total, partCost(it)) }
             history.forEach { total = Math.addExact(total, itemCost(it)) }
+            // 0.53 design (revised) §T5: when the user switch is on, the adapters send no output cap and the provider
+            // applies its official 64K/128K default, so this stage reserves exactly that documented value. When the
+            // switch is off the reservation is `profile.maxOutputTokens` — the pre-0.53 formula.
             val limit = minOf(profile.inputBudgetTokens.toLong(),
-                profile.usableWindowTokens.toLong() - profile.maxOutputTokens.toLong() - profile.safetyTokens.toLong())
+                profile.usableWindowTokens.toLong() - ThoughtBudget.reserve(profile).toLong() - profile.safetyTokens.toLong())
             val removed = mutableListOf<String>()
             var removedGroups = 0
             while (total > limit && removedGroups < groups.size) {

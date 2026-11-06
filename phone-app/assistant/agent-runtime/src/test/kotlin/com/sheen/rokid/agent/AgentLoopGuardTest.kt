@@ -40,7 +40,9 @@ import kotlin.test.assertTrue
  */
 class AgentLoopGuardTest {
 
-    private val planText = "接下来我会先观察当前屏幕，然后再点按确认。"
+    // 0.5.4 Task 1: this fixture no longer contains "然后再" — the tightened plan nudge rejects that phrase
+    // (design §6.1.2), and these tests are about the nudge cap and the identical-text rule, not that wording.
+    private val planText = "接下来我会先观察当前屏幕，然后点按确认。"
 
     private fun request(
         allowPlanNudge: Boolean = false,
@@ -560,6 +562,140 @@ class AgentLoopGuardTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(2, gateway.requests.size)
+    }
+
+    // ------------------------------------------------ plan nudge tightening (0.5.4 Task 1)
+
+    /**
+     * Runs one seeding tool call and then [text], and asserts the loop accepted [text] without a plan nudge.
+     *
+     * The third reply is scripted on purpose: a regression that nudges still completes cleanly and fails on the request
+     * count, instead of dying on an exhausted fixture.
+     */
+    private fun assertNoPlanNudge(text: String) {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = text),
+                reply(text = "好。"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(2, gateway.requests.size, "must not nudge: $text")
+        assertEquals(text, run.finalText)
+        assertEquals(0, run.planNudgeCap)
+    }
+
+    /**
+     * Mirror of [assertNoPlanNudge]: the seeded run MUST nudge [text] exactly once, and the scripted fallback answer is
+     * what the run finally returns. Used as the control half of the reject-marker table below.
+     */
+    private fun assertPlanNudged(text: String) {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = text),
+                reply(text = "好。"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(3, gateway.requests.size, "must nudge: $text")
+        assertEquals("好。", run.finalText)
+        assertTrue(
+            gateway.requests[2].history.any { it is ModelHistoryItem.Text && it.text.contains("Observe first") },
+            "the nudge instruction must reach the model for: $text",
+        )
+    }
+
+    @Test
+    fun `a completion sentence with the single character zai is never nudged`() {
+        listOf("不再重复了", "再见", "下单前再跟你确认", "然后再打开").forEach(::assertNoPlanNudge)
+    }
+
+    @Test
+    fun `a question sentence is never nudged`() {
+        listOf(
+            "需要你确认地址和商品",
+            "请问从哪家买",
+            // 0.5.4 Task 1: unlike the two pins above (they carry no plan marker at all), this case carries "我先"
+            // and is rejected only by the NON_PLAN_MARKERS "是否" / "已经" / "？" check.
+            "我先确认一下是否已经发货？",
+        ).forEach(::assertNoPlanNudge)
+    }
+
+    /**
+     * 0.5.4 Task 1 (design §6.1.2): every `NON_PLAN_MARKERS` entry suppresses the nudge **on its own**.
+     *
+     * Each fixture carries a surviving plan marker (`我先` / `我会先`) and no completion marker, so without the reject
+     * branch `shouldPlanNudge` would return true and the run would be nudged; only a literal substring match on the
+     * entry can reject it. The fixtures deliberately carry no *other* reject entry, so removing or mistyping one entry
+     * turns exactly one case red instead of being masked by a neighbour. Each case is paired with a control assertion:
+     * the same sentence with only that reject phrase removed IS nudged. (The older question pins carry no plan marker,
+     * so they would still pass if the reject list were deleted.)
+     */
+    @Test
+    fun `every non-plan marker suppresses the nudge even when the text also names a plan`() {
+        val fixtures = listOf(
+            "不再" to "我先看看，不再重复操作。",
+            "再见" to "我先处理完这一项，再见。",
+            "然后再" to "我先打开设置，然后再继续。",
+            "已经" to "我先确认一下，已经发过货了。",
+            "完成" to "我先完成设置，再回来汇报。",
+            "请确认" to "我会先确认，请确认收货地址。",
+            "是否" to "我先确认一下是否发货。",
+            "吗" to "我先看一下，这样可以吗。",
+            "？" to "我先看一下？",
+        )
+
+        assertEquals(
+            9,
+            fixtures.size,
+            "one fixture per NON_PLAN_MARKERS entry; add a case when the reject list grows",
+        )
+        fixtures.forEach { (marker, text) ->
+            assertTrue(marker in text, "the fixture must carry its own reject marker <$marker>: $text")
+            assertNoPlanNudge(text)
+            // Control: drop only the reject phrase and the same sentence IS nudged, so this fixture really depends on
+            // the reject branch — not on the plan-marker or completion-marker rules.
+            val withoutReject = text.replaceFirst(marker, "")
+            assertTrue(withoutReject != text, "removing <$marker> must change the fixture: $text")
+            assertPlanNudged(withoutReject)
+        }
+    }
+
+    @Test
+    fun `a real future plan sentence is still nudged`() {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = "我先打开美团，再搜索小象超市"),
+                reply(text = "好。"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("好。", run.finalText)
+        assertEquals(3, gateway.requests.size, "a real future plan must be nudged exactly once")
+        assertTrue(
+            gateway.requests[2].history.any { it is ModelHistoryItem.Text && it.text.contains("Observe first") },
+            "the nudge instruction must reach the model: ${gateway.requests[2].history}",
+        )
+    }
+
+    @Test
+    fun `a completion marker still suppresses the nudge`() {
+        assertNoPlanNudge("接下来我会先检查，抱歉无法继续。")
     }
 
     // ---------------------------------------------------------------- tool timeout (R60)

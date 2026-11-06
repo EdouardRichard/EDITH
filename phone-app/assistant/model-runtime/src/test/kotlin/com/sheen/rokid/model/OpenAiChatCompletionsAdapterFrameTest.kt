@@ -187,16 +187,26 @@ class OpenAiChatCompletionsAdapterFrameTest {
     }
 
     @Test
-    fun `a request level output cap overrides the profile cap`() {
+    fun `a request level output cap overrides the profile cap and the budgeted body keeps system and tools`() {
         // 0.3 design §5.2: the turn policy's cap is the wire value; the profile's is only the window reservation.
+        // 0.52: the budgeted overload is the live path, so it must carry the system slot and the tool table the legacy
+        // frame overload always carried — before this task it silently dropped both.
         val request = requestFixture().copy(
             profileId = profile.id,
             profileRevision = profile.revision,
             maxOutputTokens = 512,
+            tools = listOf(
+                ToolSpec("get_weather", "Get weather", """{"type":"object","properties":{"city":{"type":"string"}}}"""),
+            ),
         )
         val body = Json.parseToJsonElement(
             String(adapter.encode(profile, ContextBudgeter().prepare(profile, request)), Charsets.UTF_8),
         ).jsonObject
         assertEquals(512, body["max_tokens"]!!.jsonPrimitive.int)
+        val messages = body["messages"]!!.jsonArray
+        assertEquals("system", messages[0].jsonObject["role"]!!.jsonPrimitive.content)
+        assertEquals("synthetic instructions", messages[0].jsonObject["content"]!!.jsonPrimitive.content)
+        assertEquals(1, body["tools"]!!.jsonArray.size)
+        assertEquals("auto", body["tool_choice"]!!.jsonPrimitive.content)
     }
 }

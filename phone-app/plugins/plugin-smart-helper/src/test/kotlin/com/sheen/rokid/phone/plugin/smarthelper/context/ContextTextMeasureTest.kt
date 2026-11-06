@@ -35,6 +35,17 @@ class ContextTextMeasureTest {
     }
 
     @Test
+    fun `summary text never carries reasoning while the reasoning is still measured`() {
+        // 0.53: reasoning is a real part of the request payload the plugin reports (`P3_CONTEXT historyChars`), but it
+        // must never become summary or memory text — that path writes what the wearer said, not the model's thoughts.
+        val item = ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "想")
+
+        assertEquals("答".length + "想".length, item.estimatedLength(), "the reported size must include the reasoning")
+        assertEquals("答", item.estimatedText(), "the summary/memory text must stay the answer only")
+        assertTrue("想" !in item.estimatedText())
+    }
+
+    @Test
     fun `a history item contributes only the text the model reads`() {
         // Identities (call id, tool name) are bookkeeping; counting them would inflate an estimate without bounding
         // anything the provider actually prices.

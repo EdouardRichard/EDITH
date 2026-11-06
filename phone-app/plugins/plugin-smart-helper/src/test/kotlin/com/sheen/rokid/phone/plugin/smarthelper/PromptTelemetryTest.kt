@@ -63,9 +63,9 @@ class PromptTelemetryTest {
     /**
      * The production store-backed shape: production always injects one `ConversationStore` per route.
      *
-     * [wideWindow] keeps the gateway's trimmer out of a test that measures the dynamic tail: since Phase 4A Task 6 the
-     * 24-tool system prompt no longer fits the default small fixture together with a retry segment, and a legitimate
-     * trim would make the measured `dynamicChars` depend on the trimmer instead of on the loop's segment.
+     * [wideWindow] re-asserts the wide session window explicitly. These tests measure `dynamicChars`, so the gateway's
+     * trimmer must never decide what the number counts; pinning the window keeps that true even if the shared fixture
+     * default moves again.
      */
     private fun wakeRig(
         deviceProfile: DeviceProfile? = profile,
@@ -160,9 +160,9 @@ class PromptTelemetryTest {
             ),
             conversationStores = smartStores(),
         )
-        // A wide window so the gateway's trimmer never drops the tail these tests measure: with the default small
-        // fixture the production system prompt plus all three tails would exceed the hard limit, and a legitimate cut
-        // (or `restoreCurrentUtterance`) would make the sizes depend on the trimmer instead of on this fix.
+        // A wide window so the gateway's trimmer never drops the tail these tests measure: with the system prompt plus
+        // all three tails a legitimate cut (or `restoreCurrentUtterance`) would make the sizes depend on the trimmer
+        // instead of on this fix.
         rig.profile = smartProfile(
             usableWindowTokens = 32_000,
             inputBudgetTokens = 16_000,
@@ -216,7 +216,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.WAKE, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.5\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.5\.4 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=WAKE staticChars=\d+ dynamicChars=\d+$""",
             ).matches(line),
             "the line must carry exactly the pinned plan's identity, route and sizes: $line",
@@ -254,6 +254,21 @@ class PromptTelemetryTest {
             assertTrue("route=WAKE" in line, line)
             assertTrue(Regex("""staticChars=\d+ dynamicChars=\d+$""").containsMatchIn(line), line)
         }
+    }
+
+    @Test
+    fun `each request's perception line names its include set and request index`() {
+        // 0.5.4 Task 8 (§6.2.2): request 0 is the full opening read, a continuation asks only for the ambient sources.
+        // The plugin, not the renderer, knows which request it is building, so the wiring is pinned here.
+        val rig = tailsRig("body")
+        notifyThenAnswer(rig)
+
+        val lines = withLines { rig.wakeAndFinal("现在几点了") }
+
+        val perceptions = lines.filter { it.startsWith("P3_PERCEPTION ") }
+        assertEquals(2, perceptions.size, "one line per rendered block: $lines")
+        assertTrue("include=all request=0" in perceptions[0], perceptions[0])
+        assertTrue("include=ambient request=1" in perceptions[1], perceptions[1])
     }
 
     @Test
@@ -348,7 +363,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.5\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.5\.4 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE_HINT staticChars=\d+ dynamicChars=0$""",
             ).matches(line),
             "the proactive line must carry exactly the same pinned field list as the wake line: $line",
@@ -454,7 +469,7 @@ class PromptTelemetryTest {
     fun `a retry instruction is counted and a request without perception still logs`() {
         // Review Important (R12): a retry re-assembles the frame with the loop's RETRY segment, so the line is
         // emitted again and counts it. This rig has no perception provider at all, and the request still logs.
-        // The wide window is the same seam `tailsRig` uses: the 24-tool system prompt must not make the trimmer decide
+        // The wide window is the same seam `tailsRig` uses: the 25-tool system prompt must not make the trimmer decide
         // what this count measures.
         val rig = wakeRig(wideWindow = true)
         rig.actions.runtimeStateLine = "foreground=com.android.settings"

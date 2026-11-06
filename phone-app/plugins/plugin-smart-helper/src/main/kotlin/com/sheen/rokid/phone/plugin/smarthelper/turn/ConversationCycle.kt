@@ -79,6 +79,17 @@ internal class ConversationCycle(
      * opened a new turn between the close decision and this callback is not torn down by it.
      */
     private val cancelTurn: (route: AssistantRoute, turnId: String) -> Unit = { _, _ -> },
+    /**
+     * 0.5.4 Task 5: whether the plugin has a **fresh** next sentence queued for [route].
+     *
+     * The official continue-off branch closes after 1 s, but the wearer may already have said the next sentence while
+     * the answer was being produced. That sentence is not a reason to end the conversation: when this is true the exit
+     * opens the continuation that consumes it instead of closing. The plugin owns the single queue slot and its TTL, so
+     * the cycle only asks; a slot past that TTL is neither consumable nor a reason to continue, and the plugin answers
+     * `false` for it so the exit takes the normal close branch (which clears it). `{ false }` keeps every pre-0.5.4
+     * direct caller (including this package's tests) on the close branch.
+     */
+    private val hasQueuedUtterance: (route: AssistantRoute) -> Boolean = { false },
     /** Evidence lines only; tests substitute a recorder. */
     private val log: (String) -> Unit = { line -> P3Log.line(line) },
 ) {
@@ -736,15 +747,25 @@ internal class ConversationCycle(
 
     private fun onContinueOffTimeout(route: AssistantRoute, epoch: Long) {
         var cancelledTurn: String? = null
+        var continuationTurn: String? = null
         synchronized(lock) {
             val current = state(route)
             if (current.continueOffEpoch != epoch) return
             current.continueOffExpiry = null
             val turnId = current.turnId ?: return
-            log("P3_CONV close route=${route.name} reason=continue_off")
-            cancelledTurn = turnId
-            closeLocked(route, current)
+            if (hasQueuedUtterance(route)) {
+                // 0.5.4 Task 5: the wearer already said the next sentence. The exit is a continuation seam then - it
+                // consumes that sentence as the next turn's utterance instead of dropping it with a close.
+                log("P3_CONV queue_consumed route=${route.name} reason=continue_off")
+                continuationTurn = turnId
+            } else {
+                log("P3_CONV close route=${route.name} reason=continue_off")
+                cancelledTurn = turnId
+                closeLocked(route, current)
+            }
         }
+        // Outside the lock: the opener re-enters the plugin and eventually this cycle's `onWake`.
+        continuationTurn?.let { openContinuation(route, it) }
         cancelledTurn?.let { cancelTurn(route, it) }
     }
 

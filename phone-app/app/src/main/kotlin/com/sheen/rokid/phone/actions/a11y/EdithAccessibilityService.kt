@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.view.Display
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -18,9 +19,11 @@ import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.Observation
+import com.sheen.rokid.device.Point
 import com.sheen.rokid.device.Ref
 import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.Screenshot
+import com.sheen.rokid.device.Stroke
 import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
@@ -126,6 +129,23 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
             ?: runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
         return Foreground(packageName, foregroundActivity)
     }
+
+    /**
+     * Whether the focused accessibility window is a normal application window (0.5.4 T11 fix round).
+     *
+     * [foreground] is only a package-level witness: a system overlay that never raises a window-state event can stay
+     * invisible to it. `windows` exposes the window types directly, so the focused window's type is a second,
+     * type-level witness for the coordinate gate. `isFocused` is the primary signal; `isActive` is the documented
+     * fallback when a vendor build reports no focused window. No focused window, no window list, or a throwing probe
+     * answers `null` ("cannot tell"), which the backend refuses rather than grants. No window content is read.
+     */
+    override fun focusedWindowIsApplication(): Boolean? = runCatching {
+        val visibleWindows = windows ?: return@runCatching null
+        val focused = visibleWindows.firstOrNull { it.isFocused }
+            ?: visibleWindows.firstOrNull { it.isActive }
+            ?: return@runCatching null
+        focused.type == AccessibilityWindowInfo.TYPE_APPLICATION
+    }.getOrNull()
 
     /**
      * The active window's root package — the second witness `open` verifies a launch against.
@@ -319,11 +339,78 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         return result
     }
 
+    /**
+     * Re-reads the text the node at [index] carries now (0.5.4 T12).
+     *
+     * This is the production half of `input_text`'s verification: after `ACTION_SET_TEXT` the snapshot is invalidated,
+     * so the field must be read from a **fresh** walk. [filter] must be the one the acted-on snapshot used, because
+     * indices are assigned after filtering. The walk is deliberately side-effect free with respect to the tracked
+     * snapshot - it does not become the next actionable snapshot, and it stores no node references. `null` on a missing
+     * tree/index or a platform failure, which the backend reports as `TEXT_NOT_APPLIED`, never as success.
+     */
+    override fun textAt(index: Int, filter: ScreenFilter): String? = runCatching {
+        AccessibilityNodeSource(this).walkNodes(filter).getOrNull(index)?.text
+    }.getOrNull()
+
+    /**
+     * Whether [snapshotId] is still the channel's current snapshot (0.5.4 T12).
+     *
+     * The service is the authority: it clears its snapshot after every mutating action. Reading the volatile id into a
+     * local keeps the null-check and the comparison on the same value.
+     */
+    override fun isSnapshotValid(snapshotId: String): Boolean {
+        val current = currentSnapshotId ?: return false
+        return snapshotId == current
+    }
+
     override fun structuralFingerprint(): ScreenFingerprint {
         val source = AccessibilityNodeSource(this)
         val snap = SnapshotBuilder.build(source)
         return snap.fingerprint
     }
+
+    // ── Coordinate gestures (0.5.4 T11) ──────────────────────────────────────
+
+    /**
+     * A coordinate tap is one real gesture, not a platform node action: there is no node to receive it.
+     *
+     * `dispatchGesture` is the same synthetic-gesture path the adapter already uses for a double tap and for a
+     * non-clickable node's centre fallback; the completion callback is what makes `true` mean "the platform completed
+     * it", not "the platform accepted the request".
+     */
+    override fun clickAt(x: Int, y: Int): Boolean = dispatchPointGesture(x, y, COORD_TAP_DURATION_MILLIS)
+
+    /** One long stroke at the point; longer than the platform's ~500 ms long-press threshold. */
+    override fun longPressAt(x: Int, y: Int): Boolean = dispatchPointGesture(x, y, COORD_LONG_PRESS_DURATION_MILLIS)
+
+    private fun dispatchPointGesture(x: Int, y: Int, durationMillis: Long): Boolean =
+        adapter.dispatchGesture(Gesture(listOf(Stroke(listOf(Point(x, y)), 0L, durationMillis))))
+
+    /**
+     * The display rectangle in the same screen-pixel space as the accessibility bounds.
+     *
+     * `currentWindowMetrics` is preferred on API 30+ (the same source [com.sheen.rokid.phone.context.AndroidDeviceStateProvider]
+     * uses for the device profile), but an `AccessibilityService` is a non-UI context and some vendor builds throw from
+     * it. That probe is therefore caught **on its own**, and [resolveScreenBounds] always tries the always-present
+     * `resources.displayMetrics` fallback afterwards; wrapping both in one `runCatching` would turn the throw into a
+     * `null` answer and make every coordinate action refuse `MISSING_POINT` on device (T11 fix round). `null` means
+     * "neither source could read a positive display", which the backend treats as fail-closed rather than as a
+     * 0-sized screen.
+     */
+    override fun screenBounds(): ScreenBounds? = resolveScreenBounds(
+        windowProbe = {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                getSystemService(WindowManager::class.java)?.currentWindowMetrics?.bounds
+                    ?.let { ScreenBounds(it.left, it.top, it.right, it.bottom) }
+            } else {
+                null
+            }
+        },
+        fallbackProbe = {
+            val metrics = resources.displayMetrics
+            metrics.widthPixels to metrics.heightPixels
+        },
+    )
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -535,6 +622,10 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 /** Five seconds is the whole budget for one screenshot or one synthetic gesture. */
 private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
 private const val GESTURE_TIMEOUT_MILLIS = 5_000L
+
+/** Coordinate gesture durations: a tap is a short stroke, a long press holds past the platform's ~500 ms threshold. */
+private const val COORD_TAP_DURATION_MILLIS = 50L
+private const val COORD_LONG_PRESS_DURATION_MILLIS = 600L
 
 /**
  * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).

@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -29,19 +30,32 @@ import androidx.compose.ui.window.DialogProperties
 internal const val BACK_DESCRIPTION = "返回"
 
 /**
- * The full-screen detail surface shared by the skills and memory pages (U-3/U-4, approved spec §4.2.3).
+ * The full-screen detail surface shared by the skills and memory pages (U-3/U-4, approved spec §4.2.3) and, since 0.52,
+ * by the settings shell.
  *
  * A full-screen Compose `Dialog` rather than a navigation destination: the app has no navigation library and the two
  * pages only need "show one document, go back", so adding one would be a dependency for a screen transition. The
  * system back button and the arrow both end at [onBack], because a dialog's back press arrives as `onDismissRequest`.
  *
  * The body is selectable on purpose: the reason to open a SKILL or a memory in full is to read or copy what the file
- * actually says.
+ * actually says. [selectionEnabled] = false keeps that text-selection container out of form pages, where selection
+ * interferes with text-field interaction.
+ *
+ * [actions] is the header's trailing slot (0.52 §3.1): a settings page can put its own page-level control — for example
+ * 「获取模型」 - beside the title without every page growing its own header. An empty lambda keeps every existing call
+ * source-compatible.
+ *
+ * [scrollable] = false gives the body to a page-owned scroll container (the model service's `LazyColumn`, 0.52 I5). The
+ * shared `verticalScroll` cannot wrap a lazy list: an unbounded-height list composes every row and defeats the whole
+ * point. The caller keeps the header and the dialog; the page owns the full-height list.
  */
 @Composable
 internal fun PhoneDetailPage(
     title: String,
     onBack: () -> Unit,
+    actions: @Composable RowScope.() -> Unit = {},
+    selectionEnabled: Boolean = true,
+    scrollable: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Dialog(
@@ -62,13 +76,21 @@ internal fun PhoneDetailPage(
                         style = MaterialTheme.typography.titleLarge,
                         modifier = Modifier.weight(1f),
                     )
+                    actions()
                 }
                 HorizontalDivider()
+                val scrollState = rememberScrollState()
                 Column(
-                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                    Modifier.fillMaxSize()
+                        .then(if (scrollable) Modifier.verticalScroll(scrollState) else Modifier)
+                        .padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    SelectionContainer {
+                    if (selectionEnabled) {
+                        SelectionContainer {
+                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { content() }
+                        }
+                    } else {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { content() }
                     }
                 }

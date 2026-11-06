@@ -31,8 +31,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
-import com.sheen.rokid.storage.MemoryProfileRepository
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
@@ -376,8 +375,8 @@ class DetachedAudioWiringTest {
             val chosen = profile("p-1")
             val wiring = SmartWiring(
                 SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                    profileId = chosen.id, cooldownMillis = 3000L),
-                FixedProfiles(chosen), clock, ManualScheduler(clock))
+                    cooldownMillis = 3000L),
+                FixedProfiles(chosen), clock, ManualScheduler(clock), activeProfile = { chosen })
             val environment = CxrHostEnvironment(clock = clock, input = loop, liveOutput = { LiveDisplay() },
                 scheduler = ManualScheduler(clock),
                 providers = mapOf(
@@ -395,7 +394,7 @@ class DetachedAudioWiringTest {
                     Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
-            root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+            root = HostCompositionRoot(HostRuntime(1, environment), FixedProfiles(chosen), InertModel(),
                 environment,
                 smartWiring = wiring,
                 rokidConnectionFactory = if (withConnection) { { FakeTransportConnection(transport) } } else null,
@@ -572,11 +571,11 @@ class DetachedAudioWiringTest {
     }
 
     /**
-     * 0.4 Task 8 fix 1: Settings -> profile selection pauses the active plugin through
-     * `HostCompositionRoot.applyProfileSelection`, which used to call `host.pause()` directly. That bypassed
-     * `disarmAudioEpoch`, so a detached session's recorder, ingress, poll loop and CPU hold all outlived the pause
-     * (spec §4.5 "会话暂停/停止: 停采集、清 epoch、释放 AudioRecord" and §4.6 "release on pause"). The selection is the
-     * production seam `ProfileViewModel.select` calls, so driving it here is the user-reachable path without a UI.
+     * 0.4 Task 8 fix 1: a model switch pauses the active plugin through `HostCompositionRoot.stopForModelSwitch`,
+     * which used to be an internal `host.pause()` call. That bypassed `disarmAudioEpoch`, so a detached session's
+     * recorder, ingress, poll loop and CPU hold all outlived the pause (spec §4.5 "会话暂停/停止: 停采集、清 epoch、释放
+     * AudioRecord" and §4.6 "release on pause"). 0.52 moved the selection onto the catalog; its production sequence is
+     * stop first and apply the new projection second, so driving those two calls is the user-reachable path without a UI.
      */
     @Test
     fun aProfileSelectionWhileDetachedReleasesThePhoneCaptureAndTheWakeLock() {
@@ -587,7 +586,8 @@ class DetachedAudioWiringTest {
             assertTrue("an armed detached session holds the CPU awake", rig.wakeLock.isHeld())
 
             val lines = withP3Sink { captured ->
-                rig.root.applyProfileSelection("smart-assistant", profile("p-2"))
+                rig.root.stopForModelSwitch()
+                rig.root.onCatalogSelectionChanged(profile("p-2"))
                 captured.toList()
             }
 

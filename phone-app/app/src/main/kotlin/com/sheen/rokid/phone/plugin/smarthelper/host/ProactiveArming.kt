@@ -3,6 +3,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -83,13 +84,28 @@ internal class ProactiveArming(
      * 0.4 the detach mode** - over the user's real settings. The switch still moves in memory (the UI must respond),
      * and the next successful read reconciles; losing one preference change is recoverable, silently wiping the rest
      * is not.
+     *
+     * 0.52 design §4.2: the write's outcome is **returned**, not only logged. The page renders
+     * [SettingsSaveResult]'s mapped failure inline, because a persistence refusal the user cannot see is exactly the
+     * defect the settings redesign removes. A null store (a hand-built rig) keeps the in-memory switch working but
+     * answers `SETTINGS_STORE_UNAVAILABLE`, mirroring `DetachGate`.
      */
-    fun set(enabled: Boolean) {
+    fun set(enabled: Boolean): SettingsSaveResult {
         on.value = enabled
-        val target = store ?: return
-        runCatching { target.loadForWrite() }.onFailure {
+        val target = store
+            ?: return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_STORE_UNAVAILABLE)
+        val stored = runCatching { target.loadForWrite() }.onFailure {
             android.util.Log.i("EdithHost", "proactive switch: settings unreadable, not persisting this change")
-        }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(proactiveEnabled = enabled)) } }
+        }.getOrNull()
+            ?: return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SETTINGS_UNREADABLE)
+        return runCatching {
+            target.save(stored.copy(proactiveEnabled = enabled))
+            SettingsSaveResult(saved = true)
+        }.onFailure {
+            android.util.Log.i("EdithHost", "proactive switch: settings write failed, not persisted")
+        }.getOrElse {
+            SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SAVE_FAILED)
+        }
     }
 
     companion object {

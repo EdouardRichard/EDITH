@@ -38,3 +38,13 @@
 # build.gradle.kts because the models ship on the device. The inference classes R8 was wrongly stripping
 # are all in the parent package, so nothing needed is lost.
 -keep class com.google.ai.edge.litert.* { *; }
+
+# 0.5.3 release fix: the phone-only overlay installs the Compose ViewTree owners **reflectively**
+# (`PhoneOnlyOverlayService.installLifecycle`: Class.forName + getMethod("set", …)) because the Kotlin compile classpath
+# exposes the KMP metadata artifact, not the Android AAR's androidMain class (DECISIONS §21.1 / CONTRACTS §8).
+# Without these rules R8 renames/strips `set`, `getMethod("set", …)` throws NoSuchMethodException, and enabling
+# 纯手机模式 on a release build fails with LIFECYCLE_OWNER (「悬浮球界面的生命周期挂载失败」).
+# Measured on the K40 release APK (2026-11-05): viewtree_lifecycle_failed / viewtree_savedstate_failed =
+# NoSuchMethodException; the debug build kept the methods and worked. Keep the classes and their members by name.
+-keep class androidx.lifecycle.ViewTreeLifecycleOwner { *; }
+-keep class androidx.savedstate.ViewTreeSavedStateRegistryOwner { *; }

@@ -1,7 +1,5 @@
 package com.sheen.rokid.phone.app
 import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
-import com.sheen.rokid.phone.ui.profile.ProfileListScreen
-import com.sheen.rokid.phone.ui.profile.ProfileViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLine
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLogView
@@ -150,9 +148,6 @@ class MainActivity : ComponentActivity() {
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
         })[SessionViewModel::class.java]
-        val profileViewModel = if (root.profileTester != null) ViewModelProvider(this, object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = requireNotNull(root.profileViewModel()) as T
-        })[ProfileViewModel::class.java] else null
         setContent {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
                 val state by viewModel.state.collectAsStateWithLifecycle()
@@ -209,7 +204,7 @@ class MainActivity : ComponentActivity() {
                 // go. The settings page remains the single place that states the mode and how to leave it.
                 Column(Modifier.fillMaxSize()) {
                     Box(Modifier.weight(1f)) {
-                        PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
+                        PhoneScreen(state, root, viewModel, ::requestStart,
                             { SessionService.commandFromUi(this@MainActivity, it) }, notificationsGranted(),
                             { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) },
                             remainingSeconds)
@@ -751,7 +746,10 @@ internal fun errorLabel(code: String) = when (code) {
     "MIC_START_FAILED" -> "麦克风未能开始采音"
     "MIC_FORMAT_UNSUPPORTED" -> "麦克风音频格式不受支持"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
-    "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型档案不支持图片输入；请更换支持图片的模型/档案（本版要求 IMAGE+TEXT）"
+    "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型不支持图片输入；请更换支持图片的模型（本版要求 IMAGE+TEXT）"
+    // 0.52 I1: the start gate can also find the selection removed or its evidence stale (provider revision changed).
+    "PROFILE_MODEL_MISSING" -> "当前选择的模型已被移除，请重新选择模型"
+    "PROFILE_MODEL_UNVERIFIED" -> "当前选择的模型需要重新测试，请在模型详情完成文本测试"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"
     "UNKNOWN_PLUGIN" -> "插件不可用"
     else -> "会话异常"

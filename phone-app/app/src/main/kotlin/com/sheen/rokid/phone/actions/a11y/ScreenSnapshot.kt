@@ -24,6 +24,43 @@ data class ScreenSnapshot(
     val fingerprint: ScreenFingerprint,
 )
 
+/**
+ * A screen-pixel rectangle as the accessibility node reports it.
+ *
+ * 0.5.4 T9: carried verbatim from [RawSnapshotNode] so the model can see geometry and a later coordinate action can
+ * aim at it without re-walking the tree. Screen pixels, not density-independent units.
+ */
+data class ScreenBounds(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+) {
+    val centerX: Int get() = (left + right) / 2
+    val centerY: Int get() = (top + bottom) / 2
+}
+
+/** A screen-pixel point; the midpoint of [ScreenBounds] for a rendered element. */
+data class ScreenPoint(val x: Int, val y: Int)
+
+/**
+ * Picks the one usable display rectangle from the two platform witnesses (0.5.4 T11 fix round).
+ *
+ * `WindowManager.currentWindowMetrics` can throw from a non-UI context such as an `AccessibilityService`; that failure
+ * must not discard the always-present `resources.displayMetrics` fallback, so each probe is caught on its own and the
+ * fallback is always tried when the window answer is missing or degenerate. `null` means neither source produced a
+ * positive display, which the backend treats as fail-closed [MISSING_POINT], never as a guessable screen.
+ */
+internal fun resolveScreenBounds(
+    windowProbe: () -> ScreenBounds?,
+    fallbackProbe: () -> Pair<Int, Int>?,
+): ScreenBounds? {
+    val window = runCatching(windowProbe).getOrNull()
+    if (window != null && window.right > window.left && window.bottom > window.top) return window
+    val (width, height) = runCatching(fallbackProbe).getOrNull() ?: return null
+    return if (width > 0 && height > 0) ScreenBounds(0, 0, width, height) else null
+}
+
 data class ScreenElement(
     val index: Int,
     val text: String?,
@@ -33,7 +70,14 @@ data class ScreenElement(
     val scrollable: Boolean,
     val checked: Boolean,
     val boundsDigest: String,
-)
+    /** The node's contentDescription, the fallback label when [text] is absent (0.5.4 T9). */
+    val desc: String? = null,
+    /** The node's rectangle in screen pixels (0.5.4 T9); defaults keep older producers source-compatible. */
+    val bounds: ScreenBounds = ScreenBounds(0, 0, 0, 0),
+) {
+    /** The rectangle's midpoint, in screen pixels; what a coordinate action aims at. */
+    val center: ScreenPoint get() = ScreenPoint(bounds.centerX, bounds.centerY)
+}
 
 data class ScreenFingerprint(
     val hash: String,
@@ -122,6 +166,8 @@ object SnapshotBuilder {
                 scrollable = raw.scrollable,
                 checked = raw.checked,
                 boundsDigest = boundsDigest(raw),
+                desc = raw.contentDescription,
+                bounds = ScreenBounds(raw.left, raw.top, raw.right, raw.bottom),
             )
         }
 

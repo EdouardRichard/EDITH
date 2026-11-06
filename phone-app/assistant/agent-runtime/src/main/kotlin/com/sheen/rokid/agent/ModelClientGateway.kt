@@ -12,6 +12,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelRequestTiming
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
@@ -248,7 +249,15 @@ class ModelClientGateway(
             }
             if (isContextOverflow(reply)) {
                 if (recoveries >= MAX_OVERFLOW_RECOVERIES) {
-                    return contextOverflowFailure(reply.usage, recoveries = recoveries)
+                    return contextOverflowFailure(
+                        usage = reply.usage,
+                        recoveries = recoveries,
+                        // The provider's own overflow verdict is the last attempt; the chain of thought it streamed
+                        // before that verdict is diagnosis state, not answer text, and must survive the final reply.
+                        reasoning = reply.reasoning,
+                        // Task 8: the last attempt's latency is the one this verdict belongs to.
+                        timing = reply.timing,
+                    )
                 }
                 recoveries++
                 overflowRecoveries++
@@ -268,9 +277,21 @@ class ModelClientGateway(
     private fun isContextOverflow(reply: GatewayReply): Boolean =
         reply.safeCode?.contains(CONTEXT_OVERFLOW, ignoreCase = true) == true
 
-    private fun contextOverflowFailure(usage: ModelUsage? = null, recoveries: Int = 0): GatewayReply {
+    /**
+     * The terminal verdict after both deterministic recoveries were exhausted. No answer text is kept — the turn
+     * produced no answer — but the provider's own accounting and the reasoning its last attempt streamed are: both are
+     * diagnosis state the run reports, and the reasoning is never rendered or logged by this adapter.
+     */
+    private fun contextOverflowFailure(
+        usage: ModelUsage? = null,
+        recoveries: Int = 0,
+        reasoning: String? = null,
+        timing: ModelRequestTiming? = null,
+    ): GatewayReply {
         overflowFailures++
-        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries)
+        return GatewayReply(
+            emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries, reasoning, timing,
+        )
     }
 
     /** Builds the one stateless request shape every model call of this gateway uses. */
@@ -318,8 +339,65 @@ class ModelClientGateway(
         sentFrame: RequestFrame? = request.frame,
     ): GatewayReply {
         val reply = sendTurnOnce(request, modelRequest)
+        emitModelRequestMetric(reply)
         emitCacheMetric(request, reply, sentFrame)
+        emitThinkingMetric(request, reply, modelRequest)
         return reply
+    }
+
+    /**
+     * 0.5.4 Task 8 (§6.2.2): the count-only `P3_MODEL_REQ` line of one model request.
+     *
+     * Latency comes from the client's own [com.sheen.rokid.plugin.ModelRequestTiming] (it owns the request's three
+     * stages), so an unreported stage is `-`, never a fabricated `0`. `reasoningChars` counts the chain of thought only,
+     * never answer text.
+     *
+     * **Grammar** (fix round, review Important 3): `outcome=<END> stage=<CODE|->`. `outcome` is always a bare
+     * [ModelEnd] token, so `outcome=DEADLINE` is a searchable verdict; the transport's stable stage code is the
+     * **separate** additive `stage` token. A code that merely repeats the verdict is deduped to `-` (the pre-fix form
+     * could emit `DEADLINE:DEADLINE`), and a nested relabel code such as
+     * `TOOL_CALL_DELIVERY_INCOMPLETE:<provider-code>` is one whitespace-delimited `stage` value, never a second
+     * `outcome` colon field. Emitted for every request that reached the transport, including each deterministic
+     * overflow re-send.
+     */
+    private fun emitModelRequestMetric(reply: GatewayReply) {
+        val timing = reply.timing
+        val verdict = reply.terminal?.name ?: ModelEnd.FAILED.name
+        // A stage code that repeats the verdict adds nothing, so it is not printed twice; `-` is the same unavailable
+        // state the latency fields use.
+        val stage = reply.safeCode?.takeIf { it != verdict } ?: "-"
+        val line = "P3_MODEL_REQ ttfbMs=${timing?.ttfbMillis ?: "-"} " +
+            "firstTokenMs=${timing?.firstTokenMillis ?: "-"} streamMs=${timing?.streamMillis ?: "-"} " +
+            "reasoningChars=${reply.reasoning?.length ?: 0} outcome=$verdict stage=$stage"
+        // Observability is never a verdict: a throwing sink must not turn a delivered reply into a failed turn.
+        runCatching { metricLine(line) }
+    }
+
+    /**
+     * 0.53: the count-only `P3_THINKING` line of one model request.
+     *
+     * `active` is the profile's **enabled switch** alone (0.53 revised: the capability bit is not part of the behaviour
+     * surface; the family rule lives in the catalog projection, not here). It describes what the operator set — not
+     * whether this particular stream happened to produce reasoning — so a device log can tell "thinking off" from
+     * "thinking on but the model reasoned nothing". `reasoningChars` and `replayChars` are character counts only — no
+     * reasoning text ever rides this line, exactly like `P3_CACHE`. `replayChars` describes what this request actually
+     * replays: it is zero unless the request carries tools, the one shape the adapter sends history reasoning on.
+     */
+    private fun emitThinkingMetric(request: GatewayTurn, reply: GatewayReply, modelRequest: ModelRequest) {
+        val profile = profileLookup(request.profileId) ?: return
+        val active = profile.thinkingEnabled
+        val effort = if (active) profile.thinkingEffort.name.lowercase() else "-"
+        val reasoningChars = reply.reasoning?.length ?: 0
+        // Only a tool-bearing request replays the history's reasoning (the adapter's measured rule); counting it on a
+        // no-tool request would claim bytes the wire never carries.
+        val replayChars = if (request.tools.isEmpty()) {
+            0
+        } else {
+            modelRequest.history.filterIsInstance<ModelHistoryItem.Text>()
+                .sumOf { it.reasoning?.length ?: 0 }
+        }
+        val line = "P3_THINKING active=$active effort=$effort reasoningChars=$reasoningChars replayChars=$replayChars"
+        runCatching { metricLine(line) }
     }
 
     /**
@@ -380,14 +458,22 @@ class ModelClientGateway(
             // verdict; waiting further could only burn the deadline.
             if (accumulated.sawSynchronousEvent) {
                 handle.cancel()
-                return GatewayReply(emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL)
+                return GatewayReply(
+                    emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL,
+                    reasoning = accumulated.reasoningText(),
+                    timing = accumulated.terminal?.timing,
+                )
             }
             while (true) {
                 if (stop()) return cancel(handle, accumulated)
                 if (accumulated.settled) return reply(accumulated)
                 if (clock.nowNanos() >= request.deadlineNanos) {
                     handle.cancel()
-                    return GatewayReply(emptyList(), accumulated.text(), ModelEnd.DEADLINE, DEADLINE)
+                    return GatewayReply(
+                        emptyList(), accumulated.text(), ModelEnd.DEADLINE, DEADLINE,
+                        reasoning = accumulated.reasoningText(),
+                        timing = accumulated.terminal?.timing,
+                    )
                 }
                 accumulated.waitForStep(WAIT_STEP_MILLIS)
             }
@@ -407,12 +493,17 @@ class ModelClientGateway(
         // real and rides the cancelled reply up to the run.
         return GatewayReply(
             emptyList(), accumulated.text(), ModelEnd.CANCELLED, CANCELLED, accumulated.terminal?.usage,
+            reasoning = accumulated.reasoningText(),
+            timing = accumulated.terminal?.timing,
         )
     }
 
     private fun reply(accumulated: Accumulated): GatewayReply {
         val terminal = accumulated.terminal
-            ?: return GatewayReply(emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL)
+            ?: return GatewayReply(
+                emptyList(), accumulated.text(), ModelEnd.FAILED, NO_TERMINAL,
+                reasoning = accumulated.reasoningText(),
+            )
         val calls = accumulated.calls()
         val text = accumulated.text()
         // A verdict the transport already delivered (FAILED / DEADLINE / CANCELLED) is not softened. An otherwise
@@ -424,9 +515,17 @@ class ModelClientGateway(
             // Keep the provider's own machine-readable reason when it sent one: re-labelling the verdict must not erase
             // what the transport actually reported. The token accounting survives the re-label for the same reason.
             val code = terminal.safeCode?.let { "$TOOL_CALL_DELIVERY_INCOMPLETE:$it" } ?: TOOL_CALL_DELIVERY_INCOMPLETE
-            GatewayReply(emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage)
+            GatewayReply(
+                emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage,
+                reasoning = accumulated.reasoningText(),
+                timing = terminal.timing,
+            )
         } else {
-            GatewayReply(calls, text, terminal.end, terminal.safeCode, terminal.usage)
+            GatewayReply(
+                calls, text, terminal.end, terminal.safeCode, terminal.usage,
+                reasoning = accumulated.reasoningText(),
+                timing = terminal.timing,
+            )
         }
     }
 
@@ -533,7 +632,17 @@ class ModelClientGateway(
                         history += items
                     }
                 }
-                else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
+                else -> {
+                    // 0.53: a TRANSCRIPT assistant segment carries the turn's reasoning beside its text. It is restored
+                    // onto the `Text` item — the one history shape that can replay it — and only for an assistant turn;
+                    // a summary (folded into the leading user text above) never carries a chain of thought.
+                    val role = roleOf(segment)
+                    history += ModelHistoryItem.Text(
+                        role,
+                        segment.text,
+                        if (role == MessageRole.ASSISTANT) segment.reasoning else null,
+                    )
+                }
             }
         }
         val summaryText = summaries.joinToString("\n\n")
@@ -721,6 +830,8 @@ class ModelClientGateway(
         private val lock = ReentrantLock()
         private val ready = lock.newCondition()
         private val text = StringBuilder()
+        /** 0.53: the chain of thought of this turn, accumulated exactly like the answer text but never displayed. */
+        private val reasoning = StringBuilder()
         private val deltaItems = LinkedHashSet<String>()
         private val terminalItems = LinkedHashSet<String>()
         private val terminalCalls = mutableListOf<ModelStreamEvent.ToolCallTerminal>()
@@ -733,6 +844,9 @@ class ModelClientGateway(
         val hasDanglingDelta: Boolean get() = lock.withLock { deltaItems.any { it !in terminalItems } }
 
         fun text(): String = lock.withLock { text.toString() }
+
+        /** The turn's chain of thought, or `null` when it streamed none. Never part of the answer text. */
+        fun reasoningText(): String? = lock.withLock { reasoning.toString().ifBlank { null } }
 
         fun calls(): List<ToolCall> = lock.withLock {
             terminalCalls.map { ToolCall(it.callId, it.name, it.argsJson, it.itemId) }
@@ -749,6 +863,11 @@ class ModelClientGateway(
                         // Only text is a display increment; the other events stay internal to the accumulation, so
                         // the observer is called exactly once per accepted answer chunk.
                         true
+                    }
+                    is ModelStreamEvent.ReasoningDelta -> {
+                        // 0.53: internal state, never a display increment and never part of the answer text.
+                        reasoning.append(event.text)
+                        false
                     }
                     is ModelStreamEvent.ToolCallDelta -> {
                         deltaItems += event.itemId

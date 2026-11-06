@@ -18,6 +18,7 @@ class PromptHardcodeGuardTest {
     private val fixedResources = listOf(
         "core/00-identity.md",
         "core/10-operating.md",
+        "core/15-app-entry.md",
         "core/20-tools.md",
         "core/30-safety.md",
         "core/40-output.md",

@@ -9,9 +9,12 @@ import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.PlaybackGate
+import com.sheen.rokid.phone.session.WakeAckGate
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
+import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
@@ -191,6 +194,27 @@ class SpeechRoutingTest {
     }
 
     @Test
+    fun `setSpeechEnabled reports the persistence result to the page`() {
+        val blobs = RecordingBlobs()
+        val root = composition(SpeechPlayerRouter(), blobs) { FakePlayer() }
+        try {
+            val saved = root.setSpeechEnabled(true)
+            assertTrue("a written blob is a saved result", saved.saved)
+            assertNull(saved.errorCode)
+
+            blobs.failReadId = SmartSettingsStore.BLOB_ID
+            val unreadable = root.setSpeechEnabled(false)
+            assertFalse("an unreadable blob is a visible refusal", unreadable.saved)
+            assertEquals(
+                SettingsSaveResult.ERROR_SETTINGS_UNREADABLE,
+                unreadable.errorCode,
+            )
+        } finally {
+            root.close()
+        }
+    }
+
+    @Test
     fun `the wake ack opens the echo window only at the player's audible onset`() {
         // C5: the ack used to call `echoMute.open()` itself and the player's `onStart` opened it again. The player is
         // now the single owner, and the root is given the same window through the test seam below so a reintroduced
@@ -223,9 +247,31 @@ class SpeechRoutingTest {
             engine.fireStart("detached-wake-ack")
             assertTrue("the audible interval is muted", window.covers(clock.nowNanos()))
 
+            val audible = withP3Sink { captured ->
+                root.emitWake(root.host, "伊迪丝", 1.0)
+                captured.toList()
+            }
+            assertTrue("the production player callback arms the ack gate",
+                audible.any { it == "P3_WAKE suppressed reason=ack_echo" })
+
             engine.fireDone("detached-wake-ack")
             clock.advance(151_000_000L)
             assertFalse("one reverb tail after the end, the mic is live again", window.covers(clock.nowNanos()))
+
+            val tail = withP3Sink { captured ->
+                root.emitWake(root.host, "伊迪丝", 1.0)
+                captured.toList()
+            }
+            assertTrue("the gate follows the real end, not the 150 ms echo window",
+                tail.any { it == "P3_WAKE suppressed reason=ack_echo" })
+
+            // Distinguish the FINISHED mapping from a dropped terminal: a dropped terminal leaves the gate in the
+            // audible branch for up to 10 s, while the real end + tail is over now.
+            clock.advance(WakeAckGate.DEFAULT_TAIL_NANOS)
+            assertFalse(
+                "FINISHED must move the gate out of the audible branch; a dropped terminal would still suppress",
+                root.wakeAckGate.shouldSuppress(clock.nowNanos()),
+            )
         } finally {
             root.close()
         }

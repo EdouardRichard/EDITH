@@ -177,7 +177,9 @@ val TrimReport.counts: TrimCounts
  * the same 32-unit per-message overhead — plus one [ImageBudget.UNITS_PER_IMAGE] per image the adapter will put on the
  * wire (R68). The two stages therefore price a text and an image identically, and an image-bearing frame cannot be
  * trimmed to a request the send-time budgeter then rejects. [total] adds the same fixed [FIXED_OVERHEAD] that
- * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`).
+ * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`). 0.53: an assistant segment's
+ * [Segment.reasoning] is priced too — it is sent on the wire beside the text — so it evicts with the message it
+ * belongs to and the trimmer never trims a request the adapter would grow past the window.
  *
  * The rendered request is not necessarily the exact sum of those per-segment prices: the gateway folds the leading
  * context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time total can differ
@@ -570,12 +572,22 @@ class TurnTrimmer(
                 merged[merged.lastIndex] = previous.copy(
                     text = previous.text + "\n\n" + segment.text,
                     images = previous.images + segment.images,
+                    // 0.53: the reasoning belongs to each assistant half, so it merges with the text and keeps its own
+                    // halves distinct. Both absent stays absent; one present keeps that one.
+                    reasoning = mergeReasoning(previous.reasoning, segment.reasoning),
                 )
             } else {
                 merged += segment
             }
         }
         return merged
+    }
+
+    /** The merged reasoning of two assistant texts: newline-joined, and `null` only when both are `null`. */
+    private fun mergeReasoning(first: String?, second: String?): String? = when {
+        first == null -> second
+        second == null -> first
+        else -> first + "\n" + second
     }
 
     /** A conversation-flow assistant text: `ContextBudgeter` renders a `TRANSCRIPT` without `USER` as the assistant. */
@@ -799,6 +811,10 @@ internal fun tokenUnitsPlusOverhead(text: String): Int = TokenMeter.estimate(tex
  */
 internal fun defaultSegmentMeasure(segment: Segment): Int {
     var cost = tokenUnitsPlusOverhead(segment.text)
+    // 0.53: reasoning is replayed on the wire beside its assistant text (the DeepSeek adapters emit
+    // `reasoning_content` / a reasoning input item), so it is part of this message's real cost. A segment without it is
+    // priced exactly as before.
+    segment.reasoning?.let { cost = Math.addExact(cost, TokenMeter.estimate(it)) }
     cost += imageUnits(segment.images.size)
     if (segment.origin == SegmentOrigin.TOOL_ROUND) cost += imageUnits(toolRoundImageCount(segment.text))
     return cost

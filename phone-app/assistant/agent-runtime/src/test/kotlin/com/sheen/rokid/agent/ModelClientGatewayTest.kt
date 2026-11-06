@@ -9,6 +9,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelRequestTiming
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ToolSpec
@@ -56,8 +57,9 @@ class ModelClientGatewayTest {
         client: com.sheen.rokid.plugin.ModelClient,
         stop: () -> Boolean = { false },
         audioParts: (() -> List<InputPart>)? = null,
+        metricLine: (String) -> Unit = {},
     ) =
-        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, audioParts)
+        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, audioParts, metricLine)
 
     private fun turn(
         turnId: String = "turn-7",
@@ -527,6 +529,248 @@ class ModelClientGatewayTest {
         assertEquals(ModelEnd.COMPLETED, reply.terminal)
     }
 
+    // ------------------------------------------------------------ 6b. reasoning (0.53)
+
+    @Test fun `a thinking turn keeps its reasoning on the reply without touching the answer text`() {
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "先想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        val reply = gateway(client).turn(turn())
+
+        assertEquals("先想", reply.reasoning)
+        assertEquals("答", reply.text)
+        assertFalse(reply.text.contains("先想"))
+    }
+
+    @Test fun `a turn that ends without a terminal keeps the reasoning it already received`() {
+        // The client consumes the stream on the caller's thread and never sends a terminal: the turn is a failed
+        // no-verdict turn, and the chain of thought it did stream must still ride up for the diagnostic count.
+        val client = FakeModelClient { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, "想到一半"))
+            clock.advance(2_000_000_000L)
+        }
+
+        val reply = gateway(client).turn(turn(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals("NO_TERMINAL", reply.safeCode)
+        assertEquals("想到一半", reply.reasoning)
+    }
+
+    @Test fun `an exhausted overflow keeps the reasoning the provider already streamed`() {
+        // M1 review fix: the provider's own overflow verdict is the last turn of the recursion, and the chain of
+        // thought it streamed before that verdict is diagnosis state. `contextOverflowFailure` used to build a fresh
+        // empty reply, so the reasoning the adapter had already received was lost exactly where it is most useful.
+        val reasoning = "先把窗口算清楚"
+        val client = FakeModelClient { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, reasoning))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.FAILED, null, CONTEXT_OVERFLOW))
+        }
+
+        val reply = gateway(client).turn(
+            turn(
+                frame = frame(
+                    Segment(SegmentOrigin.TRANSCRIPT, true, "旧问题", SegmentRole.USER),
+                    Segment(SegmentOrigin.TRANSCRIPT, true, "旧回答", SegmentRole.ASSISTANT),
+                    Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+                ),
+            ),
+        )
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(CONTEXT_OVERFLOW, reply.safeCode)
+        assertEquals(3, client.requests.size, "two recoveries: exactly three attempts")
+        assertEquals(
+            reasoning,
+            reply.reasoning,
+            "the exhausted-recovery FAILED reply must not drop the reasoning it already received",
+        )
+    }
+
+    @Test fun `the thinking metric line carries counts only and never the reasoning text`() {
+        val lines = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingEnabled = true,
+                thinkingSupported = true,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.HIGH,
+            )
+        }
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "问"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想"),
+            ModelHistoryItem.Text(MessageRole.USER, "再问"),
+        )
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "新想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        gateway(client, metricLine = { lines += it }).turn(
+            turn(
+                history = history,
+                // M2 review fix: only a tool-bearing request replays history reasoning, so only that request may count
+                // it. This request carries a tool, which is the one shape the adapter replays the history on.
+                tools = listOf(ToolSpec("notify_user", "notify the wearer", "{}")),
+            ),
+        )
+
+        val line = lines.single { it.startsWith("P3_THINKING") }
+        assertEquals("P3_THINKING active=true effort=high reasoningChars=2 replayChars=2", line)
+        assertFalse(line.contains("新想") || line.contains("旧想"))
+    }
+
+    @Test fun `history reasoning is not counted when the request carries no tools`() {
+        // M2 review fix: `replayChars` describes reasoning the adapter will actually replay. A no-tool request drops
+        // the history's reasoning at encode time, so counting it overstates the bytes on the wire.
+        val lines = mutableListOf<String>()
+        lookup = { profile.copy(thinkingEnabled = true) }
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "问"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想"),
+            ModelHistoryItem.Text(MessageRole.USER, "再问"),
+        )
+
+        gateway(terminalClient(), metricLine = { lines += it }).turn(turn(history = history))
+
+        assertEquals(
+            "P3_THINKING active=true effort=low reasoningChars=0 replayChars=0",
+            lines.single { it.startsWith("P3_THINKING") },
+        )
+    }
+
+    @Test fun `the thinking metric reports active from the enabled switch alone`() {
+        // 0.53 revised: the capability bit is not part of the behaviour surface. `active` describes what the operator
+        // set (and what the adapter therefore sends), so a profile with the family bit false but the switch on still
+        // reads active=true, and a supported profile with the switch off reads active=false with no effort.
+        val enabled = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingSupported = false,
+                thinkingEnabled = true,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.LOW,
+            )
+        }
+        gateway(terminalClient(), metricLine = { enabled += it }).turn(turn())
+
+        assertEquals(
+            "P3_THINKING active=true effort=low reasoningChars=0 replayChars=0",
+            enabled.single { it.startsWith("P3_THINKING") },
+        )
+
+        val disabled = mutableListOf<String>()
+        lookup = {
+            profile.copy(
+                thinkingSupported = true,
+                thinkingEnabled = false,
+                thinkingEffort = com.sheen.rokid.plugin.ThinkingEffort.MAX,
+            )
+        }
+        gateway(terminalClient(), metricLine = { disabled += it }).turn(turn())
+
+        assertEquals(
+            "P3_THINKING active=false effort=- reasoningChars=0 replayChars=0",
+            disabled.single { it.startsWith("P3_THINKING") },
+        )
+    }
+
+    @Test fun `a completed request reports only counts and the latency the client measured`() {
+        // 0.5.4 Task 8 (§6.2.2): one count-only line per model request, with the client's own timing. The line must
+        // never carry the answer text or the chain of thought it counts.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.ReasoningDelta("turn-7", "想"),
+            ModelStreamEvent.TextDelta("turn-7", "答"),
+            ModelStreamEvent.Terminal(
+                "turn-7", ModelEnd.COMPLETED, null, null,
+                ModelRequestTiming(ttfbMillis = 120, firstTokenMillis = 350, streamMillis = 900),
+            ),
+        )
+
+        gateway(client, metricLine = { lines += it }).turn(turn())
+
+        val line = lines.single { it.startsWith("P3_MODEL_REQ") }
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=120 firstTokenMs=350 streamMs=900 reasoningChars=1 outcome=COMPLETED stage=-",
+            line,
+        )
+        assertFalse(line.contains("想") || line.contains("答"), "no model text may ride the request line: $line")
+    }
+
+    @Test fun `a request without client timing reports unavailable stages instead of zero`() {
+        // A client that measures nothing (a pre-Task-8 composition or a scripted double) is `-`, never a fabricated 0.
+        val lines = mutableListOf<String>()
+        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
+
+        gateway(client, metricLine = { lines += it }).turn(turn())
+
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=COMPLETED stage=-",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `a timed out request reports its stage in its own token`() {
+        // 0.5.4 Task 8: FIRST_TOKEN_TIMEOUT / STREAM_IDLE_TIMEOUT / REQUEST_DEADLINE all end as DEADLINE. The
+        // per-request line must keep the stage, or a log cannot attribute the failure to one request. Fix round
+        // (review Important 3): the stage is its own additive token, never a suffix of `outcome`, so `outcome=` is a
+        // bare verdict a grep can trust.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.Terminal(
+                "turn-7", ModelEnd.DEADLINE, null, "FIRST_TOKEN_TIMEOUT",
+                ModelRequestTiming(streamMillis = 90_000),
+            ),
+        )
+
+        val reply = gateway(client, metricLine = { lines += it }).turn(turn(deadlineNanos = 120_000_000_000L))
+
+        assertEquals(ModelEnd.DEADLINE, reply.terminal)
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=90000 reasoningChars=0 " +
+                "outcome=DEADLINE stage=FIRST_TOKEN_TIMEOUT",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `a stage code equal to the verdict is not repeated`() {
+        // 0.5.4 Task 8 fix round (review Important 3): the pre-fix grammar could emit `outcome=DEADLINE:DEADLINE`. The
+        // verdict already carries that fact, so the additive token must dedupe to `-` rather than double it.
+        val lines = mutableListOf<String>()
+        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.DEADLINE, null, "DEADLINE"))
+
+        gateway(client, metricLine = { lines += it }).turn(turn(deadlineNanos = 120_000_000_000L))
+
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 outcome=DEADLINE stage=-",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
+    @Test fun `an incomplete turn keeps its nested relabel code in the stage token`() {
+        // The INCOMPLETE relabel prefixes the provider's own code (`TOOL_CALL_DELIVERY_INCOMPLETE:<code>`), so the
+        // stage value itself contains a colon. Under the whitespace-delimited token grammar that is one value, and the
+        // verdict stays a clean bare `outcome=INCOMPLETE`.
+        val lines = mutableListOf<String>()
+        val client = scripted(
+            ModelStreamEvent.ToolCallDelta("turn-7", "item-1", "tap", """{"index":0}"""),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, "PROVIDER_STAGE_X"),
+        )
+
+        val reply = gateway(client, metricLine = { lines += it }).turn(turn())
+
+        assertEquals(ModelEnd.INCOMPLETE, reply.terminal)
+        assertEquals(
+            "P3_MODEL_REQ ttfbMs=- firstTokenMs=- streamMs=- reasoningChars=0 " +
+                "outcome=INCOMPLETE stage=TOOL_CALL_DELIVERY_INCOMPLETE:PROVIDER_STAGE_X",
+            lines.single { it.startsWith("P3_MODEL_REQ") },
+        )
+    }
+
     // ------------------------------------------------------------ 7. stop
 
     @Test fun `a stop that arrives while the turn is in flight cancels the handle and beats the late terminal`() {
@@ -898,6 +1142,23 @@ class ModelClientGatewayTest {
             sent.history[5],
             "the tool result must come back as its output item: ${sent.history}",
         )
+    }
+
+    @Test fun `a frame's assistant transcript keeps its reasoning into the request history`() {
+        // 0.53: the store hands the next turn a `TRANSCRIPT` assistant segment carrying the reasoning; frameToTranscript
+        // is the one renderer that must put it back on the `Text` item, or the adapter has nothing to replay.
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧问题", SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧回答", SegmentRole.ASSISTANT, reasoning = "旧想"),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+        )
+
+        val request = captureRequest(frame(*flow.toTypedArray()))
+
+        val assistant = request.history.filterIsInstance<ModelHistoryItem.Text>()
+            .single { it.role == MessageRole.ASSISTANT }
+        assertEquals("旧回答", assistant.text)
+        assertEquals("旧想", assistant.reasoning, "the frame renderer must not drop the reasoning: ${request.history}")
     }
 
     @Test fun `without a frame the gateway behaves exactly as before`() {

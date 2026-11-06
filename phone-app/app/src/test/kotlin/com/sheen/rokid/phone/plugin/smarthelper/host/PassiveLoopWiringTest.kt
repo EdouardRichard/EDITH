@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.phone.storage.unavailable
@@ -47,7 +47,9 @@ import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
+import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
+import com.sheen.rokid.phone.storage.KeystoreCatalogCredentialStore
 import com.sheen.rokid.phone.storage.KeystoreVault
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
@@ -471,7 +473,7 @@ private class NoStorageAccess : StorageAccess {
             "DEEPSEEK_RESPONSES", "synthetic-model", object : SecretHandle { override val id = "draft-placeholder" },
             4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList())
         val settings = SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-            profileId = "p-1", cooldownMillis = 3000L)
+            cooldownMillis = 3000L)
         val input = RecordingInputPort()
         val model = InertModel()
         val wakes = SmartWakeWordRegistry(settings.wakeWords)
@@ -1065,9 +1067,12 @@ private class NoStorageAccess : StorageAccess {
         register: (HostCompositionRoot) -> Unit = {},
     ): HostCompositionRoot {
         val wiring = SmartWiring(SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
-            whitelist = emptyList(), profileId = profile.id, cooldownMillis = 3000L),
+            whitelist = emptyList(), cooldownMillis = 3000L),
             FixedProfiles(profile),
-            FakeClock(0), ManualScheduler(FakeClock(0)))
+            FakeClock(0), ManualScheduler(FakeClock(0)),
+            // 0.52: the plugin-side selection source is the active catalog projection; a rig without a catalog passes
+            // the same profile the host's repository fallback resolves.
+            activeProfile = { profile })
         val environment = CxrHostEnvironment(clock = FakeClock(0), input = input, liveOutput = { LiveDisplay() },
             scheduler = ManualScheduler(FakeClock(0)),
             taskScope = taskScope,
@@ -1088,7 +1093,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
-        val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+        val root = HostCompositionRoot(HostRuntime(1, environment), FixedProfiles(profile), InertModel(),
             environment, smartWiring = wiring,
             rokidConnectionFactory = if (withConnection) { { FakeTransportConnection(transport) } } else null)
         // Through the composition, so its activation side effects can see what the plugin declares.
@@ -1173,7 +1178,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun theSettingsBuiltConfigurationIsAcceptedByTheRealPluginAndNamesTheChosenProfile() {
         val settings = SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
-            whitelist = emptyList(), profileId = "p-1", cooldownMillis = 3000L)
+            whitelist = emptyList(), cooldownMillis = 3000L)
         val configuration = settings.pluginConfiguration(profile("p-1"))
 
         val plugin = SmartAssistantPlugin(clock = FakeClock(0), scheduler = ManualScheduler(FakeClock(0)),
@@ -1191,8 +1196,8 @@ private class NoStorageAccess : StorageAccess {
     }
 
     @Test
-    fun aSettingsProfileThatNoLongerExistsStillProducesAConfigurationThePluginAccepts() {
-        val settings = SmartSettings(profileId = "deleted")
+    fun anAbsentProfileStillProducesAConfigurationThePluginAccepts() {
+        val settings = SmartSettings()
         val configuration = settings.pluginConfiguration(profile = null)
 
         assertTrue("the plugin requires a profileId in its shape even when the profile is gone",
@@ -1204,7 +1209,7 @@ private class NoStorageAccess : StorageAccess {
 
     @Test
     fun theConfigurationNamesEachKeyThePluginKnows() {
-        val values = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1")).values
+        val values = SmartSettings().pluginConfiguration(profile("p-1")).values
 
         assertEquals(setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist",
             "proactiveCooldownMillis", "proactiveSensitivity", "noInterception"), values.keys)
@@ -1219,8 +1224,8 @@ private class NoStorageAccess : StorageAccess {
      */
     @Test
     fun theNoInterceptionSettingIsSentAsThePluginsInitialValue() {
-        val off = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1"))
-        val on = SmartSettings(profileId = "p-1", noInterception = true).pluginConfiguration(profile("p-1"))
+        val off = SmartSettings().pluginConfiguration(profile("p-1"))
+        val on = SmartSettings(noInterception = true).pluginConfiguration(profile("p-1"))
 
         assertEquals("false", off.values["noInterception"])
         assertEquals("true", on.values["noInterception"])
@@ -1237,7 +1242,7 @@ private class NoStorageAccess : StorageAccess {
     fun theLiveNoInterceptionGateReachesThePluginTheWiringBuilds() {
         val enabled = java.util.concurrent.atomic.AtomicBoolean(false)
         val wiring = SmartWiring(
-            SmartSettings(profileId = "p-1"), MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
+            SmartSettings(), MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
             noInterception = { enabled.get() },
         )
         val field = wiring.plugin.javaClass.getDeclaredField("noInterception")
@@ -1252,12 +1257,13 @@ private class NoStorageAccess : StorageAccess {
 
     @Test
     fun theWiringBuildsThePluginWithTheCompositionsOwnCollaboratorsRatherThanDefaults() {
-        val wiring = SmartWiring(SmartSettings(profileId = "p-1"), FixedProfiles(profile("p-1")),
-            FakeClock(0), ManualScheduler(FakeClock(0)))
+        val chosen = profile("p-1")
+        val wiring = SmartWiring(SmartSettings(), FixedProfiles(chosen),
+            FakeClock(0), ManualScheduler(FakeClock(0)), activeProfile = { chosen })
 
         assertEquals("smart-assistant", wiring.plugin.descriptor.pluginId)
         assertEquals(listOf("伊迪丝", "edith"), wiring.wakeWords.current())
-        val resolved = wiring.configuration(requireNotNull(wiring.selectedProfile()))
+        val resolved = wiring.configuration(requireNotNull(wiring.activeProfile()))
         assertEquals("p-1", resolved.values["profileId"])
         assertEquals("3", resolved.values["profileRevision"])
     }
@@ -1352,7 +1358,7 @@ private class NoStorageAccess : StorageAccess {
         val wiring = SmartWiring(SmartSettings(), MemoryProfileRepository(),
             FakeClock(0), ManualScheduler(FakeClock(0)))
 
-        val configuration = wiring.configuration(wiring.selectedProfile())
+        val configuration = wiring.configuration(wiring.activeProfile())
 
         assertEquals("__unconfigured__", configuration.values["profileId"])
         wiring.plugin.validate(configuration)
@@ -1361,11 +1367,11 @@ private class NoStorageAccess : StorageAccess {
     // ---- fix items 1-3: one configuration, for the plugin it belongs to, and an honest epoch ---------------------
 
     /**
-     * A root over a real `AndroidProfileRepository`.
+     * A root over the real encrypted catalog projection.
      *
-     * This is the repository the shipped App uses, and the only one whose per-plugin `selections()` makes the
-     * activation path take the branch these fix items are about: `MemoryProfileRepository` has no selection store, so
-     * a rig built on it can never reproduce "the profile selection replaced the settings-derived keys".
+     * 0.52 replaced the per-plugin profile selection with one global catalog selection. The host reads
+     * `profiles.list()` (the production projection over the catalog) and the first profile is the one the configuration
+     * names, which is what these tests pin.
      */
     private class AndroidRoot(
         val root: HostCompositionRoot,
@@ -1381,12 +1387,33 @@ private class NoStorageAccess : StorageAccess {
         taskScope: TaskScope = UnavailableTaskScope,
         registered: (SmartWiring) -> PluginLifecycle = { it.plugin }): AndroidRoot {
         val blobs = TestBlobs()
-        val repository = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-        val saved = repository.saveWithSecret(profile("p-1"), "synthetic-dummy-secret".toCharArray())
-        repository.select("smart-assistant", saved.id)
+        val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(KeystoreVault(blobs)))
+        catalog.saveProvider(
+            com.sheen.rokid.phone.model.catalog.Provider(
+                id = "p-1",
+                name = "Synthetic",
+                baseUrl = "https://synthetic.example/v1",
+                protocolId = "DEEPSEEK_RESPONSES",
+                models = listOf(
+                    com.sheen.rokid.phone.model.catalog.ModelEntry(
+                        id = "m-1",
+                        displayName = "Synthetic m-1",
+                        contextWindowTokens = 4096,
+                        maxOutputTokens = 1024,
+                        inputs = setOf(InputModality.TEXT, InputModality.IMAGE),
+                        outputs = setOf(OutputModality.TEXT),
+                        origin = com.sheen.rokid.phone.model.catalog.ModelOrigin.MANUAL,
+                    ),
+                ),
+            ),
+            "synthetic-dummy-secret".toCharArray(),
+        )
+        catalog.setActiveProvider("p-1")
+        val repository = CatalogProfileRepository(catalog)
         val wiring = SmartWiring(SmartSettings(wakeWords = listOf("小艾"), maxLevel = "L0",
-            whitelist = listOf("launch|app"), profileId = saved.id, cooldownMillis = 3000L),
-            repository, FakeClock(0), ManualScheduler(FakeClock(0)))
+            whitelist = listOf("launch|app"), cooldownMillis = 3000L),
+            repository, FakeClock(0), ManualScheduler(FakeClock(0)),
+            activeProfile = { repository.list().firstOrNull() })
         val environment = CxrHostEnvironment(clock = FakeClock(0), input = input, liveOutput = { LiveDisplay() },
             scheduler = ManualScheduler(FakeClock(0)),
             taskScope = taskScope,
@@ -1431,7 +1458,7 @@ private class NoStorageAccess : StorageAccess {
             // replaces the stored configuration, so a second call with only the profile selection would leave the
             // plugin on its own defaults for every other key.
             val effective = rig.recorded.configurations.last()
-            assertEquals("p-1", effective.values["profileId"])
+            assertEquals("p-1:m-1", effective.values["profileId"])
             assertEquals("1", effective.values["profileRevision"])
             assertEquals("the user's risk ceiling must not fall back to the plugin's own L1 default",
                 "L0", effective.values["maxLevel"])
@@ -1460,9 +1487,13 @@ private class NoStorageAccess : StorageAccess {
 
             assertNull("the diagnostic plugin's own configuration must be accepted, not refused",
                 root.state.value.errorCode)
+            val configuration = diagnostic.configurations.last()
             assertEquals("no smart key may be sent to a plugin whose configuration is not the smart one",
-                setOf("profileId", "profileRevision", "requestConsent", "inputMode"),
-                diagnostic.configurations.last().values.keys)
+                setOf("profileId", "profileRevision", "requestConsent", "inputMode"), configuration.values.keys)
+            assertEquals("the one global active model must reach the diagnostic plugin's lookup",
+                "p-1", configuration.values["profileId"])
+            assertEquals("with the active revision, so its model request can be resolved", "3",
+                configuration.values["profileRevision"])
             assertNull("the previous plugin's epoch must not stay armed while another plugin is active",
                 root.currentAudioEpoch())
             assertEquals(listOf(smartEpoch), input.stopped)
@@ -1571,11 +1602,12 @@ private class NoStorageAccess : StorageAccess {
         val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
         val wiring = SmartWiring(
             SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
-                whitelist = emptyList(), profileId = "p-1", cooldownMillis = 3000L),
+                whitelist = emptyList(), cooldownMillis = 3000L),
             FixedProfiles(profile("p-1")), clock, scheduler,
             // Exactly the expression `create` passes: the composition's live link visibility, via the holder that does
             // not exist yet when the wiring is built.
             isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+            activeProfile = { profile("p-1") },
         )
         val link = CxrHintLink(clock, scheduler, sendJson = { true })
         val environment = CxrHostEnvironment(
@@ -1595,7 +1627,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.ConversationDisplay to display,
             ),
             storageFor = { StubStorage() })
-        val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+        val root = HostCompositionRoot(HostRuntime(1, environment), FixedProfiles(profile("p-1")), InertModel(),
             environment, hintLink = link, smartWiring = wiring,
             rokidConnectionFactory = { FakeTransportConnection(null) })
         rootHolder[0] = root
@@ -1671,9 +1703,10 @@ private class NoStorageAccess : StorageAccess {
         private val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
         private val wiring = SmartWiring(
             SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                profileId = "p-1", cooldownMillis = 5_000L),
+                cooldownMillis = 5_000L),
             FixedProfiles(profile("p-1")), clock, scheduler,
-            isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false })
+            isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+            activeProfile = { profile("p-1") })
         private val link = CxrHintLink(
             clock, scheduler,
             sendJson = { json -> sent += json; true },
@@ -1699,7 +1732,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() })
-            root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+            root = HostCompositionRoot(HostRuntime(1, environment), FixedProfiles(profile("p-1")), InertModel(),
                 environment, hintLink = link, smartWiring = wiring,
                 rokidConnectionFactory = { FakeTransportConnection(null) })
             rootHolder[0] = root

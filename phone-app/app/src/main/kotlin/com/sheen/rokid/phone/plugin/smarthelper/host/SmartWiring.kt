@@ -64,18 +64,38 @@ internal class SmartWiring(
      * stand-alone wiring (tests, harnesses) in normal mode. It must never be a captured boolean.
      */
     noInterception: () -> Boolean = { false },
+    /**
+     * 0.52 design §5.8: the **active catalog projection** this wiring reports.
+     *
+     * The model selection is no longer stored in [SmartSettings]; the catalog is the only owner. Production passes the
+     * composition's live reader (the same `HostCompositionRoot.activeCatalogProfile()` the host configures from), so a
+     * provider/model switch made after assembly is visible on the next call. The `{ null }` default keeps a
+     * stand-alone wiring (tests, harnesses) on the contract-valid "no model configured" shape.
+     *
+     * **Appended last** so every existing positional construction of this class stays valid.
+     */
+    activeProfile: () -> ModelProfile? = { null },
+    /**
+     * Debug-only model trace sink (App-private `filesDir/edith-model-trace.jsonl`), or the `{}` no-op default.
+     *
+     * This is the wiring's only debug-only channel: `HostCompositionRoot.create` passes the file writer **only** when
+     * `BuildConfig.DEBUG`, so a release build keeps the plugin's own no-op default and writes nothing. A stand-alone
+     * wiring (tests, harnesses) also writes nothing. **Appended last** so every existing positional construction of this
+     * class stays valid.
+     */
+    traceLine: (String) -> Unit = {},
 ) {
     /** The word list the plugin declares on activation; also the `Capability.WakeWord` provider's content. */
     val wakeWords: SmartWakeWordRegistry = SmartWakeWordRegistry(settings.wakeWords)
 
+    private val activeProfileSource = activeProfile
+
     /**
-     * Resolved per call, because a profile can be deleted between an App start and a session start.
-     *
-     * A repository that refuses (no keystore, deleted payload) yields null rather than propagating: the configuration
-     * still has to be built, and the plugin's own lookup will find nothing until storage answers again.
+     * The profile the catalog currently projects, resolved per call, or null when no provider/model is active (or the
+     * source refuses). A source that throws yields null rather than propagating: the configuration still has to be
+     * built, and the plugin's own lookup will find nothing until the catalog can answer again.
      */
-    fun selectedProfile(): ModelProfile? =
-        settings.resolveProfileId(profiles)?.let { id -> runCatching { profiles.get(id) }.getOrNull() }
+    fun activeProfile(): ModelProfile? = runCatching { activeProfileSource() }.getOrNull()
 
     /**
      * The plugin's complete configuration: the settings-derived keys with [profile] as the named profile.
@@ -129,6 +149,9 @@ internal class SmartWiring(
         // 0.3 Phase 4B (`D189`): the live 「不拦截」 gate. A provider (not a snapshot) is what lets a settings save take
         // effect from the next tool call; the plugin passes it to both the policy and the command-level precheck wrapper.
         noInterception = noInterception,
+        // Debug-only: one JSON line per finished agent run. The no-op default keeps a release APK and every stand-alone
+        // wiring from writing anything; only `HostCompositionRoot.create` injects the file writer, behind BuildConfig.DEBUG.
+        traceLine = traceLine,
     )
 
     companion object {

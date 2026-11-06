@@ -431,15 +431,23 @@ internal class OffThreadTasks : TaskScope {
     fun joinAll(millis: Long = 5_000) { workers.toList().forEach { it.join(millis) } }
 }
 
-/** Minimal but valid `ModelProfile` fixture; the plugin reads its window limits, `id`, `revision` and `timeoutMillis`. */
+/**
+ * Minimal but valid `ModelProfile` fixture; the plugin reads its window limits, `id`, `revision` and `timeoutMillis`.
+ *
+ * 0.5.4 Task 16 raised the default window from the legacy 4 000/2 000: the production system prompt (the 25-tool face
+ * plus the app-entry section) is a fixed, untrimmable prompt of several thousand tokens, so a 2 000-token hard input
+ * would refuse every turn with `PROMPT_EXCEEDS_BUDGET` before the model is asked. The fixture now models a realistically
+ * sized window (the same 32 k/16 k the prompt tests already used explicitly), and the tests that need a *small* budget
+ * derive it from the live prompt size (`StoreSessionWiringTest`'s tiny windows) or pass their own limits.
+ */
 internal fun smartProfile(
     id: String = "smart-profile",
     revision: Long = 3,
     timeoutMillis: Long = 10_000,
-    usableWindowTokens: Int = 4_000,
-    inputBudgetTokens: Int = 2_000,
-    maxOutputTokens: Int = 1_000,
-    safetyTokens: Int = 100,
+    usableWindowTokens: Int = 32_000,
+    inputBudgetTokens: Int = 16_000,
+    maxOutputTokens: Int = 2_000,
+    safetyTokens: Int = 1_000,
 ) = ModelProfile(
     id = id,
     revision = revision,
@@ -660,6 +668,11 @@ internal class SmartTestRig(
      * (`services.deviceState()` inside `activate`) under test.
      */
     deviceState: DeviceStateProvider? = null,
+    /**
+     * Debug-only model trace sink. The `{}` default is the plugin's own no-op default, so every pre-trace rig keeps
+     * writing nothing; the trace tests pass a collector and assert one line per finished run.
+     */
+    traceLine: (String) -> Unit = {},
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -702,6 +715,7 @@ internal class SmartTestRig(
             phoneOnly = { phoneOnly },
             noInterception = { noInterception },
             deviceState = deviceState,
+            traceLine = traceLine,
         )
         // 0.3 Phase 3: the seam is an internal property (a public constructor must not expose the internal
         // `PromptRoute`); a test that pins a catalog sets it here, before any activation.

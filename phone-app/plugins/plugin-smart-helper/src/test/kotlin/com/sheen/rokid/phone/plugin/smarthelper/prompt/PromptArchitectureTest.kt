@@ -3,7 +3,6 @@ package com.sheen.rokid.phone.plugin.smarthelper.prompt
 import com.sheen.rokid.agent.RequestLayout
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.agent.SegmentOrigin
-import com.sheen.rokid.phone.plugin.smarthelper.output.ToolLabelMap
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -16,15 +15,15 @@ import kotlin.test.assertTrue
  * content and policy in the plugin.
  *
  * The rules are asserted here in one place, from the production artifacts (manifest, resources,
- * `RequestLayout`, `ToolLabelMap`), not from a hand-written fixture:
+ * `RequestLayout`), not from a hand-written fixture:
  *
  * 1. `agent-runtime` imports no `phone-app`/`plugin-smart-helper` production package;
  * 2. the base layer names no product route/tool/brand vocabulary;
  * 3. prompt resources live only in the allowed directories;
  * 4. `RequestLayout` rejects a dynamic segment **and** a runtime placeholder in the system slot;
  * 5. `PromptCatalog` rejects unresolved placeholders and static/dynamic slot mixing;
- * 6. the prompt names exactly the 24 tools `ToolLabelMap` registers (descriptor prose coverage is
- *    A5's `ToolContractTest`; this test pins the prompt ↔ face coupling instead of duplicating it).
+ * 6. the prompt ↔ 25-tool face coupling is pinned by `PromptCatalogTest`, against the same default
+ *    face `ToolContractTest` reads from production; this class does not duplicate that check.
  *
  * Rules 1–2 reuse [ProductionSourceScan], the same scanner [SourceHardcodeGuardTest] exercises, so
  * the two files cannot drift into two different definitions of "no product vocabulary".
@@ -245,30 +244,7 @@ class PromptArchitectureTest {
         }
     }
 
-    /** The tool-shaped identifiers in [corpus] that [advertised] does not register. */
-    private fun unadvertisedToolNames(corpus: String, advertised: Set<String>): Set<String> =
-        TOOL_NAME.findAll(corpus).map { it.value }.toSet() - advertised
-
     /** Parses one synthetic manifest row through the production validator. */
     private fun parse(file: String, kind: String, body: String) =
         PromptCatalog.parseManifest("x\t$file\t$kind\t1\tdescription") { body }
-
-    private companion object {
-        /** The 23-tool default face after the 2026-10-22 retirement, the same set A5's `ToolContractTest` owns. */
-        val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
-            "read_screen", "tap", "long_press", "scroll", "input_text",
-            "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
-            "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-            "list_apps", "system_action",
-            "device", "shell", "open", "dial",
-            "notify_user", "load_skill",
-        )
-
-        /** A tool name as a whole token, so `open` is not satisfied by `open_app`. */
-        fun mentions(text: String, name: String): Boolean =
-            Regex("(?<![A-Za-z0-9_])${Regex.escape(name)}(?![A-Za-z0-9_])").containsMatchIn(text)
-
-        /** A snake_case tool-shaped identifier; the prompt's own prose has no other underscore words. */
-        val TOOL_NAME = Regex("""(?<![A-Za-z0-9_])[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?![A-Za-z0-9_])""")
-    }
 }

@@ -31,8 +31,9 @@ internal enum class SmartTurnPhase { AwaitingTranscript, Running, Idle }
  * `Stop` and `deactivate` can cancel a run that is already in flight.
  *
  * [hintValidUntil] bounds the turn's `sourceTurnId` lifetime: the turn's deadline plus a small grace window. Since
- * 2026-10-22 (D197) the deadline is a 24 h sanity ceiling, so this window is effectively open for the turn's lifetime;
- * `emit` still refines it per hint from the hint's own reading budget, and [hintExpiry] is the concrete expiry stamped
+ * 0.5.4 Task 7 the deadline is a five-machine-minute turn budget (confirmation wait shifts it), so this window covers
+ * the run and a short tail; `emit` still refines it per hint from the hint's own reading budget, and [hintExpiry] is
+ * the concrete expiry stamped
  * on the hint currently shown. A `Displayed` ACK is honoured only while it is still in the future, which is what keeps
  * a late ACK for an already-expired hint from being counted.
  *
@@ -80,14 +81,15 @@ internal class SmartTurn private constructor(
         private set
 
     /**
-     * The turn's **machine** budget: when the agent run must stop, or an effectively unbounded value for no product
-     * cap.
+     * The turn's **machine** deadline: when the agent run must stop.
      *
-     * Since 2026-10-22 (D197) a normal turn carries a 24 h sanity ceiling only: the loop is bounded by its step and
-     * no-progress guards, each provider request is bounded by the profile's timeout, and the wearer can stop it. It
-     * is not a listening window: since 0.24 S3 the official 10 s belongs to `ConversationCycle` and starts at
-     * `PANEL_SHOWN`. The hint window moves with it (`deadline + grace`), which is harmless at this ceiling because
-     * `emit` still sizes each shown hint's own expiry.
+     * Since 0.5.4 Task 7 a normal turn carries five minutes of machine budget: model requests, tool calls and
+     * assembly, but never the time a person spends deciding. `AgentLoop` shifts its own deadline by the measured human
+     * wait (D49) and the plugin moves this deadline by the same measurement ([extendDeadline]), so a considered
+     * approval neither spends the budget nor expires the answer. It is not a listening window: since 0.24 S3 the
+     * official 10 s belongs to `ConversationCycle` and starts at
+     * `PANEL_SHOWN`. The hint window moves with it (`deadline + grace`); `emit` still sizes each shown hint's own
+     * expiry.
      */
     var deadlineNanos: Long = deadlineNanos
         private set
@@ -213,9 +215,11 @@ internal class SmartTurn private constructor(
     /**
      * Moves the turn's machine deadline to [newDeadlineNanos], never backwards.
      *
-     * Since 2026-10-22 (D197) an agent turn has a 24 h sanity ceiling instead of a 180 s product cap, so this is
-     * normally a no-op; it remains for the human-wait accounting path. The hint window still moves with the deadline
-     * (`deadline + grace`), and `emit` refines the shown hint's own expiry from its reading budget.
+     * Since 0.5.4 Task 7 an agent turn has a five-minute machine budget, and the time a person spends answering a
+     * confirmation is not part of it. `AgentLoop` returns the wall clock it excluded in `AgentRun.humanWaitNanos`, and
+     * the plugin passes `deadline + that wait` here before submitting the result, so a late answer is still inside the
+     * hint window. The hint window moves with the deadline (`deadline + grace`), and `emit` refines the shown hint's
+     * own expiry from its reading budget.
      */
     fun extendDeadline(newDeadlineNanos: Long) {
         if (newDeadlineNanos <= deadlineNanos) return
@@ -251,8 +255,8 @@ internal class SmartTurn private constructor(
          *
          * The assembler is built here, once per turn, and its emit callback is the plugin's own — so a hint can only
          * ever be emitted while this exact turn is still the plugin's current one. [deadlineNanos] is the **machine
-         * budget** the caller chose; production passes a 24 h sanity ceiling (D197: no product wall-clock cap), while
-         * the step/no-progress guards and the profile's per-request timeout bound the run. It is not a listening window:
+         * budget** the caller chose; production passes five minutes (0.5.4 Task 7), and the loop shifts it by any human
+         * wait. It is not a listening window:
          * since 0.24 S3 the official 10 s lives in `ConversationCycle` and starts at `PANEL_SHOWN`.
          */
         fun awaiting(

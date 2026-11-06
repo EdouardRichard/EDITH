@@ -2,15 +2,19 @@ package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.agent.ContextPolicy
 import com.sheen.rokid.agent.ContextTuning
+import com.sheen.rokid.agent.TokenMeter
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -68,10 +72,28 @@ class ProductionBudgetCompressionTest {
     }
 
     /**
-     * The turns that overflow the fixture's allowance. `smartProfile`'s hard input is 2 000 tokens; a 0.01
-     * compression threshold gives a 20-token end-of-turn allowance, so the second turn's history already exceeds it
-     * and the production compressor truncates immediately instead of after ~200 turns.
+     * The turns that overflow the fixture's allowance, with a window derived from the **live** production prompt.
+     *
+     * The legacy 2 000-token fixture can no longer hold the system prompt: 0.5.4's 25-tool + app-entry prompt is
+     * already larger, so the gateway would refuse every turn with `PROMPT_EXCEEDS_BUDGET` before the compressor ran.
+     * This profile keeps the fixed prompt just inside the hard input while the send-time hard limit sits below it, so
+     * the trimmer is owed a compression on every turn. A 0.01 compression threshold then leaves a tiny allowance, and
+     * the production compressor truncates immediately instead of after hundreds of turns.
      */
+    private fun smallWindowProfile(): ModelProfile {
+        val system = PromptCatalog.plan(PromptRoute.WAKE, null).systemText
+        val fixed = 32 + measure(system) + measure("第0次请问现在到底是几点了呢")
+        return smartProfile().copy(
+            usableWindowTokens = fixed + 10 + 1_000 + 100,
+            inputBudgetTokens = fixed + 10,
+            maxOutputTokens = 1_000,
+            safetyTokens = 100,
+        )
+    }
+
+    /** `TurnTrimmer`'s own per-segment unit (`TokenMeter.estimate + 32`), so the window above is exact. */
+    private fun measure(text: String): Int = TokenMeter.estimate(text) + 32
+
     private fun runTurns(rig: SmartTestRig, turns: Int = 3) {
         repeat(turns) { index ->
             rig.wakeAndFinal("第${index}次请问现在到底是几点了呢", turnId = "asr-$index")
@@ -94,7 +116,9 @@ class ProductionBudgetCompressionTest {
         val storage = SmartFakeStorage()
         val tasks = RecordingTasks()
         val tuning = ContextTuning(compressionThreshold = 0.01)
+        val profile = smallWindowProfile()
         val rig = SmartTestRig(contextTuning = tuning)
+        rig.profile = profile
         activateSmall(rig, storage, tasks)
         answerTurnsAndSummaries(rig, summary = "SUMMARK")
 
@@ -108,12 +132,17 @@ class ProductionBudgetCompressionTest {
         val stored = MemoryLog(storage).entries().map { it.text }
         assertTrue("SUMMARK" in stored, "the summary never reached the store: $stored")
         assertEquals(
-            // The profile's 2 000-token hard input with the fixture's 0.01 threshold: floor(2 000 * 0.01) = 20.
-            ContextPolicy.from(smartProfile(), tuning).softLimit,
+            // The derived hard input with the fixture's 0.01 threshold: a deliberately small allowance.
+            ContextPolicy.from(profile, tuning).softLimit,
             rig.plugin.historyBudgetTokensForTest(),
             "the profile-derived policy did not reach the session's compressor",
         )
-        assertEquals(20, rig.plugin.historyBudgetTokensForTest(), "the tuning seam must produce a small, exact allowance")
+        // Exact, not a 1..100 range: floor(hardInputLimit * 0.01) for the profile built above.
+        assertEquals(
+            profile.inputBudgetTokens / 100,
+            rig.plugin.historyBudgetTokensForTest(),
+            "the 0.01 threshold must floor the hard input, not produce a lookalike allowance",
+        )
     }
 
     @Test
@@ -123,6 +152,7 @@ class ProductionBudgetCompressionTest {
         // the one failure this ordering exists to prevent.
         val storage = SmartFakeStorage()
         val rig = SmartTestRig(contextTuning = ContextTuning(compressionThreshold = 0.01))
+        rig.profile = smallWindowProfile()
         activateSmall(rig, storage)
         answerTurnsAndSummaries(rig, summary = "SUMMARK")
 
@@ -167,7 +197,7 @@ class ProductionBudgetCompressionTest {
 
         assertEquals(ContextPolicy.from(smartProfile()).softLimit, defaultAllowance)
         assertEquals(ContextPolicy.from(wideProfile).softLimit, wideAllowance)
-        assertEquals(1_500, defaultAllowance, "a 2 000-token hard input leaves a 1 500-token compression allowance")
+        assertEquals(12_000, defaultAllowance, "a 16 000-token hard input leaves a 12 000-token compression allowance")
         assertEquals(15_000, wideAllowance)
         assertTrue(
             wideAllowance > defaultAllowance,

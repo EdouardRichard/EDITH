@@ -1,6 +1,5 @@
 package com.sheen.rokid.phone.app
-import com.sheen.rokid.phone.ui.profile.ProbeConsent
-import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.model.ProbeConsent
 import com.sheen.rokid.phone.ui.typedResultLabel
 import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.intent.CallPermission
@@ -22,6 +21,7 @@ import com.sheen.rokid.phone.session.confirmation.SummaryDisplayer
 import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.NoInterceptionGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.VisionGate
@@ -35,7 +35,10 @@ import com.sheen.rokid.phone.model.EngineBundleProvisioning
 import com.sheen.rokid.phone.model.ModelAssetSource
 import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.model.ModelStartGate
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
+import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
+import com.sheen.rokid.phone.model.catalog.ModelCatalogService
+import com.sheen.rokid.phone.model.catalog.ModelSelection
+import com.sheen.rokid.phone.ui.settings.ModelCatalogViewModel
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
@@ -92,6 +95,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
 import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
 import com.sheen.rokid.phone.session.EchoMuteWindow
+import com.sheen.rokid.phone.session.WakeAckGate
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
@@ -154,6 +158,7 @@ import com.sheen.rokid.phone.actions.UnlockGatedActions
 import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
 import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
 import com.sheen.rokid.phone.actions.a11y.ScreenFilter as A11yScreenFilter
+import com.sheen.rokid.phone.actions.a11y.ScreenBounds
 import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
 import com.sheen.rokid.phone.actions.a11y.ScreenSnapshot
 import com.sheen.rokid.phone.actions.a11y.ScrollDirection
@@ -169,6 +174,10 @@ import com.sheen.rokid.phone.actions.device.PrivilegedShellPort
 import com.sheen.rokid.phone.actions.device.ScreenProjector
 import com.sheen.rokid.phone.actions.device.ShellTool
 import com.sheen.rokid.phone.actions.device.ToolCatalog
+import com.sheen.rokid.phone.actions.deeplink.ContextDeepLinkLauncher
+import com.sheen.rokid.phone.actions.deeplink.DeepLinkTool
+import com.sheen.rokid.phone.actions.media.AndroidMediaControlPort
+import com.sheen.rokid.phone.actions.media.MediaTool
 import com.sheen.rokid.phone.lock.KeystoreLockPinStore
 import com.sheen.rokid.phone.lock.LockPinStore
 import com.sheen.rokid.phone.lock.LockPinValidator
@@ -202,6 +211,9 @@ import com.sheen.rokid.phone.model.ProfileProbeGate
 import com.sheen.rokid.phone.model.profileStartupError
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
 import com.sheen.rokid.phone.model.ArtifactMediaSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -387,9 +399,42 @@ class HostCompositionRoot internal constructor(
      * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
      * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
      * page and to [ProactiveArming]'s detached predicate. A hand-built composition keeps the shipped glasses mode.
-     * Kept **last** so positional construction of older call sites is unchanged.
      */
     internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.52 (design §5.8): the encrypted model catalog, when this composition owns one.
+     *
+     * Production [create] passes the same `AndroidModelCatalogRepository` that backs [profiles], so
+     * [activeCatalogProfile] is the live projection rather than an assembly-time snapshot. A hand-built composition
+     * leaves it null; [activeCatalogProfile] then answers the first profile its repository lists, which keeps the
+     * pre-0.52 rigs meaningful without constructing a second owner of the model configuration.
+     *
+     * Appended after [detachGate] per the 0.52 plan; all call sites pass it by name.
+     */
+    private val modelCatalog: ModelCatalogRepository? = null,
+    /**
+     * 0.52 (design §5.4): the gateway's `GET /models` source, or null for a hand-built composition.
+     *
+     * Production [create] builds a dedicated client with redirects and connection retries off and without the
+     * scripted model wire; the catalog refresh (Task 13) reads this same instance. A hand-built composition that
+     * does not wire one leaves the refresh unavailable rather than fabricating a model list.
+     */
+    val modelListSource: ModelListSource? = null,
+    /**
+     * 0.52 (design §5.5): the refresh/restore orchestration over [modelCatalog] and [modelListSource].
+     *
+     * Production [create] constructs `ModelCatalogService(catalog, modelListSource)` and passes it; a hand-built
+     * composition that does not wire one leaves the model-service page unavailable instead of pretending a refresh
+     * exists. Task 13's [modelCatalogViewModel] is the only consumer.
+     */
+    private val modelCatalogService: ModelCatalogService? = null,
+    /**
+     * 0.52 (design §5.3): the one-shot pre-catalog upgrade detector, or null for hand-built compositions.
+     *
+     * Production [create] builds it over the same encrypted blob store and the `edith_model_upgrade` SharedPreferences
+     * flag. `PhoneScreen` asks it at first composition; the dialog is the only caller.
+     */
+    internal val legacyModelConfig: LegacyModelConfig? = null,
     /**
      * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
      * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
@@ -458,6 +503,19 @@ class HostCompositionRoot internal constructor(
      */
     private val speechOn = MutableStateFlow(false)
     internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
+
+    /**
+     * 0.52 fix round 1 (design §4.2): the last detach auto-on speech write that refused, or null.
+     *
+     * [onDetachModeChanged] turns 「语音朗读」on the first time the phone-only mode is enabled and the user has never
+     * made an explicit speech choice. That write is not the settings page's own switch callback, so its
+     * [SettingsSaveResult] used to be discarded: on a store that could be read but not written the refusal ended in
+     * `P5_TTS ... persisted=false` while the live switch showed on and the page showed no failure. Publishing the
+     * result here lets the page render the same mapped refusal as every other save. Null means nothing to report;
+     * the next detach clears it before re-deciding.
+     */
+    private val speechAutoOnFailureState = MutableStateFlow<SettingsSaveResult?>(null)
+    internal val speechAutoOnFailure: StateFlow<SettingsSaveResult?> = speechAutoOnFailureState.asStateFlow()
 
     /**
      * 0.5 (`D210`/`D211`): the live appearance of the phone-only overlay. Seeded from the persisted settings in
@@ -555,8 +613,13 @@ class HostCompositionRoot internal constructor(
      *
      * `speechOn` is the user's intent and can stay on while no player exists (the engine is missing); the capability
      * and every speech request are gated on the holder, not on this flow.
+     *
+     * 0.52 design §4.2: the returned [SettingsSaveResult] is what makes a persistence refusal visible. The live switch
+     * and the player still move before the blob write (the user's tap must not be lost), but the settings page now
+     * renders the mapped refusal instead of it ending in a log line. Every call source can ignore the value; only the
+     * page shows it.
      */
-    @Synchronized internal fun setSpeechEnabled(enabled: Boolean) {
+    @Synchronized internal fun setSpeechEnabled(enabled: Boolean): SettingsSaveResult {
         speechOn.value = enabled
         val state = if (enabled) "on" else "off"
         if (enabled) {
@@ -587,20 +650,26 @@ class HostCompositionRoot internal constructor(
             // mic", so the tail is dropped too; otherwise a lost end callback could leave the only mute source behind now
             // that the 120 s watchdog is gone.
             echoMute?.clear()
+            wakeAckGate.reset()
             P3Log.line("P5_TTS state=off")
         }
         val target = smartSettingsStore
         if (target == null) {
             P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_STORE_UNAVAILABLE")
-            return
+            return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_STORE_UNAVAILABLE)
         }
         val stored = runCatching { target.loadForWrite() }.getOrNull()
         if (stored == null) {
             P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_UNREADABLE")
-            return
+            return SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SETTINGS_UNREADABLE)
         }
-        runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }
-            .onFailure { P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED") }
+        return runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }.fold(
+            onSuccess = { SettingsSaveResult(saved = true) },
+            onFailure = {
+                P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED")
+                SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SAVE_FAILED)
+            },
+        )
     }
 
     /** One opacity save's outcome: [saved] is the blob's verdict, [error] a stable code for the settings copy. */
@@ -1057,7 +1126,119 @@ class HostCompositionRoot internal constructor(
      * deliberately unaffected until the next assembly - which is what the screen's copy says.
      */
     fun storedSettings(): SmartSettings =
-        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load(profiles)
+        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load()
+
+    /**
+     * 0.52 design §5.8: the model profile the encrypted catalog currently projects, or null when none is configured.
+     *
+     * Production reads the live catalog on every call, so a provider/model switch made after assembly applies to the
+     * next configuration and turn. A hand-built composition without a catalog falls back to the first profile its
+     * repository lists - the 0.52 test seam - and any refusal (locked keystore, deleted payload, unreadable catalog) is
+     * answered as null rather than an exception: the configuration still has to be built, and the plugin's own lookup
+     * is the fail-closed point.
+     */
+    fun activeCatalogProfile(): ModelProfile? {
+        val catalog = modelCatalog
+        if (catalog != null) return runCatching { catalog.catalog() }.getOrNull()?.activeProfile()
+        return runCatching { profiles.list().firstOrNull() }.getOrNull()
+    }
+
+    /**
+     * 0.52: the encrypted catalog itself, for the settings home's read-only summary and the debug seeding instrument.
+     *
+     * Internal rather than a public host surface: the catalog is an App-storage concern and Task 13's model-service view
+     * model owns every user-visible mutation. The debug receiver writes through it because it seeds a provider without
+     * the Compose form; the settings shell only calls [ModelCatalogRepository.catalog].
+     */
+    internal val modelCatalogRepository: ModelCatalogRepository? get() = modelCatalog
+
+    /**
+     * 0.52 I1: refuses a session whose catalog selection is not currently usable (removed by the gateway, or its
+     * TEXT_REQUEST evidence no longer matches the provider revision). Hand-built rigs without a catalog keep the
+     * pre-existing profile-only gate; an unreadable catalog is answered by the configuration path, not invented here.
+     */
+    private fun catalogSelectionStartupError(): String? {
+        val repository = modelCatalog ?: return null
+        val catalog = runCatching { repository.catalog() }.getOrNull() ?: return null
+        return ModelSelection.startRefusal(catalog)
+    }
+
+    /**
+     * 0.52 design §5.10: builds the model-service page's view model, or null when this composition has no catalog or no
+     * refresh service - the page then says 「模型服务不可用」 rather than fabricating an empty catalog.
+     *
+     * One call = one page session. The shell composes it inside `remember` for the catalog route group and calls
+     * `leave()` when the group leaves composition; that cancels in-flight fetches/writes. Re-entering the group composes a
+     * new view model whose `enter()` re-reads the catalog, which is the design §4.4 state rule.
+     *
+     * The selection callbacks are the T3 split: `beforeSelectionChange` is [stopForModelSwitch] (it must run before the
+     * repository writes the selection), `selectionChanged` is [onCatalogSelectionChanged], and `probeConsent` is the
+     * probe gate's grant. A null tester disables the detail page's test with a reason instead of crashing.
+     */
+    internal fun modelCatalogViewModel(): ModelCatalogViewModel? {
+        val repository = modelCatalog ?: return null
+        val service = modelCatalogService ?: return null
+        return ModelCatalogViewModel(
+            repository = repository,
+            service = service,
+            tester = profileTester,
+            probeConsent = { consent -> profileConsent(consent) },
+            beforeSelectionChange = { stopForModelSwitch() },
+            selectionChanged = { profile -> onCatalogSelectionChanged(profile) },
+            sessionRunning = { sessionBlocksModelSwitch() },
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        )
+    }
+
+    /**
+     * Debug-only: grants the probe gate the confirmation that the production UI would otherwise collect.
+     *
+     * This is the same [profileConsent] callback [modelCatalogViewModel] hands the model-service page, so the
+     * shell-driven debug profile creator can drive the **production** tester end to end without a confirmation dialog.
+     * The production UI still owns the user confirmation, and no production code calls this method.
+     */
+    internal fun debugGrantProbeConsent(consent: ProbeConsent?) {
+        profileConsent(consent)
+    }
+
+    /** True while a live plugin session would have to be stopped before a model selection is written. */
+    private fun sessionBlocksModelSwitch(): Boolean = !closed && activatedPlugin != null
+
+    /**
+     * 0.52 design §5.8 / ruling R18: stops the running session **before** a model selection is written.
+     *
+     * The split from [onCatalogSelectionChanged] is deliberate. Stopping after the catalog write would leave a session
+     * briefly running under the new selection while the plugin still holds the old configuration; Task 13's view model
+     * therefore calls this first, writes `activeProviderId`/`selectedModelId` second and reconfigures third. A failure
+     * here propagates, so the selection is not persisted and the old session keeps running.
+     *
+     * A session with no activated plugin (idle/paused, or one refused for missing capabilities) needs no stop, and the
+     * host's configure path already accepts a paused/ready host. A pending START grant is dropped with the stop, so a
+     * token authorized before the switch cannot start a session under the selection being replaced. The audio epoch is
+     * disarmed before the pause for the same reason [pause] does it: a detached session's recorder, ingress, poll loop
+     * and CPU hold must not survive it.
+     */
+    @Synchronized fun stopForModelSwitch() {
+        if (closed || activatedPlugin == null) return
+        pendingStart = null
+        disarmAudioEpoch()
+        host.pause()
+        activatedPlugin = null
+    }
+
+    /**
+     * 0.52 design §5.8: applies the active catalog projection to the smart plugin's stored configuration.
+     *
+     * Only `configurationFor` + `host.configure` - the session stop belongs to [stopForModelSwitch] and the caller runs
+     * it **before** writing the selection. Configuring while a plugin is active is refused by the host, which is the
+     * truthful answer for a caller that skipped the stop rather than a silently dropped selection.
+     */
+    @Synchronized fun onCatalogSelectionChanged(profile: ModelProfile?) {
+        if (closed) return
+        val pluginId = smartWiring?.plugin?.descriptor?.pluginId ?: return
+        val configuration = configurationFor(pluginId, profile) ?: return
+        check(host.configure(pluginId, configuration)) { "Model selection unavailable" }
+    }
 
     /**
      * Persists one settings edit; the next App start's composition picks it up (this one never re-reads).
@@ -1114,40 +1295,10 @@ class HostCompositionRoot internal constructor(
     private data class StartGrant(val token: String, val pluginId: String, val expires: Long)
     private var pendingStart: StartGrant? = null
     private val clock = environment?.clock ?: object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
-    fun profileViewModel(): ProfileViewModel? {
-        val repository = profiles as? AndroidProfileRepository ?: return null
-        return ProfileViewModel(repository, profileTester ?: return null, profileConsent, ::applyProfileSelection)
-    }
+
     fun namespace(pluginId: String): StorageHandle {
         require(pluginId in setOf("smart-assistant", "interview-assistant") || (BuildConfig.DEBUG && pluginId == DIAGNOSTIC_PLUGIN_ID))
         return namespaceFactory?.invoke(pluginId) ?: throw ContractError.CapabilityMissing("Persistent storage unavailable")
-    }
-    /**
-     * Applies a profile selection the user made to the plugin it belongs to.
-     *
-     * The configuration is rebuilt whole ([configurationFor]) rather than patched with the profile fields:
-     * `HostRuntime.configure` replaces the stored configuration, so sending only the profile selection would drop the
-     * settings-derived keys the plugin runs with (Task 14a-fix item 1). A plugin that is already active must be
-     * paused first, because the host refuses to configure an active plugin.
-     *
-     * 0.4 Task 8 fix 1 (spec §4.5/§4.6). This pause used to call `host.pause()` directly and so bypassed the
-     * composition's own [pause], which is the path that disarms the audio epoch. A profile change made while a
-     * **detached** session was active therefore left its phone recorder, ingress, poll loop and CPU wake lock running
-     * with the host paused until some later resume/stop/close - the "release on pause" rule violated from a
-     * user-reachable Settings action. Detached mode now disarms first (the ordinary `P4_AUDIO ... reason=DISARMED`
-     * transition, which is also where `lockscreen_hold=false` is recorded). The disarm is deliberately gated on
-     * [detachGate]: glasses mode's pre-0.4 epoch semantics on this settings path are intentionally left byte-for-byte
-     * unchanged, and this fix's scope is the detached source and its CPU hold.
-     */
-    @Synchronized internal fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
-        if (closed) return
-        if (activatedPlugin == pluginId) {
-            if (detachGate.enabled.value) disarmAudioEpoch()
-            host.pause()
-            activatedPlugin = null
-        }
-        val configuration = configurationFor(pluginId, profile) ?: return
-        check(host.configure(pluginId, configuration)) { "Profile selection unavailable" }
     }
 
     /**
@@ -1171,22 +1322,17 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * The profile that applies to [pluginId].
+     * The profile that applies to every plugin.
      *
-     * The App stores one selection per plugin, so that selection wins where this composition has such a store (the
-     * Android repository). Without one - a JVM harness, or a plugin the user never selected for - the smart plugin
-     * falls back to the settings' own resolved choice, because that is the profile the settings name; any other
-     * plugin gets no profile, and its own shape fills in the contract-valid placeholder it needs. A repository that
-     * refuses (locked keystore, deleted payload) yields null rather than propagating: the configuration still has to
-     * be built, and the plugin's own lookup finds nothing until storage answers again.
+     * 0.52 design §5.8: the catalog is the only selection source and it is global - there is one active provider/model
+     * for the whole app, not one per plugin. The question is therefore answered without looking at [pluginId]. The
+     * smart plugin's role is answered by the wiring's live `activeProfile()` (production wires it to
+     * [activeCatalogProfile]); the host's own projection is the fallback for a rig whose wiring was built without a
+     * catalog source. A plugin that still receives null (no catalog configured) fills in the contract-valid placeholder
+     * its own configuration shape needs - the smart keys are never sent to it.
      */
-    private fun selectedProfile(pluginId: String): ModelProfile? = resolveTurnProfile(
-        selection = { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) },
-        load = profiles::get,
-        fallback = {
-            if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
-        },
-    )
+    private fun selectedProfile(pluginId: String): ModelProfile? =
+        smartWiring?.activeProfile() ?: activeCatalogProfile()
 
     /** The diagnostic text plugin's own configuration shape; it refuses every key that is not one of these. */
     private fun diagnosticValues(profile: ModelProfile?): Map<String, String> = mapOf(
@@ -1210,6 +1356,12 @@ class HostCompositionRoot internal constructor(
         val startupError = profileStartupError(selectedProfile(pluginId))
         if (startupError != null) {
             mutableState.update { it.copy(errorCode = startupError) }
+            return
+        }
+        // 0.52 I1: the same selectability rule the radio and the repository use also gates the session start. A stale
+        // selection (content change cleared its TEXT evidence) or a gateway-removed one refuses here, visibly.
+        catalogSelectionStartupError()?.let { refusal ->
+            mutableState.update { it.copy(errorCode = refusal) }
             return
         }
         val session = SessionId(UUID.randomUUID().toString())
@@ -2589,6 +2741,9 @@ class HostCompositionRoot internal constructor(
 
     private var wakeAckPlayer: AndroidSpeechPlayer? = null
 
+    /** Drops a KWS hit that is the detached ack's own tail; driven by the player's real start/end callbacks. */
+    internal val wakeAckGate = WakeAckGate()
+
     /**
      * 0.5.1 C5: the composition's one echo-mute window, handed to every player [create] and [setSpeechEnabled] build.
      *
@@ -2619,6 +2774,20 @@ class HostCompositionRoot internal constructor(
         ack: (String) -> Boolean = { false },
         chime: () -> Unit = {},
     ) {
+        // A KWS hit is an explicit new input, not a continuation of the turn that faulted. A provider fault pauses
+        // the process-lifetime pipeline for the whole session; without this re-arm the wake turn opens, the ack
+        // plays, and the turn times out with no `P3_ASR` while KWS keeps working (K70 2026-11-06; only force-stop
+        // repaired it). `rearmPipeline` is a no-op unless the pipeline is actually paused.
+        audioChain?.rearmPipeline("wake")
+        // The acknowledgement's own tail can be reported as a second wake just after the player's real end
+        // (K70: 145 ms after onDone). Drop the whole duplicate - not just its spoken copy - because admitting it can
+        // open a ten-second wake turn with no user speech. The gate is driven by the player's STARTED/FINISHED
+        // callbacks, so a cold TTS start that takes seconds does not shorten it and a never-audible ack arms nothing.
+        val now = clock.nowNanos()
+        if (detachGate.enabled.value && wakeAckGate.shouldSuppress(now)) {
+            P3Log.line("P3_WAKE suppressed reason=ack_echo")
+            return
+        }
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
@@ -2655,7 +2824,13 @@ class HostCompositionRoot internal constructor(
         runCatching {
             Thread({
                 val accepted = runCatching {
-                    player.speakText(text, "detached-wake-ack")
+                    player.speakText(text, "detached-wake-ack") { state ->
+                        when (state) {
+                            SpeechPlayback.STARTED -> wakeAckGate.started(clock.nowNanos())
+                            SpeechPlayback.FINISHED, SpeechPlayback.FAILED ->
+                                wakeAckGate.finished(clock.nowNanos())
+                        }
+                    }
                 }.getOrDefault(false)
                 P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
             }, "edith-wake-ack").apply { isDaemon = true }.start()
@@ -2975,6 +3150,13 @@ class HostCompositionRoot internal constructor(
             error(code)
             return
         }
+        // 0.52 I1: the start gate uses the same selectability rule as the settings radio and the repository fallbacks.
+        catalogSelectionStartupError()?.let { code ->
+            disarmAudioEpoch()
+            host.pause()
+            error(code)
+            return
+        }
         // One configuration, built once - settings keys and profile selection together - and applied only to the
         // plugin it belongs to. `HostRuntime.configure` replaces the stored configuration, so a second call carrying
         // just the profile selection silently dropped the smart keys the user configured (Task 14a-fix item 1), and
@@ -3086,6 +3268,9 @@ class HostCompositionRoot internal constructor(
         // Before `host.stop()`: the epoch named by `runningAudioEpoch` is the one the loop is polling under, and
         // after teardown the input port may no longer be able to answer for it.
         disarmAudioEpoch()
+        // The next session must not inherit the previous acknowledgement's tail; reset after the input epoch is torn
+        // down so a duplicate KWS wake during teardown is still covered.
+        wakeAckGate.reset()
         try {
             host.stop()
         } finally {
@@ -3162,6 +3347,8 @@ class HostCompositionRoot internal constructor(
                     else -> "close_failed"
                 },
         )
+        // 0.52 fix round 1 (design §4.2): a previous auto-on refusal is stale once the mode is enabled again.
+        speechAutoOnFailureState.value = null
         // 0.5 (`D213`): the phone-only model's first activation turns「语音朗读」on when the user has never made an
         // explicit speech choice. `speechConfigured` is the D53② same-shape guard: once the user has turned it off, a
         // later detach never re-enables it. A store that cannot be read is treated as "already configured" so an
@@ -3169,7 +3356,10 @@ class HostCompositionRoot internal constructor(
         val speechAlreadyConfigured = runCatching { storedSettings().speechConfigured }.getOrDefault(true)
         if (!speechAlreadyConfigured) {
             P3Log.line("P5_TTS state=default_on reason=phone_only")
-            setSpeechEnabled(true)
+            // The refusal must be visible on the settings page, not only in `P5_TTS ... persisted=false`: the live
+            // switch already moved, so the page is the only place that can tell the user nothing was stored.
+            val result = setSpeechEnabled(true)
+            speechAutoOnFailureState.value = if (result.saved) null else result
         }
         // 0.5 (`D214`): the ball/bubbles follow the mode; a missing overlay permission is refused visibly in the
         // settings page (the service logs `NO_OVERLAY_PERMISSION` and stops itself).
@@ -3255,6 +3445,7 @@ class HostCompositionRoot internal constructor(
             stop()
         } finally {
             closed = true
+            wakeAckGate.reset()
             // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an
             // arm that never reached a disarm, and is a no-op when nothing is held.
             releaseDetachedWakeLock()
@@ -3317,7 +3508,14 @@ class HostCompositionRoot internal constructor(
             }
             val blobs = AndroidEncryptedBlobStore(context)
             val resolver = KeystoreVault(blobs)
-            val profiles = AndroidProfileRepository(blobs, resolver)
+            // 0.52 design §5.8: the encrypted catalog is the only model-configuration owner. The projected profiles
+            // keep the existing `ProfileRepository` contract for the controlled client, the probe gate, the tester and
+            // the plugin's lookup, so everything downstream reads one derived view of the catalog.
+            val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(resolver))
+            // Ruling R13: the vault admits only handles the catalog currently references. Without this authority the
+            // projected `SecretHandle` is rejected by `withSecret` before the request reaches HTTP.
+            resolver.authorize(catalog::isCredentialReferenced)
+            val profiles = CatalogProfileRepository(catalog)
             val probeGate = ProfileProbeGate(profiles)
             // Task 14a/14b: the one settings store, built here rather than further down because the arming switch
             // below persists through it. A save and the next load therefore read the same blob.
@@ -3358,10 +3556,33 @@ class HostCompositionRoot internal constructor(
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
             val scriptedWire = ScriptedModelWire()
             val http = OkHttpClient.Builder()
+                // 0.5.4 Task 6: `ControlledModelClient` owns the request's liveness (first-token grace, stream idle,
+                // hard cap). The transport must not impose its own read/write deadlines on top of that - OkHttp's
+                // default 10 s read timeout would cut a thinking stream long before the client's 20 s idle window, and
+                // could never see the 45 s first-token grace. The connect timeout is the one bound OkHttp keeps.
+                .callTimeout(0, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.SECONDS)
+                .writeTimeout(0, TimeUnit.SECONDS)
                 // Debug-only scripted wire, first so a canned answer still passes through `ModelHttpLog` below and the
                 // `P3_HTTP` line keeps telling the truth about what the client saw. Inert until armed.
                 .addInterceptor(scriptedWire)
                 .addInterceptor(ModelHttpLog(clock::nowNanos)).build()
+            // 0.52 design §5.4: `GET /models` is a plain JSON call, not the SSE model wire, so it gets its **own**
+            // client. Redirects stay off (a redirect could carry the bearer key to another origin) and so do
+            // connection retries (the caller owns repetition). No ScriptedModelWire: that wire answers POSTs, and a
+            // canned model list would make the settings page lie about the gateway.
+            val modelListHttp = OkHttpClient.Builder()
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .retryOnConnectionFailure(false)
+                .build()
+            val modelListSource = ModelListClient(modelListHttp, resolver, allowLocalHttp = BuildConfig.DEBUG)
+            // 0.52 design §5.5: the refresh/restore orchestration Task 13's model-service view model drives; one
+            // instance per composition, over the same catalog and model-list client.
+            val modelCatalogService = ModelCatalogService(catalog, modelListSource)
+            // 0.52 design §5.3: the one-shot pre-catalog upgrade notice. The flag persists in SharedPreferences
+            // (`edith_model_upgrade`), the payload check reads the same encrypted store as the catalog.
+            val legacyModelConfig = LegacyModelConfig(blobs, SharedPreferencesLegacyPromptStore(context))
             // 0.25 Task 13 (R67/R71/R72): the one artifact store of this composition. The kernel writes a screenshot
             // into it; both model adapters read the same instance back through the one `MediaSource` the controlled
             // client holds. App-cache scratch, bounded and LRU — never the repository, never a log line.
@@ -3445,7 +3666,7 @@ class HostCompositionRoot internal constructor(
             // the same blob. The composition's own settings stay the ones read here; the screen's copy says that only
             // a full App restart re-reads them (this root is a process-lifetime singleton), with the single exception
             // of the live vision gate built just below.
-            val smartSettings = smartSettingsStore.load(profiles)
+            val smartSettings = smartSettingsStore.load()
             // Phase 2 Task 10: one live gate for the perception provider and the device tool, seeded from the stored
             // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
             // both consumers are gone, so the switch really is the only source of truth.
@@ -3675,10 +3896,23 @@ class HostCompositionRoot internal constructor(
                 phoneOnly = { detachGate.enabled.value },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
                 // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
-                noInterception = noInterceptionGate.provider())
+                noInterception = noInterceptionGate.provider(),
+                // 0.52: the live catalog projection. Read through the root holder because the composition instance is
+                // built after this wiring; the host's own `activeCatalogProfile()` is the single answer to "which
+                // model is active now", so a provider/model switch needs no re-assembly.
+                activeProfile = { rootHolder[0]?.activeCatalogProfile() },
+                // Debug-only model trace (debug/0.5.4-model-trace): one JSON line per finished agent run, appended to
+                // the App-private `filesDir/edith-model-trace.jsonl` for `adb exec-out run-as ... cat`. `BuildConfig.DEBUG`
+                // is a compile-time constant, so a release build folds this to the plugin's no-op default and never
+                // writes a model body, transcript or observation to disk.
+                traceLine = if (BuildConfig.DEBUG) {
+                    com.sheen.rokid.phone.plugin.smarthelper.trace.ModelTraceFile.writer(context.filesDir)
+                } else {
+                    {}
+                })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
-            // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed
+            // four verified tools plus the atomic channel legs, 23 descriptors in all. The advertised set is fixed
             // (A3): each channel is asked per call, never at read time, so a channel that goes down refuses rather than
             // disappearing from the model's table.
             val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
@@ -3769,10 +4003,10 @@ class HostCompositionRoot internal constructor(
                 glassesConnected = { hintLink.isEstablished() },
                 glassesWearing = { rootHolder[0]?.glassesWearing() },
             )
-            // ---- 0.3 Phase 4A Task 4: the 22-host-tool surface (spec §4.1/§4.2) ---------------------------------------
+            // ---- 0.3 Phase 4A Task 4: the 23-host-tool surface (spec §4.1/§4.2) ---------------------------------------
             // `ToolCatalog` is the umbrella half: four host tools (`device`/`shell`/`open`/`dial`) that stay advertised
-            // in every channel state (A3). The atomic legs built below it add the 18 fast-path tools, and the plugin
-            // adds `notify_user`/`load_skill` beside the surface - 24 model-visible tools in all. The old 21-tool
+            // in every channel state (A3). The atomic legs built below it add the 19 fast-path tools, and the plugin
+            // adds `notify_user`/`load_skill` beside the surface - 25 model-visible tools in all. The old 21-tool
             // `ExecutionRouter` remains retired from production.
             //
             // The accessibility port is resolved per call through the service's companion: the user can switch the
@@ -3842,18 +4076,15 @@ class HostCompositionRoot internal constructor(
                 // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
                 // injected capture is not called while it is off.
                 visionEnabled = { visionGate.enabled },
-                // 0.3 Phase 2.1 Task 4 fix: the second gate resolves the **turn's** profile, not the assembly-time
-                // settings choice. The repository selection (the same source `selectedProfile(pluginId)`/the turn
-                // configuration reads) wins; the settings profile is only the fallback. Both are read inside the lambda,
-                // so a profile selection change applies to the next capture. Null/exception reads false (no image).
+                // 0.52: the turn's profile is the **active catalog projection** - the same source
+                // `selectedProfile(pluginId)` and the turn configuration read. Resolved inside the lambda, so a
+                // provider/model switch applies to the next capture instead of being frozen at assembly.
+                // Null/exception reads false (no image).
                 profileSupportsImage = {
                     autoVisionProfileSupportsImage(
-                        selection = {
-                            (profiles as? AndroidProfileRepository)?.selections()
-                                ?.get(smartWiring.plugin.descriptor.pluginId)
-                        },
+                        selection = { rootHolder[0]?.activeCatalogProfile()?.id },
                         load = profiles::get,
-                        fallback = smartWiring::selectedProfile,
+                        fallback = { null },
                     )
                 },
                 // 0.3 Phase 2.1 Task 4 fix: one mapping for the kernel envelope. A `pending` placeholder (the capture
@@ -3921,12 +4152,13 @@ class HostCompositionRoot internal constructor(
                 observe = toolObservation,
                 capture = { perception.screenshot() },
             )
-            // ---- edith-0.3 Phase 4A Task 4 (A4): the 22-host-tool face ------------------------------------------
-            // `toolCatalog` is the umbrella half (the verified, structured path). The five atomic backends beside it are
-            // the fast path the model may choose instead: one leg per channel, each answering its own `available()` at
-            // call time. `ToolSurface` is the **one** `Capability.Actions` provider over both halves - 18 atomic
-            // descriptors plus the catalog's four = 22 - and it refuses a duplicate name at construction, which is why
-            // the intent leg filters `dial`: the catalog's `DialTool` is that name's only advertised owner.
+            // ---- edith-0.3 Phase 4A Task 4 (A4): the 23-host-tool face ------------------------------------------
+            // `toolCatalog` is the umbrella half (the verified, structured path). The seven atomic backends beside it are
+            // the fast path the model may choose instead: one leg per channel (plus 0.5.4's app-process `deep_link` and
+            // notification-listener `media` legs), each answering its own `available()` at call time. `ToolSurface` is
+            // the **one** `Capability.Actions` provider over both halves - 19 atomic descriptors plus the catalog's
+            // four = 23 - and it refuses a duplicate name at construction, which is why the intent leg filters `dial`:
+            // the catalog's `DialTool` is that name's only advertised owner.
             //
             // Advertising is stable (A3): a channel that is down keeps its tools advertised and its own `execute`
             // answers the refusal, so the schema and the cached prompt prefix cannot change under the model mid-session.
@@ -3949,7 +4181,20 @@ class HostCompositionRoot internal constructor(
                 override fun scroll(direction: ScrollDirection): Boolean = live().scroll(direction)
                 override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean =
                     live().setTextByIndex(snapshotId, index, text)
+                // 0.5.4 T12: the read-back and the channel's own snapshot-validity answer. Their interface defaults are
+                // the no-op answers (null / true), so the wrapper must delegate or production could never verify a write
+                // and could never tell an invalidated channel snapshot.
+                override fun textAt(index: Int, filter: A11yScreenFilter): String? = live().textAt(index, filter)
+                override fun isSnapshotValid(snapshotId: String): Boolean = live().isSnapshotValid(snapshotId)
                 override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
+                // 0.5.4 T11: coordinate actions are the live service's own gesture and gate probes. The defaults on
+                // `AccessibilityUi` fail closed, so the wrapper must delegate or production would never tap a point.
+                override fun foreground(): Foreground? = live().foreground()
+                override fun isKeyguardLocked(): Boolean = live().isKeyguardLocked()
+                override fun focusedWindowIsApplication(): Boolean? = live().focusedWindowIsApplication()
+                override fun screenBounds(): ScreenBounds? = live().screenBounds()
+                override fun clickAt(x: Int, y: Int): Boolean = live().clickAt(x, y)
+                override fun longPressAt(x: Int, y: Int): Boolean = live().longPressAt(x, y)
             }
             // `list_apps` and the umbrella `open` resolve spoken names against the same `appCatalog` instance.
             // `open_app` (intent) resolves through its own executor's package catalog over the same package manager,
@@ -3982,6 +4227,29 @@ class HostCompositionRoot internal constructor(
                 // Shizuku: back/home/recents/notifications
                 AtomicActionExecutor(
                     SystemActionExecutor(shell = shizukuShell, channelUp = { shizukuShell.ready() }),
+                ),
+                // 0.5.4 Task 14 (spec §6.4): `deep_link` - one ACTION_VIEW intent through the app process itself
+                // (no Shizuku, no new permission/service), verified by the same 2 s foreground + a11y-root pipeline
+                // `open` uses. The intent channel has no unavailable state, so the leg advertises and answers always;
+                // an accessibility-off device gets `UNVERIFIED`, never a fabricated success.
+                AtomicActionExecutor(
+                    DeepLinkTool(
+                        launcher = ContextDeepLinkLauncher(context),
+                        foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
+                        rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                    ),
+                ),
+                // 0.5.4 Task 15 (spec §6.5): `media` - the active-session control leg over the already-granted
+                // notification listener (`MediaSessionManager.getActiveSessions`), not a new permission or Service.
+                // The port sends one transport command, polls PlaybackState for 1.5 s and releases every controller;
+                // without notification access it answers NO_NOTIFICATION_ACCESS, never a fabricated session.
+                AtomicActionExecutor(
+                    MediaTool(
+                        AndroidMediaControlPort(
+                            context = context,
+                            listenerComponent = ComponentName(context, NotificationCategoryService::class.java),
+                        ),
+                    ),
                 ),
             )
             // The catalog is closed through the surface's `onClose` (after the atomic executors), so the composition's
@@ -4132,9 +4400,9 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 18 atomic tools plus the catalog's four
-                    // (22 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
-                    // plugin adds `notify_user`/`load_skill` beside it for 24. The old 21-tool router stays retired.
+                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 19 atomic tools plus the catalog's four
+                    // (23 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
+                    // plugin adds `notify_user`/`load_skill` beside it for 25. The old 21-tool router stays retired.
                     put(Capability.Actions, gatedActions)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
@@ -4190,6 +4458,7 @@ class HostCompositionRoot internal constructor(
                 add(AutoCloseable {
                     timer.shutdownNow(); pluginTasks.shutdownNow()
                     http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
+                    modelListHttp.dispatcher.executorService.shutdown(); modelListHttp.connectionPool.evictAll()
                 })
                 // 0.25 Task 10 (R42): closing the surface closes the device kernel (through the catalog's onClose) and
                 // any closeable atomic executor, so a closed composition cannot leave a device thread behind. The
@@ -4236,6 +4505,14 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.52: the same catalog behind `profiles`, so the runtime switch reads the live projection.
+                modelCatalog = catalog,
+                // 0.52 design §5.4: the dedicated gateway list client the catalog refresh will use.
+                modelListSource = modelListSource,
+                // 0.52 design §5.5: the refresh/restore service Task 13's page view model drives.
+                modelCatalogService = modelCatalogService,
+                // 0.52 design §5.3: the one-shot legacy upgrade detector PhoneScreen asks at first composition.
+                legacyModelConfig = legacyModelConfig,
                 // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
                 syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
@@ -4832,12 +5109,14 @@ internal class CxrAudioChain private constructor(
     }
 
     /**
-     * Re-arms the shared speech pipeline after a provider fault, for a **new** session (0.4 Task 13d).
+     * Re-arms the shared speech pipeline after a provider fault: for a **new session**, and since the 2026-11-06 K70
+     * hotfix for an **explicit KWS wake** (a user-initiated new input).
      *
      * The pipeline is process-lifetime (its ASR/VAD/speaker models cost a full load), and a fault pauses it for the
      * session that produced it. Without this the first transient fault silenced ASR for every later session until the
      * App was force-stopped (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake turn with no
-     * `P3_ASR`, restored by cold launch). Called when a new audio epoch is armed.
+     * `P3_ASR`, restored by cold launch). A KWS wake now re-arms the same session once; a persistent fault remains
+     * visible (`P3_PIPELINE state=fault`/`state=paused`) and is retried only on the next explicit wake, not in a loop.
      */
     internal fun rearmPipeline(reason: String) {
         val rearmed = runCatching { pipeline.rearm() }.getOrDefault(false)

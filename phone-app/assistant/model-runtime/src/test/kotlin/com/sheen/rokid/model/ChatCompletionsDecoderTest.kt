@@ -33,6 +33,12 @@ class ChatCompletionsDecoderTest {
     private fun content(text: String) = SseFrame(null,
         """{"choices":[{"delta":{"content":"$text"}}]}""")
 
+    private fun reasoning(text: String) = SseFrame(null,
+        """{"choices":[{"delta":{"reasoning_content":"$text"},"index":0}]}""")
+
+    private fun finishWith(reason: String) = SseFrame(null,
+        """{"choices":[{"delta":{},"finish_reason":"$reason"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}""")
+
     private fun done() = SseFrame(null, "[DONE]")
 
     private fun usageOf(usage: String): ModelUsage? {
@@ -143,5 +149,186 @@ class ChatCompletionsDecoderTest {
         val terminal = terminal(decoder.accept(done()))
         assertEquals(ModelUsage(100, 20, cacheMissInputTokens = 36), terminal.usage)
         assertNull(terminal.usage?.cachedInputTokens, "a counter never reported stays absent")
+    }
+
+    // ------------------------------------------------------------ 0.53 DeepSeek thinking (design §5.2)
+
+    @Test fun `reasoning content streams before the answer without becoming text`() {
+        // The chain of thought is its own event stream: it never becomes answer text and never marks the turn as
+        // "text delivered" (so it cannot satisfy the retry gate or the content-based verdict).
+        val decoder = ChatCompletionsDecoder("q")
+
+        val first = decoder.accept(reasoning("先想"))
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "先想")), first)
+
+        val second = decoder.accept(content("好"))
+        assertEquals(listOf(ModelStreamEvent.TextDelta("q", "好")), second)
+    }
+
+    @Test fun `an empty reasoning chunk emits nothing and a reasoning only turn is decided by its finish reason`() {
+        val decoder = ChatCompletionsDecoder("q")
+
+        assertTrue(decoder.accept(reasoning("")).isEmpty(), "an empty reasoning fragment is not an event")
+        assertEquals(
+            listOf(ModelStreamEvent.ReasoningDelta("q", "想")),
+            decoder.accept(reasoning("想")),
+            "a reasoning-only turn still surfaces its chain of thought",
+        )
+        val terminal = terminal(decoder.accept(finishWith("stop")))
+        assertEquals(ModelEnd.COMPLETED, terminal.end, "the finish reason decides, not the absent answer text")
+    }
+
+    @Test fun `a reasoning only stream with no finish reason ends incomplete`() {
+        val decoder = ChatCompletionsDecoder("q")
+
+        decoder.accept(reasoning("想"))
+
+        val terminal = terminal(decoder.accept(done()))
+        assertEquals(ModelEnd.INCOMPLETE, terminal.end)
+        assertEquals("EOF_INCOMPLETE", terminal.safeCode, "reasoning is not answer content, so it cannot complete a turn")
+    }
+
+    @Test fun `a tool call finish reason is a completed turn`() {
+        // 0.53 §T10: a tool-call turn is a successful model turn. Before this fix `tool_calls` fell into the unknown
+        // branch and failed the whole Chat protocol tool loop.
+        val decoder = ChatCompletionsDecoder("q")
+
+        decoder.accept(reasoning("想"))
+
+        val terminal = terminal(decoder.accept(finishWith("tool_calls")))
+        assertEquals(ModelEnd.COMPLETED, terminal.end)
+        assertNull(terminal.safeCode)
+    }
+
+    @Test fun `the other finish reasons keep their existing verdicts`() {
+        assertEquals(ModelEnd.COMPLETED, terminal(ChatCompletionsDecoder("q").accept(finishWith("stop"))).end)
+        assertEquals(ModelEnd.INCOMPLETE, terminal(ChatCompletionsDecoder("q").accept(finishWith("length"))).end)
+        for (reason in listOf("content_filter", "insufficient_system_resource", "aborted")) {
+            val terminal = terminal(ChatCompletionsDecoder("q").accept(finishWith(reason)))
+            assertEquals(ModelEnd.FAILED, terminal.end, reason)
+            assertEquals("PROVIDER_FAILED", terminal.safeCode, reason)
+        }
+    }
+
+    // ------------------------------------------------------------ 0.53 Chat tool calls (Task 9 prerequisite)
+
+    @Test fun `streamed tool call fragments become one terminal call and stay replayable`() {
+        // OpenAI/DeepSeek Chat streams a call in pieces: the first fragment carries id/name, later ones append
+        // argument text. The loop only executes a call it received a terminal event for, so the decoder must assemble
+        // the fragments. This was never implemented: 0.52 only used Chat for text, which is why Task 9's chat tool
+        // round could not exist.
+        val decoder = ChatCompletionsDecoder("q")
+        val first = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"reasoning_content":"查"},"index":0}]}"""))
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "查")), first)
+
+        val opening = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"ci"}}]},"index":0}]}"""))
+        assertEquals(
+            listOf(ModelStreamEvent.ToolCallDelta("q", "chat:0", "lookup", "{\"ci")),
+            opening,
+            "the fragment is surfaced as a delta under a stable per-call identity",
+        )
+
+        val finishing = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Hangzhou\"}"}}]},"index":0},{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"""))
+        val call = finishing.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().single()
+        assertEquals("call_1", call.callId)
+        assertEquals("lookup", call.name)
+        assertEquals("""{"city":"Hangzhou"}""", call.argsJson, "argument fragments are assembled in order")
+        assertEquals("chat:0", call.itemId, "the delta and terminal share one item identity")
+        assertEquals(ModelEnd.COMPLETED, finishing.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a tool call without a finish reason still completes at the stream end`() {
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"lookup","arguments":"{}"}}]}}]}"""))
+        val events = decoder.accept(done())
+        assertEquals("call_9", events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().single().callId)
+        assertEquals(ModelEnd.COMPLETED, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a truncated tool call surfaces a dangling delta and never a terminal call`() {
+        // A stream that dies mid-call must not look like a successful empty turn: the delta without a terminal item is
+        // what `ModelClientGateway` reads as TOOL_CALL_DELIVERY_INCOMPLETE.
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"ci"}}]}}]}"""))
+        val events = decoder.endOfInput()
+        assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), "no terminal call from a partial one")
+        assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `two parallel tool call indexes aggregate independently`() {
+        // M10 review gap: a provider may stream several calls in one turn, each identified only by its
+        // `tool_calls[].index`. The decoder keys them by that index; nothing pinned the parallel case, where a shared
+        // buffer or a single "current call" would merge two calls into one and pair the wrong arguments with a name.
+        val decoder = ChatCompletionsDecoder("q")
+
+        val opening = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"ci"}},{"index":1,"id":"call_2","type":"function","function":{"name":"weather","arguments":"{\"day"}}]},"index":0}]}"""))
+        assertEquals(
+            listOf(
+                ModelStreamEvent.ToolCallDelta("q", "chat:0", "lookup", "{\"ci"),
+                ModelStreamEvent.ToolCallDelta("q", "chat:1", "weather", "{\"day"),
+            ),
+            opening,
+            "each index keeps its own name and argument stream",
+        )
+
+        val finishing = decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Hangzhou\"}"}},{"index":1,"function":{"arguments":"\":\"today\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"""))
+
+        val calls = finishing.filterIsInstance<ModelStreamEvent.ToolCallTerminal>()
+        assertEquals(listOf("call_1", "call_2"), calls.map { it.callId })
+        assertEquals(listOf("lookup", "weather"), calls.map { it.name })
+        assertEquals(listOf("chat:0", "chat:1"), calls.map { it.itemId })
+        assertEquals(listOf("""{"city":"Hangzhou"}""", """{"day":"today"}"""), calls.map { it.argsJson })
+        assertEquals(ModelEnd.COMPLETED, finishing.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    // ------------------------------------------------------------ review round 1 fixes
+
+    @Test fun `a whitespace-only reasoning fragment is ignored and the turn survives`() {
+        // `ReasoningDelta` requires a non-blank text. Treating a whitespace chunk as an event made its constructor throw
+        // inside the decoder, which the outer catch turned into FAILED/MALFORMED_JSON — a valid turn lost.
+        val decoder = ChatCompletionsDecoder("q")
+
+        assertTrue(decoder.accept(reasoning(" ")).isEmpty(), "a space is not a reasoning fragment")
+        assertTrue(decoder.accept(reasoning("\\n")).isEmpty(), "a newline is not a reasoning fragment")
+        assertEquals(listOf(ModelStreamEvent.ReasoningDelta("q", "想")), decoder.accept(reasoning("想")))
+        assertEquals(listOf(ModelStreamEvent.TextDelta("q", "好")), decoder.accept(content("好")))
+        assertEquals(ModelEnd.COMPLETED, terminal(decoder.accept(finishWith("stop"))).end)
+    }
+
+    @Test fun `a length-truncated tool call stays dangling and never becomes callable`() {
+        // `finish_reason="length"` means the provider cut the call off, not that it completed it. Emitting a terminal
+        // would hand the loop a call whose arguments the provider never finished.
+        val decoder = ChatCompletionsDecoder("q")
+        decoder.accept(SseFrame(null,
+            """{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\""}}]}}]}"""))
+
+        val events = decoder.accept(finishWith("length"))
+        assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), "a length-cut call is not callable")
+        assertEquals(ModelEnd.INCOMPLETE, events.filterIsInstance<ModelStreamEvent.Terminal>().single().end)
+    }
+
+    @Test fun `a tool call missing its identity refuses the turn instead of completing silently`() {
+        // The id and name are what pair a call with its tool output. A call missing either must never read as success:
+        // a completed turn with text would otherwise let the gateway's dangling-delta check miss it entirely.
+        for ((label, fragment) in listOf(
+            "missing id" to """{"index":0,"function":{"name":"lookup","arguments":"{}"}}""",
+            "missing name" to """{"index":0,"id":"call_1","function":{"arguments":"{}"}}""",
+        )) {
+            val decoder = ChatCompletionsDecoder("q")
+            decoder.accept(content("partial answer"))
+            decoder.accept(SseFrame(null, """{"choices":[{"delta":{"tool_calls":[$fragment]},"index":0}]}"""))
+            val events = decoder.accept(finishWith("tool_calls"))
+            assertTrue(events.filterIsInstance<ModelStreamEvent.ToolCallTerminal>().isEmpty(), label)
+            val terminal = events.filterIsInstance<ModelStreamEvent.Terminal>().single()
+            assertEquals(ModelEnd.INCOMPLETE, terminal.end, label)
+            assertEquals("TOOL_CALL_DELIVERY_INCOMPLETE", terminal.safeCode, label)
+        }
     }
 }

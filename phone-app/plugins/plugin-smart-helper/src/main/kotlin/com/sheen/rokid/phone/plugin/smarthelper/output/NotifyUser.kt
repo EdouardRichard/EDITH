@@ -74,6 +74,15 @@ fun decideChannel(channel: NotifyChannel): NotifyDecision = when (channel) {
  * - **The result detail is `notified:<n>`.** `AgentLoop` feeds every tool result to `ProgressGuard`, which trips on
  *   three identical consecutive fingerprints; a model that sends the same sentence twice would otherwise end its own
  *   run as `NO_PROGRESS`. The counter keeps the fingerprints distinct and carries no content.
+ * - **`awaiting_reply = true` replaces that detail with `{"awaiting_user":true}` and sets
+ *   `ActionResult.awaitingUser`** (0.5.4 Task 3). The turn terminalizes with `AWAITING_USER` and the next user answer
+ *   settles it (Task 4), so no `ProgressGuard` fingerprint is produced for it — the structured fact, not the counter,
+ *   is what the model needs. `final` keeps its declared no-op meaning here.
+ * - **`awaiting_reply = true` with `channel = silent` is refused** (0.5.4 Task 4, the Task 3 review's minor). `silent`
+ *   notifies nobody, so a turn that waits for an answer to a question nothing displayed would wait for an answer the
+ *   wearer cannot give. The contradiction is a malformed call, refused before anything runs; the model can correct it.
+ *   Note this is about the *declaration*, not about delivery: `screen`/`voice`/`both` still do not prove the wearer saw
+ *   the question (that is the host's arbitration), and the turn's own settlement covers that case.
  * - **The model-facing result is the unified envelope** (0.3 Phase 2.2 Task 7). The call was accepted and completed,
  *   so it states `accepted = true`; `applied`/`verified`/`changed` stay `null` because this tool has no independent
  *   evidence that the wearer saw or heard the notification, and `observation` is `null` because it never looks at the
@@ -98,14 +107,39 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
             ?.content
             ?.let { NotifyChannel.fromWire(it) }
             ?: return refused()
+        // Absent means "not a question" (every existing caller). Present must be a JSON boolean: a string or a number
+        // is a malformed call, refused like every other invalid argument rather than coerced.
+        val awaitingReply = if ("awaiting_reply" in args) {
+            (args["awaiting_reply"] as? JsonPrimitive)
+                ?.takeIf { !it.isString }
+                ?.content
+                ?.toBooleanStrictOrNull()
+                ?: return refused()
+        } else {
+            false
+        }
+        // 0.5.4 Task 4: a question nobody can see cannot be answered. `silent` submits nothing, so pairing it with
+        // `awaiting_reply` would pause the turn for an answer the wearer was never asked for. Refuse it before
+        // notifying anyone: the model can correct the call, and no half-notification is left behind.
+        if (awaitingReply && channel == NotifyChannel.SILENT) return refused()
 
         onNotify(channel, text)
-        return ActionResult(
-            outcome = ActionOutcome.Done,
-            detail = "notified:${sequence.incrementAndGet()}",
-            execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
-            observation = null,
-        )
+        return if (awaitingReply) {
+            ActionResult(
+                outcome = ActionOutcome.Done,
+                detail = AWAITING_USER_DATA,
+                execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+                observation = null,
+                awaitingUser = true,
+            )
+        } else {
+            ActionResult(
+                outcome = ActionOutcome.Done,
+                detail = "notified:${sequence.incrementAndGet()}",
+                execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+                observation = null,
+            )
+        }
     }
 
     override fun cancel() = Unit
@@ -139,11 +173,14 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
         /** The stable code for every malformed/unsupported `notify_user` call. */
         const val NOTIFY_ARGUMENTS_INVALID = "NOTIFY_ARGUMENTS_INVALID"
 
+        /** The model-facing `data` of a notification that declares it awaits the user's reply (0.5.4 Task 3). */
+        const val AWAITING_USER_DATA = """{"awaiting_user":true}"""
+
         val DESCRIPTOR = ActionDescriptor(
             name = "notify_user",
             title = "向用户发送通知",
-            description = "把要对用户说的话交给系统输出：text 是要显示或播报的句子，channel 取 screen（只显示）、voice（只播报，本版会同时显示）、both（显示并播报）或 silent（不打扰用户，用于不必打断的完成汇报）。final 只是模型自报本任务收尾的标记，本版不改变通知行为。需要让用户看到或听到回答时用它，收尾答复也应通过它给出；一个任务可以多次调用。参数不合法返回 NOTIFY_ARGUMENTS_INVALID。不要把工具调用过程、内部计划或屏幕原文塞进 text。",
-            parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"},"final":{"type":"boolean","description":"true=模型声明任务结束（spec §3.7 决策5b）"}},"required":["text","channel"],"additionalProperties":false}""",
+            description = "把要对用户说的话交给系统输出：text 是要显示或播报的句子，channel 取 screen（只显示）、voice（只播报，本版会同时显示）、both（显示并播报）或 silent（不打扰用户，用于不必打断的完成汇报）。awaiting_reply=true 表示这次通知是在向用户提问并等待回答：本回合到此结束、等待用户作答；进度汇报或普通告知不要用它。silent 不能与 awaiting_reply=true 同时使用（用户看不到问题就无法作答），该组合会被拒绝。final 只是模型自报本任务收尾的标记，本版不改变通知行为。需要让用户看到或听到回答时用它，收尾答复也应通过它给出；一个任务可以多次调用。参数不合法返回 NOTIFY_ARGUMENTS_INVALID。不要把工具调用过程、内部计划或屏幕原文塞进 text。",
+            parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"},"final":{"type":"boolean","description":"true=模型声明任务结束（spec §3.7 决策5b）"},"awaiting_reply":{"type":"boolean","description":"true=这次通知是在向用户提问并等待回答，本回合等待用户作答；进度汇报不要用它"}},"required":["text","channel"],"additionalProperties":false}""",
             risk = RiskLevel.L0,
             requiresConfirmation = false,
             idempotent = true,

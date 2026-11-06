@@ -10,6 +10,7 @@ import com.sheen.rokid.plugin.ToolOutcome
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
@@ -203,6 +204,75 @@ class NotifyUserTest {
             listOf("screen", "voice", "both", "silent"),
             NotifyChannel.entries.map { it.wireName },
         )
+    }
+
+    @Test
+    fun `the descriptor includes awaiting_reply`() {
+        val schema = Json.parseToJsonElement(tool.descriptors().single().parametersJson).jsonObject
+        val awaitingReply = schema.getValue("properties").jsonObject.getValue("awaiting_reply").jsonObject
+
+        assertEquals("boolean", awaitingReply.getValue("type").jsonPrimitive.content)
+        // Optional: every existing caller that does not ask the wearer anything stays valid.
+        val required = schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }
+        assertFalse("awaiting_reply" in required, "awaiting_reply must not be required: $required")
+    }
+
+    @Test
+    fun `awaiting_reply true marks the result as awaiting user`() {
+        val result = tool.execute(
+            "notify_user",
+            """{"text":"要现在做吗？","channel":"both","awaiting_reply":true}""",
+        )
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertTrue(result.awaitingUser, "the tool owns the question, so it must say it awaits the user")
+        // The envelope's `data` is the detail; the structured awaiting fact replaces the notified:<n> counter.
+        assertEquals("""{"awaiting_user":true}""", result.detail)
+    }
+
+    @Test
+    fun `awaiting_reply defaults to false`() {
+        val result = tool.execute("notify_user", """{"text":"已完成","channel":"screen"}""")
+
+        assertFalse(result.awaitingUser)
+        assertEquals("notified:1", result.detail)
+    }
+
+    @Test
+    fun `a malformed awaiting_reply is refused`() {
+        listOf(""""yes"""", "1").forEach { malformed ->
+            val seen = mutableListOf<Pair<NotifyChannel, String>>()
+            val recorder = NotifyUserTool(onNotify = { channel, text -> seen += channel to text })
+
+            val result = recorder.execute(
+                "notify_user",
+                """{"text":"要现在做吗？","channel":"both","awaiting_reply":$malformed}""",
+            )
+
+            assertEquals(ActionOutcome.Refused, result.outcome, "awaiting_reply=$malformed must be refused")
+            assertEquals(NotifyUserTool.NOTIFY_ARGUMENTS_INVALID, result.detail)
+            assertFalse(result.awaitingUser)
+            assertTrue(seen.isEmpty(), "a malformed call must not notify anyone")
+        }
+    }
+
+    @Test
+    fun `an awaiting reply cannot be silent because the wearer would never see the question`() {
+        // 0.5.4 Task 3 review minor: `silent` + `awaiting_reply=true` would pause the turn for an answer to a question
+        // nothing ever displayed - the wearer cannot answer what they never saw, and the turn would wait forever. It is
+        // a contradictory call, so it is refused like any other invalid argument and nothing is notified.
+        val seen = mutableListOf<Pair<NotifyChannel, String>>()
+        val recorder = NotifyUserTool(onNotify = { channel, text -> seen += channel to text })
+
+        val result = recorder.execute(
+            "notify_user",
+            """{"text":"要现在做吗？","channel":"silent","awaiting_reply":true}""",
+        )
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(NotifyUserTool.NOTIFY_ARGUMENTS_INVALID, result.detail)
+        assertFalse(result.awaitingUser)
+        assertTrue(seen.isEmpty(), "a refused question must not reach the output path either")
     }
 
     @Test

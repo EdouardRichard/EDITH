@@ -28,7 +28,10 @@ class DevelopmentProfileLoader(private val resolver: MemorySecretResolver) {
             require(key.all { it.code in 33..126 })
             val placeholder = object : SecretHandle { override val id = "unregistered" }
             val protocolId = value("protocolId", "protocol")
-            val inputs = if (protocolId == "OPENAI_CHAT_COMPLETIONS")
+            // 0.52 C1: this loader's files predate the catalog and may carry the vendor-named Responses id; map it once
+            // through the shared vocabulary instead of keeping a second list of ids here.
+            val protocol = ProtocolIds.canonical(protocolId)
+            val inputs = if (protocol == ProtocolIds.OPENAI_CHAT_COMPLETIONS)
                 setOf(InputModality.TEXT, InputModality.AUDIO) else setOf(InputModality.TEXT)
             val profile = ModelProfile("development", 0, "Development probe", value("service"),
                 value("baseUrl"), protocolId, value("model"), placeholder,
@@ -36,9 +39,9 @@ class DevelopmentProfileLoader(private val resolver: MemorySecretResolver) {
                 value("maxOutputTokens").toInt(), value("safetyTokens").toInt(), value("timeoutMillis").toLong(),
                 inputs, setOf(OutputModality.TEXT), emptyList())
             // Validate endpoint format for known protocols.
-            when (protocolId) {
-                "DEEPSEEK_RESPONSES" -> ModelEndpoint.responses(profile.baseUrl)
-                "OPENAI_CHAT_COMPLETIONS" -> ModelEndpoint.chatCompletions(profile.baseUrl)
+            when (protocol) {
+                ProtocolIds.OPENAI_RESPONSES -> ModelEndpoint.responses(profile.baseUrl)
+                ProtocolIds.OPENAI_CHAT_COMPLETIONS -> ModelEndpoint.chatCompletions(profile.baseUrl)
             }
             val handle = resolver.put(key.toCharArray())
             owned?.let(resolver::revoke)

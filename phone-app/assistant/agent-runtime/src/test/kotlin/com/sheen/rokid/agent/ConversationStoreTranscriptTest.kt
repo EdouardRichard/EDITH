@@ -6,6 +6,7 @@ import com.sheen.rokid.plugin.ModelHistoryItem
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
@@ -170,6 +171,22 @@ class ConversationStoreTranscriptTest {
             ),
             store.history(),
         )
+    }
+
+    // ------------------------------------------------------------ 0.53: reasoning stays with its assistant text
+
+    @Test
+    fun `an appended assistant turn keeps its reasoning in history and in the snapshot`() {
+        val store = ConversationStore()
+
+        store.appendAssistant("答", reasoning = "想")
+
+        val stored = assertIs<ModelHistoryItem.Text>(store.history().single())
+        assertEquals("答", stored.text)
+        assertEquals("想", stored.reasoning, "the store must keep the reasoning beside the assistant text")
+        val segment = store.snapshot().single()
+        assertEquals("答", segment.text, "the segment's rendered text never includes the reasoning")
+        assertEquals("想", segment.reasoning, "the snapshot must carry the reasoning so the frame can rebuild it")
     }
 
     @Test

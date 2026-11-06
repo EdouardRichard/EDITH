@@ -151,6 +151,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillManager
 import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirectory
+import com.sheen.rokid.phone.plugin.smarthelper.trace.ModelTrace
 import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
@@ -185,19 +186,20 @@ private const val SKILL_HASH_NONE = "none"
 private const val FALLBACK_EMIT_WAIT_MILLIS = 1_000L
 
 /**
- * The agent run's wall-clock budget: effectively **none** (2026-10-22, D197).
+ * The agent run's **machine** budget: five minutes (0.5.4 Task 7).
  *
- * Mainstream agents bound a run with per-request/per-tool timeouts plus step and no-progress guards, not with a total
- * duration: Claude's Agent SDK leaves `maxTurns`/`maxBudgetUsd` off unless the caller sets them, OpenAI's Agents SDK
- * uses a turn count (10), and LangGraph uses a recursion limit. The old 180 s total cap cut a **working** 22-step
- * proactive follow-up at exactly 180 s (K70 acceptance 2026-10-22: `modelMs=120997` + `toolMs=56056`) and surfaced
- * the cut as "回答超时了，稍后再试"; the run was making progress.
+ * It bounds one turn's own work — model requests, tool calls, assembly — and deliberately **not** the time a person
+ * spends deciding: `AgentLoop` shifts its deadline by the confirmation/`mayAskHuman` wait it measures (D49), and the
+ * plugin moves the turn's hint window with the same measurement (`SmartTurn.extendDeadline`), so a considered approval
+ * never eats the budget or expires the answer.
  *
- * The guards that remain describe "stuck", not "slow": `AgentLoop.maxSteps` (24), `ProgressGuard`, the error streak,
- * the observation budget, the profile's per-request timeout, and the user's STOP/panel close. 24 h is a sanity
- * ceiling for arithmetic/schedulers, not a product limit; a real run ends long before it on the step guard.
+ * Five minutes replaces the 24 h sanity ceiling used since 2026-10-22 (D197). The guards that describe "stuck" remain
+ * (`AgentLoop.maxSteps`, `ProgressGuard`, the error streak, the observation budget); this one describes "slow", and it
+ * is distinct from the per-request timeout split of 0.5.4 Task 6 (45 s first token, 20 s stream idle, 90 s hard cap).
+ * Expiry ends the run as `DEADLINE` with the loop's own `TURN_BUDGET` safe code, so `P3_TURN` can tell it apart from a
+ * provider request timeout (`REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT`).
  */
-private const val AGENT_TURN_BUDGET_NANOS = 24L * 60L * 60L * 1_000_000_000L
+private const val AGENT_TURN_BUDGET_NANOS = 5L * 60L * 1_000_000_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
@@ -593,6 +595,16 @@ class SmartAssistantPlugin(
      * switch is meant to be global and live. The `{ false }` default keeps every pre-4B caller in normal mode.
      */
     private val noInterception: () -> Boolean = { false },
+    /**
+     * Debug-only model trace sink: one JSON line per finished agent run, or the `{}` no-op default.
+     *
+     * The plugin itself never writes a file or a log here — it only formats the run it just completed. A **release**
+     * build keeps this default (the App's wiring gates its file writer behind `BuildConfig.DEBUG`), so no model body,
+     * transcript or observation can leave the device from a delivery APK. This is deliberately separate from `P3Log`:
+     * `P3Log`'s count-and-code contract is pinned and must not grow bodies. A throwing sink is swallowed for the same
+     * reason it is separate: tracing an observation must never fail the turn it describes.
+     */
+    private val traceLine: (String) -> Unit = {},
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -716,10 +728,11 @@ class SmartAssistantPlugin(
         }.compressionBudgetTokens()
 
     /**
-     * Test-only: the wall-clock budget the next agent turn receives.
+     * Test-only: the machine-time budget the next agent turn receives.
      *
-     * Since 2026-10-22 (D197) this is the effectively unbounded [AGENT_TURN_BUDGET_NANOS], not the old 180 s product
-     * cap. The behavioral guards are `AgentLoop.maxSteps`, `ProgressGuard` and the per-request profile timeout.
+     * 0.5.4 Task 7: five minutes. It is **machine** time only; a confirmation wait is shifted out of it by the loop
+     * (D49) and out of the hint window by `extendDeadline`. Expiry surfaces as `DEADLINE` + `TURN_BUDGET`, distinct
+     * from a request timeout.
      */
     internal fun agentTurnBudgetNanosForTest(): Long = turnBudgetNanos()
 
@@ -1107,6 +1120,20 @@ class SmartAssistantPlugin(
         openContinuation = { route, previousTurnId -> openContinuationTurn(route, previousTurnId) },
         isPanelVisible = isPanelVisible,
         cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },
+        // 0.5.4 Task 5: the continue-off exit asks the plugin's single queue slot. The wearer's next sentence, said
+        // while this answer was being produced, is consumed by the continuation the exit opens instead of being dropped
+        // with a close. The predicate is **freshness-aware** (review Important 1): a slot older than the continuation
+        // TTL would be dropped by `takeQueuedUtteranceLocked` as `stale`, so claiming it here would log `queue_consumed`
+        // and open an empty continuation while the sentence vanished. A stale slot must take the ordinary close branch,
+        // which clears it through `cancelTurn`. Read under `gate`; this class never calls the cycle while holding
+        // `gate`, so the two locks keep their established order (cycle -> gate).
+        hasQueuedUtterance = { route ->
+            synchronized(gate) {
+                val queued = queuedUtterance
+                queued != null && queued.route == route &&
+                    clock.nowNanos() - queued.capturedNanos <= CONTINUATION_QUEUE_TTL_NANOS
+            }
+        },
     )
 
     // ---------------------------------------------------------------- proactive state (P3.2)
@@ -1532,6 +1559,20 @@ class SmartAssistantPlugin(
                 "staticChars=${frame.systemText.length} " +
                 "dynamicChars=$dynamicChars",
         )
+    }
+
+    /**
+     * Debug-only: hands one finished run to [traceLine] as a single JSON line.
+     *
+     * Formatting and the sink are both guarded. A trace is an observation of the turn, never a participant in it, and a
+     * sink wired to a broken file must not turn a delivered answer into `PLUGIN_RUN_THREW`. The timestamp is wall time
+     * because the trace file is read later, off-device; the plugin's own monotonic clock answers relative ordering.
+     */
+    private fun emitModelTrace(turnId: String, route: AssistantRoute, run: AgentRun, sentFrame: RequestFrame?) {
+        val line = runCatching {
+            ModelTrace.line(turnId, route.name, run, sentFrame, System.currentTimeMillis())
+        }.getOrNull() ?: return
+        runCatching { traceLine(line) }
     }
 
     override fun activate(context: PluginContext) {
@@ -2129,9 +2170,10 @@ class SmartAssistantPlugin(
      * never cancels, replaces or settles any of them. It is independent of the display mode: detached mode is the
      * phone's own panel and the typed path works there exactly as on the glasses.
      *
-     * 0.5.1 fix round (review Important): in phone-only mode the post-answer continuation is off, so a sentence queued
-     * by a late final can never be consumed; it is treated as absent here rather than making the wearer's BALL/typed
-     * sentence busy until a new wake or STOP.
+     * 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: phone-only mode turns the post-answer continuation
+     * off, but the continue-off exit now consumes a queued sentence itself. A live queue is therefore never dead and
+     * always keeps the typed/BALL path busy until it is consumed, closed or dropped - the wearer cannot be stranded by
+     * it, because the exit is at most one second away once an answer settled.
      */
     fun canAcceptTypedMessage(): Boolean = synchronized(gate) { active && canAcceptTypedLocked() }
 
@@ -2139,20 +2181,24 @@ class SmartAssistantPlugin(
     private fun canAcceptTypedLocked(): Boolean {
         if (context == null) return false
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
-        // Unless no continuation can ever consume it (phone-only mode's post-answer seam is off): then keeping the
-        // typed/BALL path busy would strand the wearer until a new wake or STOP.
-        if (queuedUtterance != null && !postAnswerContinuationOff()) return false
+        // Since 0.5.4 Task 5 this holds in phone-only mode too. The point is not that both turns would answer the same
+        // sentence: a typed/BALL turn is `!continuation`, so `openTurn` clears the queue (`queuedUtterance = null`) and
+        // the sentence would be dropped inside the exit's ≤1 s window; since 0.5.4 Task 8 that clear is named
+        // (`queue_drop reason=new_wake`), but it is still a loss the wearer did not ask for. Keeping the queue live here
+        // lets the continue-off exit consume it; there is no dead-queue exception left to ignore.
+        if (queuedUtterance != null) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
     }
 
     /**
-     * 0.5.1 fix round (review Important): whether phone-only mode has turned the post-answer continuation off.
+     * 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: whether phone-only mode has turned the post-answer
+     * continuation off.
      *
      * This is the composition's exact split (`settings.continueDialogue && !phoneOnly()`), read through the live
-     * providers. When it is true no answer continuation can open for either route, so a queued utterance is dead: the
-     * typed/BALL admission may ignore it, and a transcript arriving after the answer settled must not cancel the
-     * continue-off close that releases it. Glasses mode is not affected (`phoneOnly()` is false there).
+     * providers. When it is true no answer continuation can open for either route, so a transcript arriving after the
+     * answer settled must not cancel the continue-off exit: that exit either closes the round or (Task 5) opens the
+     * continuation that consumes the queued sentence. Glasses mode is not affected (`phoneOnly()` is false there).
      */
     private fun postAnswerContinuationOff(): Boolean = phoneOnly() && !continueAfterAnswer()
 
@@ -2284,7 +2330,7 @@ class SmartAssistantPlugin(
                     if (turnMatches) {
                         cancelledTurn = detachFollowup()
                         followupBusy = false
-                        clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
+                        clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE, "cycle_close")
                     }
                     true
                 }
@@ -2307,7 +2353,7 @@ class SmartAssistantPlugin(
         synchronized(gate) {
             if (turn?.turnId != expectedTurnId) return
             wakeBusy = false
-            clearQueuedUtteranceLocked(AssistantRoute.WAKE)
+            clearQueuedUtteranceLocked(AssistantRoute.WAKE, "cycle_close")
             stopped = detach()
         }
         teardown(stopped)
@@ -2591,9 +2637,10 @@ class SmartAssistantPlugin(
                 var followupContinuation: Pair<SmartTurn, String>? = null
                 var queuedWakeFinal = false
                 var queuedProactiveFinal = false
-                // 0.5.1 fix round (review Important): the answer was already settled on the continue-off branch and
-                // phone-only mode can open no continuation for this transcript. Such a message must not cancel the 1 s
-                // close (the release path for the dead queue) or regress the panel from ANSWERING back to ASR.
+                // 0.5.1 fix round (review Important), revised by 0.5.4 Task 5: the answer was already settled on the
+                // continue-off branch and phone-only mode can open no *answer* continuation for this transcript. Such a
+                // message must not cancel the 1 s exit (which either closes the round or consumes the queued sentence)
+                // or regress the panel from ANSWERING back to ASR.
                 var settledPhoneOnlyAnswer = false
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
@@ -2939,7 +2986,12 @@ class SmartAssistantPlugin(
         if (!continuation) {
             if (startsCooldown) scene.noteTurn(nowNanos)
             // A new wake (or Help) starts a new conversation; a sentence queued for the previous answer's
-            // continuation must not be replayed into it.
+            // continuation must not be replayed into it. 0.5.4 Task 8 fix round: that clear is a real loss, so it is
+            // named **before** the slot is emptied. Counts only; the route is the queued sentence's own, which is the
+            // only route the slot carries.
+            queuedUtterance?.let { dropped ->
+                P3Log.line("P3_CONV queue_drop route=${dropped.route.name} reason=new_wake")
+            }
             queuedUtterance = null
         }
         val replaced = turn?.also { it.closed = true }
@@ -3007,14 +3059,14 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The agent run's **machine budget** (2026-10-22, D197): none.
+     * The agent run's **machine budget**: five minutes (0.5.4 Task 7).
      *
-     * The profile timeout still bounds each **provider request** (`requestTimeoutNanos`), and the loop still stops on
-     * the step guard, `ProgressGuard`, the error streak and the observation budget. A total wall-clock cap is what the
-     * mainstream harnesses do not use, and it cut a working multi-step proactive follow-up at 180 s.
+     * It bounds the turn's own work, not the time a person spends answering a confirmation: `AgentLoop` shifts its
+     * deadline by the measured human wait, and [SmartTurn.extendDeadline] moves this turn's hint window by the same
+     * amount. Expiry ends the run as `DEADLINE` with the distinct `TURN_BUDGET` safe code.
      *
      * This is deliberately not the official 10 s listening window: since 0.24 S3 that window belongs to
-     * [conversationCycle] and starts at `PANEL_SHOWN`; this number no longer bounds the run at all.
+     * [conversationCycle] and starts at `PANEL_SHOWN`; this number does not bound listening at all.
      */
     private fun turnBudgetNanos(): Long = AGENT_TURN_BUDGET_NANOS
 
@@ -3086,9 +3138,16 @@ class SmartAssistantPlugin(
         }
         val text = revision.text.trim()
         if (!isUsableUtterance(text)) return
+        // 0.5.4 Task 8 (spec §6.1.3): the slot is one sentence, latest wins. That replacement is existing behaviour, but
+        // it really loses the earlier sentence, so the count-only line names it instead of letting it vanish. The route
+        // is the dropped sentence's own, which is the sibling route when a final replaced it.
+        queuedUtterance?.let { dropped ->
+            P3Log.line("P3_CONV queue_drop route=${dropped.route.name} reason=superseded")
+        }
         queuedUtterance = QueuedUtterance(route, text, revision.turnId, clock.nowNanos())
-        // Counts only: the wearer's words are display content and never reach the log.
-        P3Log.line("P3_CONV queue route=${route.name} chars=${text.length}")
+        // Counts only: the wearer's words are display content and never reach the log. `reason` says why the sentence
+        // was kept rather than answered now: its answer/continuation is still pending.
+        P3Log.line("P3_CONV queue_kept route=${route.name} reason=continuation_pending chars=${text.length}")
     }
 
     /**
@@ -3114,8 +3173,13 @@ class SmartAssistantPlugin(
     }
 
     /** Must hold [gate]: drops a queued sentence only when it belongs to [route] (the two routes stay independent). */
-    private fun clearQueuedUtteranceLocked(route: AssistantRoute) {
-        if (queuedUtterance?.route == route) queuedUtterance = null
+    private fun clearQueuedUtteranceLocked(route: AssistantRoute, reason: String) {
+        val queued = queuedUtterance ?: return
+        if (queued.route != route) return
+        queuedUtterance = null
+        // 0.5.4 Task 8 (spec §6.1.3): a closed round that still held a sentence is a real loss; naming the close reason
+        // is what makes "continue_off kept the queue" and "a close dropped it" separable in one device log.
+        P3Log.line("P3_CONV queue_drop route=${route.name} reason=$reason")
     }
 
     /** Whether a trimmed final can be the utterance: not empty, and not the wake segment's own echo of the word. */
@@ -3528,6 +3592,9 @@ class SmartAssistantPlugin(
         // unsupported, so only a real profile that omits `IMAGE` turns the rendered coverage into
         // `unavailable(no_image_profile)`. The host's gate-off token (`disabled`) always wins over this.
         val profileAcceptsImages = turnProfile?.let { InputModality.IMAGE in it.inputs }
+        // Debug trace: the last assembled frame is the only place the observation the model actually read survives,
+        // because `AgentRun.transcript` replaces perception-bearing tool outputs with a marker at finish.
+        var traceFrame: RequestFrame? = null
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -3609,7 +3676,10 @@ class SmartAssistantPlugin(
                     // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
                     // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no
                     // frame and therefore emits no prompt line.
-                    onRequestBuilt = { frame -> logPromptRequest(promptRoute, frame) },
+                    onRequestBuilt = { frame ->
+                        logPromptRequest(promptRoute, frame)
+                        traceFrame = frame
+                    },
                 ),
             )
         } catch (failure: Throwable) {
@@ -3653,6 +3723,9 @@ class SmartAssistantPlugin(
             "P3_TURN end turn=${owned.turnId} outcome=${run.outcome} code=${run.safeCode ?: "-"} " +
                 "steps=${run.steps.size}${routeField(owned.route)}",
         )
+        // Debug-only trace: exactly one line per finished run, emitted after the run's own counts are reported. It
+        // runs on the detached path too (that is why it sits before the `stillOurs` return): the run did happen.
+        emitModelTrace(owned.turnId, owned.route, run, traceFrame)
         // Phase 6 (obligations 2 and 5): close the turn that `beginSkillTurn()` opened. This runs before the outcome
         // is submitted **and** on the detached path below, so every ending pairs with its opening: an unclosed turn
         // would let the following turn fold into this one as a single observation, and a body pulled here would still
@@ -3684,7 +3757,14 @@ class SmartAssistantPlugin(
         // whether it was a mid-run `notify_user` or the closing fallback the assembler is about to emit. This is where
         // the displayed/rejected/silent decision is made, not in `emit`'s phase check (a `notify_user` answer is
         // emitted while the run is still `Running`).
-        settleAnswerAfterRun(owned, fallbackExpected = ledger.calls == 0 && !ledger.suppressed)
+        //
+        // 0.5.4 Task 4: `AWAITING_USER` never schedules a closing fallback (`submitOutcome` submits nothing for it), so
+        // waiting one second for one would turn "waiting for the wearer" into a phantom pending deadline. A question
+        // that did reach the wearer was emitted mid-run and is settled by its own `answerEmitId` regardless.
+        settleAnswerAfterRun(
+            owned,
+            fallbackExpected = ledger.calls == 0 && !ledger.suppressed && run.outcome != AgentOutcome.AWAITING_USER,
+        )
         // 0.3 Phase 3 Task 7 fix (controller ruling): only a **WAKE** turn may release the proactive work it made wait
         // (spec §4.6). `runTurnBody` is shared with the FOLLOWUP_TURN, and releasing from a follow-up's end resumed a
         // trigger parked during the follow-up as a HINT_TURN right after the follow-up answer. That hint's `Displayed`
@@ -3717,7 +3797,10 @@ class SmartAssistantPlugin(
         requests: AtomicInteger,
         visionSupported: Boolean?,
     ): String? {
-        val full = requests.getAndIncrement() == 0
+        // 0.5.4 Task 8: the index is part of the telemetry, not just the full/ambient decision — an `elements=0` line
+        // must say which request it described and which sources that request actually asked for.
+        val request = requests.getAndIncrement()
+        val full = request == 0
         val snapshot = if (full) {
             initialSnapshot ?: runCatching {
                 provider.snapshot(PerceptionSource.entries.toSet(), PerceptionFilter.ALL, null)
@@ -3743,6 +3826,12 @@ class SmartAssistantPlugin(
                 rendered.text,
                 rendered.truncated,
                 rendered.coverage,
+                include = if (full) {
+                    SmartPerceptionRenderer.INCLUDE_ALL
+                } else {
+                    SmartPerceptionRenderer.INCLUDE_AMBIENT
+                },
+                request = request,
             ),
         )
         return rendered.text
@@ -3819,6 +3908,15 @@ class SmartAssistantPlugin(
         // Recording only `finalText` dropped every notification from the conversation (review M1's "没有任何地方把
         // 通知内容记进上下文"), so both halves are recorded here, in the order they happened.
         val closingText = run.finalText?.takeIf { it.isNotBlank() }
+        // 0.5.4 Task 4: an awaiting-user run that reached nobody has no assistant half to record. `AWAITING_USER` is
+        // not a failure, so the `FAILURE_HINTS` fallback below must not be written; and recording the wearer's half
+        // alone would leave the route's transcript ending on a one-item user group, the exact shape `ContextBudgeter`
+        // refuses (one such turn used to brick every later turn until a restart). The notification shape - a question
+        // emitted by `notify_user` - takes the `notifications` branch above and is recorded as usual.
+        if (run.outcome == AgentOutcome.AWAITING_USER && notifications.isEmpty() && closingText == null) {
+            P3Log.line("P3_CONTEXT record=skipped reason=AWAITING_USER")
+            return
+        }
         val reply = when {
             notifications.isNotEmpty() -> (notifications + listOfNotNull(closingText)).joinToString("\n")
             closingText != null -> closingText
@@ -3838,6 +3936,8 @@ class SmartAssistantPlugin(
         }
         val context = contexts.context(route)
         context.appendUser(userText)
+        // 0.53: the legacy `ConversationContext` path carries no reasoning (it is not the live frame path; its history
+        // never reaches a DeepSeek tool-bearing request through this wiring). The store path above is the one that must.
         contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context)
     }
@@ -3895,10 +3995,10 @@ class SmartAssistantPlugin(
         )
         if (conversation.isEmpty()) {
             store.appendUser(userText)
-            store.appendAssistant(reply)
+            store.appendAssistant(reply, run.finalReasoning)
             return
         }
-        store.appendTranscript(closeStoreTurnWithReply(conversation, reply))
+        store.appendTranscript(closeStoreTurnWithReply(conversation, reply, run.finalReasoning))
     }
 
     /**
@@ -3913,10 +4013,12 @@ class SmartAssistantPlugin(
     private fun closeStoreTurnWithReply(
         turn: List<ModelHistoryItem>,
         reply: String,
+        /** 0.53: the run's `finalReasoning`; it rides the replacement assistant text so the next request can replay it. */
+        reasoning: String? = null,
     ): List<ModelHistoryItem> {
         val last = turn.lastOrNull()
         val kept = if (last is ModelHistoryItem.Text && last.role == MessageRole.ASSISTANT) turn.dropLast(1) else turn
-        return kept + ModelHistoryItem.Text(MessageRole.ASSISTANT, reply)
+        return kept + ModelHistoryItem.Text(MessageRole.ASSISTANT, reply, reasoning)
     }
 
     /**
@@ -4747,6 +4849,8 @@ class SmartAssistantPlugin(
             // unsupported, so only a real profile that omits `IMAGE` downgrades the rendered coverage.
             val profileAcceptsImages = proactiveProfile?.let { InputModality.IMAGE in it.inputs }
             val tool = ProposeHintTool()
+            // Debug trace: same seam as the share turn engine — the last assembled frame carries the unredacted round.
+            var traceFrame: RequestFrame? = null
             val loop = AgentLoop(
                 gateway = gateway,
                 registry = ToolRegistry(listOf(tool)),
@@ -4804,7 +4908,10 @@ class SmartAssistantPlugin(
                                 )
                             }
                         },
-                        onRequestBuilt = { frame -> logPromptRequest(PromptRoute.PROACTIVE_HINT, frame) },
+                        onRequestBuilt = { frame ->
+                            logPromptRequest(PromptRoute.PROACTIVE_HINT, frame)
+                            traceFrame = frame
+                        },
                         // The hint turn never executes a screen tool; the loop's failure observation has no subject.
                         observationSource = null,
                     ),
@@ -4821,6 +4928,8 @@ class SmartAssistantPlugin(
                 synchronized(gate) { if (request.loop === loop) request.loop = null }
             }
             val elapsed = elapsedMillis(started)
+            // Debug-only trace: the hint turn is its own `AgentLoop`, so it needs its own line (one per run).
+            emitModelTrace(request.turnId, AssistantRoute.PROACTIVE, run, traceFrame)
             val decision = hintDecision(run, tool, request)
             val hintText = decision.text
             if (hintText == null) {
@@ -4850,7 +4959,14 @@ class SmartAssistantPlugin(
             // against the same budget, **before** the hint is submitted. The order is the submission's, not the
             // compressor's: the compressor's truncation is what writes the dropped messages to memory, and the trigger
             // belongs to the conversation whether or not the display accepted it.
-            recordProactiveTurn(trigger.transcript, hintText, hint.hintId, hint.turnId, gateway.lastTrim)
+            recordProactiveTurn(
+                trigger.transcript,
+                hintText,
+                hint.hintId,
+                hint.turnId,
+                gateway.lastTrim,
+                reasoning = run.finalReasoning,
+            )
             submitProactiveHint(hint, hintText)
         } finally {
             // Every exit - a hint, silence, a cancellation, a throw - closes the perception boundary it opened.
@@ -4925,6 +5041,12 @@ class SmartAssistantPlugin(
         hintId: String,
         turnId: String,
         trim: TrimCounts?,
+        /**
+         * 0.53: the hint turn's `AgentRun.finalReasoning`. A later proactive request carries `propose_hint` (tools), so
+         * the transcript's assistant hint must replay its reasoning or DeepSeek rejects the request with 400. `null`
+         * when the turn produced none — never fabricated.
+         */
+        reasoning: String? = null,
     ) {
         if (triggerTranscript.isBlank()) return
         // Phase C: the trigger is what this route records as its user side (see this method's note above), so it is also
@@ -4934,7 +5056,7 @@ class SmartAssistantPlugin(
         recordTurnAndCompress(
             ContextRoute.PROACTIVE,
             triggerTranscript,
-            AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList()),
+            AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList(), finalReasoning = reasoning),
             trim = trim,
         )
     }
@@ -5288,7 +5410,7 @@ class SmartAssistantPlugin(
             val had = proactiveFollowup != null || followupTurnRequest != null || followupTurn != null
             proactiveFollowup = null
             followupTurnRequest = null
-            clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
+            clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE, "followup_close")
             cancelledTurn = detachFollowup()
             had
         }
@@ -5322,6 +5444,15 @@ class SmartAssistantPlugin(
         }
         if (ledger.suppressed) {
             P3Log.line("P3_NOTIFY reply=suppressed reason=SILENT")
+            return
+        }
+        // 0.5.4 Task 4: a run stopped to wait for the wearer's answer is neither a completed answer nor a failure.
+        // When a question reached them, `notify_user` emitted it during the run and `ledger.calls > 0` already
+        // returned above; this branch is the "nothing was said" shape (a successful tool that only awaits the user).
+        // Appending FAILURE_HINTS would tell the wearer the assistant failed, and `ModelEnd.FAILED` would close an
+        // answer that never existed. Nothing is submitted; `settleAnswerAfterRun` closes the round as `no_display`.
+        if (run.outcome == AgentOutcome.AWAITING_USER) {
+            P3Log.line("P3_NOTIFY reply=none reason=AWAITING_USER")
             return
         }
         if (run.outcome == AgentOutcome.COMPLETED && !finalText.isNullOrBlank()) {
@@ -5920,6 +6051,9 @@ internal fun ModelHistoryItem.toSegment(): Segment = when (this) {
         trusted = true,
         text = text,
         role = if (role == MessageRole.USER) SegmentRole.USER else SegmentRole.ASSISTANT,
+        // 0.53: reasoning rides its assistant text through the frame renderer. `Text` guarantees it is null for a user
+        // turn, and `Segment` re-checks the role, so a malformed value cannot become a user segment's reasoning.
+        reasoning = reasoning,
     )
     is ModelHistoryItem.ToolCall -> Segment(
         origin = SegmentOrigin.TOOL_ROUND,

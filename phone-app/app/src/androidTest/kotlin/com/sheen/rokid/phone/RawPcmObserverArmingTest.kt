@@ -56,7 +56,7 @@ class RawPcmObserverArmingTest {
 
     @Test fun createStillAcceptsAnInitialObserverForCallersThatArmItUpFront() {
         val captured = mutableListOf<ByteArray>()
-        val root = HostCompositionRoot.create(context) { data -> captured += data }
+        val root = HostCompositionRoot.create(context, initialObserver = { data -> captured += data })
 
         root.rawPcmObserver(byteArrayOf(5, 6))
 

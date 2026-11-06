@@ -18,6 +18,62 @@ import kotlinx.serialization.json.*
 /** R70: a bounded read of a provider error body — enough for its machine code, never a full diagnostic dump. */
 private const val MAX_ERROR_BODY_BYTES = 8_192L
 
+/**
+ * 0.5.4 Task 6: the three stages that bound one model request. [ControlledModelClient] owns all of them, so no caller
+ * (and no HTTP-library default) can silently decide when a request dies.
+ *
+ * - [firstTokenMillis]: send → first liveness delta (`TextDelta`, `ReasoningDelta`, `ToolCallDelta` or
+ *   `ToolCallTerminal`). A thinking model may spend a long time before the first visible fragment, and a tool-call-only
+ *   turn has no visible fragment at all, so the grace must end on whichever delta proves the request is alive; 45 s is
+ *   the grace, not the whole answer budget.
+ * - [streamIdleMillis]: the longest silence allowed **between** two fragments. Every accepted delta restarts it, so a
+ *   stream that keeps flowing never trips it.
+ * - [hardCapMillis]: the whole request, whatever the profile or caller allows. It is only ever lowered by the caller's
+ *   own `ModelRequest.deadlineNanos`.
+ */
+data class RequestTimeouts(
+    val firstTokenMillis: Long = 45_000,
+    val streamIdleMillis: Long = 20_000,
+    val hardCapMillis: Long = 90_000,
+) {
+    init {
+        require(firstTokenMillis > 0 && streamIdleMillis > 0 && hardCapMillis > 0)
+    }
+}
+
+// Stable machine codes for the three stages. A timeout is never a verdict on the answer; these tell an operator (and
+// Task 8's `P3_MODEL_REQ`) which stage expired. All three are reported as `ModelEnd.DEADLINE` so the user hears the
+// timeout copy rather than a generic failure; the stage code still rides the terminal's `safeCode` into the turn's
+// detail/log line. The turn/gateway boundary keeps its own `DEADLINE` code as well.
+private const val FIRST_TOKEN_TIMEOUT = "FIRST_TOKEN_TIMEOUT"
+private const val STREAM_IDLE_TIMEOUT = "STREAM_IDLE_TIMEOUT"
+private const val REQUEST_DEADLINE = "REQUEST_DEADLINE"
+
+/**
+ * 0.5.4 Task 8 (§6.2.2): one request's count-only latency from the instant it was actually sent.
+ *
+ * [firstByteAtNanos] is the first body read (true TTFB), [firstTokenAtNanos] the first liveness delta and
+ * [endedAtNanos] the terminal. A stage whose instant is missing is `null` — the request never got there — and the
+ * arithmetic never invents a zero. A null [sentAtNanos] means nothing left admission, so every field is unavailable.
+ */
+internal fun requestTiming(
+    sentAtNanos: Long?,
+    firstByteAtNanos: Long?,
+    firstTokenAtNanos: Long?,
+    endedAtNanos: Long,
+): ModelRequestTiming {
+    fun millisBetween(start: Long?, at: Long?): Long? {
+        if (start == null || at == null) return null
+        return ((at - start).coerceAtLeast(0L)) / 1_000_000L
+    }
+    val streamMillis = sentAtNanos?.let { ((endedAtNanos - it).coerceAtLeast(0L)) / 1_000_000L }
+    return ModelRequestTiming(
+        ttfbMillis = millisBetween(sentAtNanos, firstByteAtNanos),
+        firstTokenMillis = millisBetween(sentAtNanos, firstTokenAtNanos),
+        streamMillis = streamMillis,
+    )
+}
+
 class ControlledModelClient(
     http: OkHttpClient, private val repository: ProfileRepository, private val resolver: SecretResolver,
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
@@ -34,6 +90,8 @@ class ControlledModelClient(
 ) : ModelClient, ProfileProbeTransport, AutoCloseable {
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
+    /** Task 6: one policy for every request this client sends. */
+    private val timeouts = RequestTimeouts()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
     // Mutable media source: starts as no-op, can be replaced after construction when the audio bridge is ready.
     @Volatile private var activeMediaSource: MediaSource = mediaSource ?: NoOpMediaSource
@@ -58,16 +116,23 @@ class ControlledModelClient(
 
     private fun admit(input: ModelRequest, listener: (ModelStreamEvent) -> Unit, probe: Boolean): CancellationHandle {
         val profile = repository.get(input.profileId) ?: rejected()
-        val support = when (profile.protocolId) {
-            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.support
-            else -> deepSeekAdapter.support
-        }
-        gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(profile), probe)
+        // 0.52 C1: one mapping table decides adapter + endpoint, so the catalog's family id and the adapter's support id
+        // can never disagree again. `DEEPSEEK_RESPONSES` stays the documented alias for pre-0.5.2 debug profiles.
+        val protocol = ProtocolIds.canonical(profile.protocolId)
+        val chatCompletions = protocol == ProtocolIds.OPENAI_CHAT_COMPLETIONS
+        val support = if (chatCompletions) openAiAdapter.support else deepSeekAdapter.support
+        gate.check(profile, input, support, consent(profile), probe)
         val prepared = budgeter.prepare(profile, input)
-        val endpoint = if (profile.protocolId == "OPENAI_CHAT_COMPLETIONS")
+        val endpoint = if (chatCompletions)
             ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)
         else ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
-        val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
+        val admittedAt = clock.nowNanos()
+        // Task 6: the client is the single owner of the request cap. It never re-applies `profile.timeoutMillis` — the
+        // caller (AgentLoop) already folded that into `deadlineNanos`; here only min(caller deadline, hard cap) remains.
+        val deadline = minOf(input.deadlineNanos, saturatedAdd(admittedAt, millisNanos(timeouts.hardCapMillis)))
+        // 0.53 design (revised) §5.4: reasoning is passed through as-is. The system does not guess a model family, and
+        // a server that returns reasoning must be answered with it on the next tool-bearing request — whatever the
+        // user switch says — so the client never filters the event.
         val pending = Pending(input, profile.revision, deadline, listener)
         val superseded: List<Pending>
         synchronized(lock) {
@@ -84,9 +149,10 @@ class ControlledModelClient(
         }
         superseded.forEach { it.end(ModelEnd.CANCELLED, "TURN_REPLACED") }
         if (!pending.active()) return pending
-        val payload = when (profile.protocolId) {
-            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.encode(profile, prepared)
-            else -> deepSeekAdapter.encode(profile, prepared)
+        val payload = if (chatCompletions) {
+            openAiAdapter.encode(profile, prepared)
+        } else {
+            deepSeekAdapter.encode(profile, prepared)
         }
         var encoded: Request? = null
         try {
@@ -100,15 +166,23 @@ class ControlledModelClient(
             rejected()
         }
         if (!pending.active()) return pending
-        pending.attachTimer(scheduler.at(deadline) { pending.end(ModelEnd.DEADLINE, "DEADLINE") })
-        if (clock.nowNanos() >= deadline) pending.end(ModelEnd.DEADLINE, "DEADLINE")
+        // The hard cap covers the whole request, retries included. It is armed first so that a scheduler which runs the
+        // callback immediately (tests) settles the request before the grace is considered at all.
+        pending.attachTimer(scheduler.at(deadline) { pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE) })
+        // The grace only matters while it can still expire before the cap; arming it past the cap would produce a
+        // timer that can never decide anything.
+        val graceAt = saturatedAdd(admittedAt, millisNanos(timeouts.firstTokenMillis))
+        if (graceAt < deadline && pending.active()) {
+            pending.attachFirstTokenGrace(scheduler.at(graceAt) { pending.firstTokenTimedOut() })
+        }
+        if (clock.nowNanos() >= deadline) pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE)
         else execute(pending, encoded ?: rejected(), 0)
         return pending
     }
 
     private fun execute(pending: Pending, request: Request, attempt: Int) {
         if (!pending.active()) return
-        if (clock.nowNanos() >= pending.deadline) { pending.end(ModelEnd.DEADLINE, "DEADLINE"); return }
+        if (clock.nowNanos() >= pending.deadline) { pending.end(ModelEnd.DEADLINE, REQUEST_DEADLINE); return }
         // OkHttp status follow-ups bypass retryOnConnectionFailure; only our scheduler may repeat a POST.
         val body = requireNotNull(request.body)
         val attemptBody = object : RequestBody() {
@@ -122,6 +196,9 @@ class ControlledModelClient(
         try { executor.execute {
             try {
                 if (!pending.active()) return@execute
+                // Task 8: the request really leaves here; the retry scheduler re-enters this method, so a second
+                // attempt restarts the measurement instead of inheriting the failed attempt's wait.
+                pending.noteSent()
                 call.execute().use { response ->
                     if (!pending.active()) return@use
                     if (!response.isSuccessful) {
@@ -145,14 +222,27 @@ class ControlledModelClient(
                     val framing = SseDecoder()
                     // P5: route to the right SSE decoder by protocol. Chat Completions uses a different wire format
                     // (choices[].delta.content + finish_reason) than the Responses API (response.output_text.delta).
-                    val isChatCompletions = repository.get(pending.input.profileId)?.protocolId == "OPENAI_CHAT_COMPLETIONS"
+                    val isChatCompletions = ProtocolIds.isChatCompletions(
+                        repository.get(pending.input.profileId)?.protocolId.orEmpty(),
+                    )
                     val chatDecoder = if (isChatCompletions) ChatCompletionsDecoder(pending.input.requestId) else null
                     val responsesDecoder = if (!isChatCompletions) ResponsesDecoder(pending.input.requestId) else null
                     fun frames(frames: List<SseFrame>) {
                         for (frame in frames) {
                             if (!pending.active()) break
                             if (chatDecoder != null) {
-                                chatDecoder.accept(frame).forEach(pending::deliver)
+                                chatDecoder.accept(frame).forEach { event ->
+                                    // Review round 1: the retry gate is "has this turn already delivered payload?".
+                                    // Chat answer text and call fragments count; reasoning never does (it is not the
+                                    // answer). Before this, only the Responses path set the flag.
+                                    when (event) {
+                                        is ModelStreamEvent.TextDelta,
+                                        is ModelStreamEvent.ToolCallDelta,
+                                        is ModelStreamEvent.ToolCallTerminal -> pending.delta.set(true)
+                                        else -> Unit
+                                    }
+                                    pending.deliver(event)
+                                }
                             } else {
                                 val type = try { (Json.parseToJsonElement(frame.data) as? JsonObject)?.get("type")?.jsonPrimitive?.content }
                                     catch (_: Exception) { null }
@@ -172,6 +262,9 @@ class ControlledModelClient(
                                 if (pending.active()) (chatDecoder?.endOfInput() ?: responsesDecoder!!.endOfInput()).forEach(pending::deliver)
                                 break
                             }
+                            // Task 8: the first body byte is the true TTFB, which a metadata-only SSE frame precedes
+                            // the first token by; measured before the frame is decoded.
+                            pending.noteFirstByte()
                             total += count
                             if (total > 1048576L) { pending.end(ModelEnd.FAILED, "RESPONSE_LIMIT"); break }
                             frames(framing.feed(bytes.copyOf(count)))
@@ -211,12 +304,35 @@ class ControlledModelClient(
         private val listener: (ModelStreamEvent) -> Unit) : CancellationHandle {
         private val done = AtomicBoolean(false)
         val delta = AtomicBoolean(false)
+        /** Task 6: true once the first liveness delta arrived; disarms the first-token grace. */
+        private val firstToken = AtomicBoolean(false)
+        /** Task 8: the instant this attempt left the socket, and the first body byte/first liveness delta it reached. */
+        @Volatile private var sentAtNanos: Long? = null
+        @Volatile private var firstByteAtNanos: Long? = null
+        @Volatile private var firstTokenAtNanos: Long? = null
+        private var firstTokenTimer: CancellationHandle? = null
+        private var idleTimer: CancellationHandle? = null
         private var call: Call? = null
         private val timers = mutableListOf<CancellationHandle>()
+        /**
+         * Task 8: this attempt was really dispatched; the latency stages are measured from here.
+         *
+         * The retry scheduler re-enters `execute`, and a retry is only possible while no answer payload has been
+         * delivered (`delta` is still false), so the first byte/token cannot exist yet and only the start moves.
+         */
+        fun noteSent() {
+            sentAtNanos = clock.nowNanos()
+        }
+
+        /** Task 8: the first body byte of the current attempt. Idempotent; a later read never moves it. */
+        fun noteFirstByte() {
+            if (firstByteAtNanos == null) firstByteAtNanos = clock.nowNanos()
+        }
+
         fun active(): Boolean {
             if (done.get()) return false
             if (repository.get(input.profileId)?.revision != revision) { end(ModelEnd.CANCELLED, "PROFILE_CHANGED"); return false }
-            if (clock.nowNanos() >= deadline) { end(ModelEnd.DEADLINE, "DEADLINE"); return false }
+            if (clock.nowNanos() >= deadline) { end(ModelEnd.DEADLINE, REQUEST_DEADLINE); return false }
             return !done.get()
         }
         fun attachCall(value: Call): Boolean {
@@ -229,22 +345,84 @@ class ControlledModelClient(
             val accepted = synchronized(lock) { if (done.get()) false else { timers += value; true } }
             if (!accepted) value.cancel()
         }
+        /** Task 6: the first-token grace is kept separately so the first fragment can disarm it early. */
+        fun attachFirstTokenGrace(value: CancellationHandle) {
+            val accepted = synchronized(lock) {
+                if (done.get()) false else { firstTokenTimer = value; timers += value; true }
+            }
+            if (!accepted) value.cancel()
+        }
+        fun firstTokenTimedOut() {
+            if (!firstToken.get()) end(ModelEnd.DEADLINE, FIRST_TOKEN_TIMEOUT)
+        }
+        /**
+         * Task 6: the deltas that mean the request is still producing something. This one predicate feeds both the
+         * first-token grace and the idle window: answer text, thinking, and a tool-call fragment are all liveness, so a
+         * stream is never killed while the server is still sending (Finding 1).
+         */
+        private fun isLiveness(event: ModelStreamEvent) = event is ModelStreamEvent.TextDelta ||
+            event is ModelStreamEvent.ReasoningDelta || event is ModelStreamEvent.ToolCallDelta ||
+            event is ModelStreamEvent.ToolCallTerminal
+        /** Task 6: mark the first liveness delta as seen and disarm the grace. */
+        private fun noteFirstToken(event: ModelStreamEvent) {
+            if (!isLiveness(event)) return
+            if (!firstToken.compareAndSet(false, true)) return
+            // Task 8: the first-token stage is exactly this instant; it is recorded before the grace is disarmed so a
+            // racing terminal can never read a half-updated timing.
+            firstTokenAtNanos = clock.nowNanos()
+            val grace = synchronized(lock) { val armed = firstTokenTimer; firstTokenTimer = null; armed }
+            grace?.cancel()
+        }
+        /**
+         * Task 6: (re)start the idle window. Called after every accepted delta — a thinking stream that keeps producing
+         * fragments therefore never trips it. Every delta replaces the previous window, so only total silence expires.
+         */
+        private fun armIdle() {
+            if (done.get()) return
+            val handle = scheduler.at(saturatedAdd(clock.nowNanos(), millisNanos(timeouts.streamIdleMillis))) {
+                // Finding 3: the idle stage is a deadline, not a generic provider failure: the wearer must hear the
+                // timeout copy, while the stage code stays in `safeCode` for the turn's detail/log line.
+                end(ModelEnd.DEADLINE, STREAM_IDLE_TIMEOUT)
+            }
+            var previous: CancellationHandle? = null
+            val accepted = synchronized(lock) {
+                if (done.get()) false else { previous = idleTimer; idleTimer = handle; timers += handle; true }
+            }
+            if (!accepted) { handle.cancel(); return }
+            previous?.cancel()
+        }
         fun deliver(event: ModelStreamEvent) {
             if (!active()) return
-            if (event is ModelStreamEvent.Terminal) end(event.end, event.safeCode, event.usage)
-            else {
-                val admitted = synchronized(lock) { !done.get() }
-                if (admitted) try { listener(event) } catch (_: Exception) { end(ModelEnd.FAILED, "LISTENER_FAILED") }
+            if (event is ModelStreamEvent.Terminal) {
+                end(event.end, event.safeCode, event.usage)
+                return
             }
+            // Mark liveness **before** the listener runs: a fragment that has arrived must win the race against a
+            // watchdog callback firing on another thread at the same instant.
+            noteFirstToken(event)
+            // 0.53 (revised) §5.4: reasoning is forwarded verbatim. It is still not answer text, so it never satisfies
+            // the 429/5xx retry gate (which is about text already delivered to the listener).
+            val admitted = synchronized(lock) { !done.get() }
+            if (admitted) try { listener(event) } catch (_: Exception) { end(ModelEnd.FAILED, "LISTENER_FAILED") }
+            // Deltas of any kind are liveness for the idle window; metadata only (`response.created`) is not.
+            if (isLiveness(event)) armIdle()
         }
         fun end(end: ModelEnd, code: String?, usage: ModelUsage? = null) {
             if (!done.compareAndSet(false, true)) return
             release()
-            try { listener(ModelStreamEvent.Terminal(input.requestId, end, usage, code)) } catch (_: Exception) { }
+            // Task 8: the terminal closes the third stage. Every exit (provider, watchdog, cancel) reports the latency
+            // it really reached; a stage that was never reached stays null.
+            val timing = requestTiming(sentAtNanos, firstByteAtNanos, firstTokenAtNanos, clock.nowNanos())
+            try { listener(ModelStreamEvent.Terminal(input.requestId, end, usage, code, timing)) } catch (_: Exception) { }
         }
         fun discard() { if (done.compareAndSet(false, true)) release() }
         private fun release() {
-            val resources = synchronized(lock) { requests.remove(this); val resources = call to timers.toList(); call = null; timers.clear(); resources }
+            val resources = synchronized(lock) {
+                requests.remove(this)
+                val resources = call to timers.toList()
+                call = null; timers.clear(); firstTokenTimer = null; idleTimer = null
+                resources
+            }
             resources.first?.cancel(); resources.second.forEach { it.cancel() }
         }
         override fun cancel() { end(ModelEnd.CANCELLED, "CANCELLED") }

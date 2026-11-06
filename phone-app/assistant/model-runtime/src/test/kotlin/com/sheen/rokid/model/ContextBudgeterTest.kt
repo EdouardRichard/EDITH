@@ -311,4 +311,108 @@ class ContextBudgeterTest {
             }
         }
     }
+
+    // ------------------------------------------------------- 0.53 reasoning pricing and official output budget
+
+    @Test fun `reasoning is charged to the budgeter in the same token unit as its message`() {
+        // 0.53 §T6: reasoning changes the online request, so it is priced. Each 100 ASCII characters is 25 token units;
+        // the history pair prices at 57 + (57 + 100) = 214 with the 400-character reasoning, and the base request at
+        // 121, so the whole request is 335. At a 300-unit budget the pair is evicted; at 400 it fits.
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "u".repeat(100)),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "a".repeat(100), reasoning = "r".repeat(400)),
+        )
+        val request = required().copy(history = history)
+
+        val fits = budgeter.prepare(smallProfile(400), request)
+        assertTrue(fits.removedIds.isEmpty())
+        assertEquals(335, fits.estimatedInputTokens)
+
+        val trimmed = budgeter.prepare(smallProfile(300), request)
+        assertEquals(listOf("history:0"), trimmed.removedIds, "the group is priced with its reasoning")
+        assertEquals(121, trimmed.estimatedInputTokens)
+    }
+
+    @Test fun `the official thinking output default is what an active profile reserves`() {
+        // Owner ruling B: no invented 32K floor. The official defaults are 64K for LOW/HIGH and 128K for MAX, and the
+        // send-time reservation uses those exact values. usable 200 000 − 65 536 − 1 000 safety = **133 464** is the
+        // low/high limit; disabled keeps the profile's 1 024-token reservation and the 150 000 input budget.
+        assertEquals(65_536, ThoughtBudget.DEFAULT_THINKING_TOKENS)
+        assertEquals(131_072, ThoughtBudget.DEFAULT_MAX_EFFORT_TOKENS)
+        assertEquals(65_536, ThoughtBudget.officialDefault(ThinkingEffort.LOW))
+        assertEquals(65_536, ThoughtBudget.officialDefault(ThinkingEffort.HIGH))
+        assertEquals(131_072, ThoughtBudget.officialDefault(ThinkingEffort.MAX))
+
+        val profile = profileFixture().copy(
+            usableWindowTokens = 200_000,
+            inputBudgetTokens = 150_000,
+            maxOutputTokens = 1_024,
+            safetyTokens = 1_000,
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.LOW,
+        )
+        // 280 000 ASCII characters per text price at 70 000 + 32; the pair is 140 064 and the base request 121, so the
+        // whole request is 140 185 — past the active 133 464, inside the disabled 150 000.
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "u".repeat(280_000)),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "a".repeat(280_000)),
+        )
+        val request = required().copy(history = history)
+        assertEquals(65_536, ThoughtBudget.reserve(profile))
+
+        val active = budgeter.prepare(profile, request)
+        assertEquals(listOf("history:0"), active.removedIds, "the official default reservation forces the eviction")
+        assertEquals(121, active.estimatedInputTokens)
+
+        val disabled = budgeter.prepare(profile.copy(thinkingEnabled = false), request)
+        assertTrue(disabled.removedIds.isEmpty(), "the disabled reservation fits the turn: ${disabled.removedIds}")
+        assertEquals(140_185, disabled.estimatedInputTokens)
+
+        val max = budgeter.prepare(profile.copy(thinkingEffort = ThinkingEffort.MAX), request)
+        assertEquals(listOf("history:0"), max.removedIds, "MAX reserves 131 072: ${ThoughtBudget.reserve(profile.copy(thinkingEffort = ThinkingEffort.MAX))}")
+    }
+
+    @Test fun `the official output default can overflow a request the disabled profile would send`() {
+        val profile = profileFixture().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 60_000,
+            maxOutputTokens = 1_024,
+            safetyTokens = 1_000,
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.LOW,
+        )
+        // 150 000 ASCII characters price at 37 500 token units; with the 32-unit request and the 42/32-unit messages
+        // the request is 37 606, past the 33 464 the official 64K reservation leaves and inside the 60 000 a disabled
+        // reservation allows.
+        val request = requestFixture(listOf(InputPart.Text("q".repeat(150_000)))).copy(instructions = "i".repeat(40))
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(profile, request) }
+
+        val disabled = budgeter.prepare(profile.copy(thinkingEnabled = false), request)
+        assertEquals(37_606, disabled.estimatedInputTokens)
+    }
+
+    @Test fun `a 131072 window with MAX effort still leaves the named minimum input room`() {
+        // Review round 1: reserving the full official MAX default (131 072) on a 131 072-token window makes the limit
+        // negative, so every thinking request would fail locally. The reservation is capped by
+        // `usableWindow − safety − MIN_INPUT_TOKENS` = 131 072 − 1 000 − 8 192 = **121 880**, leaving 8 192.
+        val profile = profileFixture().copy(
+            usableWindowTokens = 131_072,
+            inputBudgetTokens = 60_000,
+            maxOutputTokens = 1_024,
+            safetyTokens = 1_000,
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.MAX,
+        )
+        assertTrue(ThoughtBudget.active(profile))
+        assertEquals(121_880, ThoughtBudget.reserve(profile))
+        assertTrue(ThoughtBudget.MIN_INPUT_TOKENS == 8_192)
+
+        // A normal request is still sendable: the limit is min(60 000, 8 192) = 8 192, not negative.
+        val fits = budgeter.prepare(profile, required())
+        assertTrue(fits.removedIds.isEmpty())
+        assertEquals(121, fits.estimatedInputTokens)
+
+        val overLimit = requestFixture(listOf(InputPart.Text("q".repeat(40_000)))).copy(instructions = "i".repeat(40))
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(profile, overLimit) }
+    }
 }

@@ -1,17 +1,25 @@
 package com.sheen.rokid.phone.debug
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.phone.app.EdithApplication
+import com.sheen.rokid.phone.model.ProbeConsent
+import com.sheen.rokid.phone.model.catalog.ModelEntry
+import com.sheen.rokid.phone.model.catalog.ModelOrigin
+import com.sheen.rokid.phone.model.catalog.ModelProfileProjection
+import com.sheen.rokid.phone.model.catalog.Provider
+import com.sheen.rokid.phone.model.domain
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.sheen.rokid.phone.model.ProfileForm
-import com.sheen.rokid.plugin.*
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.ThinkingEffort
 import java.io.File
 import java.util.Properties
 
 /**
- * Debug-only receiver that creates a model profile from `.local/p5-omni.properties` and optionally runs a probe.
+ * Debug-only receiver that seeds one catalog provider/model from `.local/p5-omni.properties` and optionally probes it.
  *
  * Usage:
  * ```
@@ -19,6 +27,15 @@ import java.util.Properties
  * ```
  *
  * Reads the properties file from the app's files directory (pushed there beforehand) or from the path in EXTRA_PATH.
+ *
+ * 0.52: the persisted model configuration is the encrypted catalog, so this instrument creates a **provider with one
+ * model** rather than a profile. The provider/model ids are logged and the API key is only handed to the catalog
+ * repository, which stages it into the Keystore; no log line carries it. `--ez select true` makes the new provider the
+ * globally active one, exactly the state the settings UI would produce.
+ *
+ * 0.53: optional `thinkingEnabled` (`true`/`false`, default `false`) and `thinkingEffort` (`LOW`/`HIGH`/`MAX`, default
+ * `LOW`) seed the thinking switch for unattended device verification. There is no family inference: the properties say
+ * exactly what gets seeded, and the log line states the boolean and the effort only, never the key.
  */
 class DebugProfileCreator : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -41,63 +58,95 @@ class DebugProfileCreator : BroadcastReceiver() {
                 ?: throw IllegalArgumentException("missing property: $name")
 
             val protocolId = prop("protocolId")
-            // 0.25 R74: the assistant is TEXT+IMAGE. This debug creator must not seed a profile the session gate would
+            // 0.25 R74: the assistant is TEXT+IMAGE. This debug creator must not seed a provider the session gate would
             // refuse; the Chat protocol keeps its pre-existing AUDIO input as an extra, it no longer substitutes for IMAGE.
-            val inputs = if (protocolId == "OPENAI_CHAT_COMPLETIONS")
+            val inputs = if (protocolId == "OPENAI_CHAT_COMPLETIONS") {
                 setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO)
-            else setOf(InputModality.TEXT, InputModality.IMAGE)
+            } else {
+                setOf(InputModality.TEXT, InputModality.IMAGE)
+            }
 
             val apiKey = prop("apiKey")
             require(apiKey.all { it.code in 33..126 }) { "apiKey contains non-printable chars" }
 
-            val usableWindow = prop("usableWindowTokens").toInt()
-            val inputBudget = prop("inputBudgetTokens").toInt()
+            // The old form's "max input K" was derived from inputBudgetTokens, and its capacity became the profile's
+            // usable window; passing the same numbers keeps the debug route's budget identical to the pre-catalog one.
+            val contextTokens = prop("inputBudgetTokens").toInt()
             val maxOutput = prop("maxOutputTokens").toInt()
-            val form = ProfileForm(
-                name = "QwenOmni",
-                service = prop("service"),
-                baseUrl = prop("baseUrl"),
-                model = prop("model"),
-                protocolId = protocolId,
-                maxInputK = (inputBudget / 1024).toString(),
-                maxOutputK = (maxOutput / 1024).coerceAtLeast(1).toString(),
-                timeoutMillis = prop("timeoutMillis"),
-                inputs = inputs,
-                outputs = setOf(OutputModality.TEXT),
+            val modelId = prop("model")
+            val thinking = debugThinking(
+                enabled = props.getProperty("thinkingEnabled"),
+                effort = props.getProperty("thinkingEffort"),
             )
-            val draft = form.draft("qwen-omni-dev", null, true)
-            val repo = root.profiles as? com.sheen.rokid.phone.storage.AndroidProfileRepository
-                ?: throw IllegalStateException("profiles is not AndroidProfileRepository")
-            val saved = repo.saveWithSecret(draft, apiKey.toCharArray())
+            val providerId = "qwen-omni-dev"
+            val provider = Provider(
+                id = providerId,
+                name = "QwenOmni",
+                baseUrl = prop("baseUrl"),
+                protocolId = protocolId,
+                timeoutMillis = prop("timeoutMillis").toLong(),
+                models = listOf(
+                    ModelEntry(
+                        id = modelId,
+                        displayName = modelId,
+                        contextWindowTokens = contextTokens,
+                        maxOutputTokens = maxOutput,
+                        inputs = inputs,
+                        outputs = setOf(OutputModality.TEXT),
+                        thinkingEnabled = thinking.enabled,
+                        thinkingEffort = thinking.effort,
+                        origin = ModelOrigin.MANUAL,
+                    ),
+                ),
+            )
+            val catalog = root.modelCatalogRepository
+                ?: throw IllegalStateException("model catalog unavailable")
+            val saved = catalog.saveProvider(provider, apiKey.toCharArray())
 
-            android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE: created profile id=${saved.id} protocol=$protocolId inputs=$inputs revision=${saved.revision}")
+            android.util.Log.i(
+                "EdithP5",
+                "DEBUG_CREATE_PROFILE: created provider id=${saved.id} model=$modelId " +
+                    "protocol=$protocolId inputs=$inputs revision=${saved.revision} " +
+                    "thinkingEnabled=${thinking.enabled} thinkingEffort=${thinking.effort}",
+            )
 
-            // 0.4 Task 9: the profile list's own 「选择」 control is a Compose tap the installed probe cannot reach
-            // either, so the debug creator can make the same repository selection the page makes (`ProfileViewModel
-            // .select` -> `AndroidProfileRepository.select`). Optional, so every existing caller is unchanged; the
-            // log names the id only, never the secret.
             if (intent.getBooleanExtra(EXTRA_SELECT, false)) {
-                repo.select(PLUGIN_ID, saved.id)
-                android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE: selected id=${saved.id} plugin=$PLUGIN_ID")
+                catalog.setActiveProvider(saved.id)
+                catalog.selectModel(modelId)
+                android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE: activated provider=${saved.id} model=$modelId")
             }
 
-            // Optionally run a text probe to verify connectivity
+            // Optionally run a text probe to verify connectivity.
             if (intent.getBooleanExtra(EXTRA_PROBE, false)) {
                 root.profileTester?.let { tester ->
                     var result = "pending"
-                    val handle = tester.testText(saved.id) { event ->
-                        when (event) {
-                            is ModelStreamEvent.Terminal -> {
-                                result = "terminal:${event.end}"
-                                android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe: $result")
-                            }
-                            else -> {}
-                        }
+                    val profileId = ModelProfileProjection.profileId(saved.id, modelId)
+                    // The production tester sits behind the probe gate, whose confirmation the settings page collects.
+                    // This shell-driven instrument has no dialog, so it grants the confirmation the UI would collect
+                    // for the exact profile revision/domain it just saved, and revokes it as soon as the probe is done.
+                    val profile = requireNotNull(CatalogProfileRepository(catalog).get(profileId)) {
+                        "saved profile is not projected: $profileId"
                     }
-                    // Wait up to 30s for the probe to complete
-                    Thread.sleep(30_000)
-                    handle.cancel()
-                    android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe result: $result")
+                    try {
+                        root.debugGrantProbeConsent(
+                            ProbeConsent(profile.id, profile.revision, domain(profile.baseUrl), image = false),
+                        )
+                        val handle = tester.testText(profileId) { event ->
+                            when (event) {
+                                is ModelStreamEvent.Terminal -> {
+                                    result = "terminal:${event.end}"
+                                    android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe: $result")
+                                }
+                                else -> {}
+                            }
+                        }
+                        // Wait up to 30s for the probe to complete
+                        Thread.sleep(30_000)
+                        handle.cancel()
+                        android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE probe result: $result")
+                    } finally {
+                        root.debugGrantProbeConsent(null)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -109,8 +158,25 @@ class DebugProfileCreator : BroadcastReceiver() {
         const val ACTION = "edith.DEBUG_CREATE_PROFILE"
         const val EXTRA_PATH = "path"
         const val EXTRA_PROBE = "probe"
-        /** 0.4 Task 9: also select the saved profile for the smart assistant (`--ez select true`). */
+        /** 0.4 Task 9: also activate the saved provider/model (`--ez select true`). */
         const val EXTRA_SELECT = "select"
-        private const val PLUGIN_ID = "smart-assistant"
     }
 }
+
+/**
+ * 0.53 design §5.7 (ruling A): the thinking seed this instrument reads from the explicit optional properties.
+ *
+ * No family inference: whatever `thinkingEnabled`/`thinkingEffort` say is what gets seeded, so a device run can
+ * exercise thinking on any model. An unknown effort throws instead of being silently mapped to a different one; the
+ * receiver's catch reports the failure.
+ */
+internal data class DebugThinking(
+    val enabled: Boolean,
+    val effort: ThinkingEffort,
+)
+
+internal fun debugThinking(enabled: String?, effort: String?): DebugThinking = DebugThinking(
+    enabled = enabled?.trim()?.toBoolean() ?: false,
+    effort = effort?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()?.let(ThinkingEffort::valueOf)
+        ?: ThinkingEffort.LOW,
+)

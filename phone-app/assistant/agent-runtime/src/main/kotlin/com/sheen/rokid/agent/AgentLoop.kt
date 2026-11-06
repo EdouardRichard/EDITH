@@ -25,8 +25,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** The six terminal states of one agent run (spec §6.3). */
-enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED }
+/** The seven terminal states of one agent run (spec §6.3; 0.5.4 Task 2 adds [AWAITING_USER]). */
+enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED, AWAITING_USER }
 
 /**
  * One agent run request.
@@ -35,8 +35,11 @@ enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCEL
  * [utterance] is the user's own text for this turn and opens the model history. [profileId] rides along for the wiring
  * that owns a model profile — the loop never reads one itself. [deadlineNanos] is a wall-clock boundary on the same
  * [MonotonicClock] the loop is given, not a capability budget; it bounds **machine** time only, because time spent
- * waiting on a confirmation is shifted out of it (D49). [requestTimeoutNanos] bounds **one model request** instead, so
- * a caller may keep them separate.
+ * waiting on a confirmation is shifted out of it (D49). Expiry ends the run as [AgentOutcome.DEADLINE] with the loop's
+ * own `TURN_BUDGET` safe code, and that includes a model request whose effective deadline was this turn deadline: the
+ * transport only reports that its own cap expired (`DEADLINE` / `REQUEST_DEADLINE`), the loop names the budget.
+ * [requestTimeoutNanos] bounds **one model request** instead, so a caller may keep them separate; when that cap is
+ * smaller than what is left of the budget, its expiry keeps the provider's code rather than becoming `TURN_BUDGET`.
  */
 data class AgentRequest(
     val turnId: String,
@@ -230,7 +233,15 @@ data class AgentMetrics(
  * The terminal result of one run.
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
- * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED].
+ * `STEP_LIMIT` / `TURN_BUDGET`) and is `null` when nothing meaningful applies. `TURN_BUDGET` means this run spent its
+ * whole `AgentRequest.deadlineNanos` (a `DEADLINE` outcome) - counted at one of the loop's own checks **or** by a model
+ * request whose effective cap was that deadline. Only an expiry of a genuinely smaller
+ * `AgentRequest.requestTimeoutNanos` keeps the provider's `REQUEST_DEADLINE` / `FIRST_TOKEN_TIMEOUT` /
+ * `STREAM_IDLE_TIMEOUT` code; that turn-bound vs request-bound reading is what keeps the two distinguishable.
+ * [finalText] is set
+ * only for [AgentOutcome.COMPLETED] (the model's answer); [AgentOutcome.AWAITING_USER] leaves it `null` — that outcome
+ * has no model answer, and the awaiting
+ * tool's text is its own notification emit, not a final answer — and every failure outcome leaves it `null` too.
  *
  * [humanWaitNanos] is the wall clock this run spent waiting for a **person** — the confirmation port and the bounded
  * mayAskHuman wait a tool reports as its deadline shift (the shell/`ConfirmingActions` wrapper) — and it is
@@ -302,7 +313,21 @@ data class AgentRun(
      * A default instance keeps every pre-0.25 `AgentRun` comparison and construction unchanged.
      */
     val metrics: AgentMetrics = AgentMetrics(),
-)
+    /**
+     * 0.53: the chain of thought of the model turn that ended this run, or `null` when it produced none (thinking off,
+     * a non-DeepSeek profile, or the run ended before any reply). The plugin writes it onto the store's closing
+     * assistant message ([ConversationStore.appendAssistant]/`closeStoreTurnWithReply`) so the next tool-bearing request
+     * can replay it; it is memory-only and never logged.
+     */
+    val finalReasoning: String? = null,
+) {
+    /**
+     * Content-free by construction: outcome and step count only. The generated `toString()` of a data class prints
+     * every member, which would put [finalText], [finalReasoning] and the transcript bodies into any stray log line or
+     * assertion message. Neither the answer nor the chain of thought may ride one.
+     */
+    override fun toString(): String = "AgentRun(outcome=$outcome, steps=${steps.size}, redacted)"
+}
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
 private const val CONFIRMATION_UNAVAILABLE = "CONFIRMATION_UNAVAILABLE"
@@ -312,6 +337,21 @@ private const val EMPTY_TURN = "EMPTY_TURN"
 private const val INCOMPLETE_TURNS = "INCOMPLETE_TURNS"
 private const val NO_PROGRESS = "NO_PROGRESS"
 private const val STEP_LIMIT = "STEP_LIMIT"
+
+/**
+ * 0.5.4 Task 7: the stable code for the run spending its **whole turn budget** (its `AgentRequest.deadlineNanos`).
+ *
+ * The outcome stays [AgentOutcome.DEADLINE] - the wearer-facing sentence is the same "回答超时了" - but a turn-budget
+ * expiry is not a provider/request timeout: `REQUEST_DEADLINE`, `FIRST_TOKEN_TIMEOUT` and `STREAM_IDLE_TIMEOUT` come
+ * from `ControlledModelClient`/`ModelClientGateway` and travel as that provider's `safeCode`. Giving the loop's own
+ * budget its own code keeps the two distinguishable in `P3_TURN` without inventing a seventh outcome.
+ *
+ * Review I-1: the transport cannot tell the two apart either, so the loop maps a `ModelEnd.DEADLINE` reply to this code
+ * only when that call's effective deadline was the turn deadline (including the `requestTimeoutNanos == 0` default) and
+ * the clock has reached it. A smaller per-request cap - and any `FIRST_TOKEN_TIMEOUT` / `STREAM_IDLE_TIMEOUT` it
+ * produced - forwards the provider's code unchanged.
+ */
+private const val TURN_BUDGET = "TURN_BUDGET"
 private const val EMPTY_TURN_TEXT = "(empty turn)"
 private const val TOOL_CALL_TEXT = "(tool call)"
 private const val CLOSED_TURN_TEXT = "(no reply)"
@@ -374,9 +414,14 @@ private const val HUMAN_CONFIRMATION_ALLOWANCE_NANOS = 120_000L * 1_000_000L
 private const val TOOL_POLL_STEP_NANOS = 10_000_000L
 private const val DEFAULT_TOOL_TIMEOUT_MILLIS = 30_000L
 
-/** Plan wording (D3 §1.6). Matched case-insensitively for the Latin markers; Chinese markers are literal. */
+/**
+ * Plan wording (D3 §1.6). Matched case-insensitively for the Latin markers; Chinese markers are literal.
+ *
+ * 0.5.4 Task 1: the single character `再` is gone. Anywhere-substring matching made it fire inside ordinary sentences
+ * ("下单前再跟你确认" is not a plan), so the "again / do it once more" sense is carried by multi-character phrases only.
+ */
 private val PLAN_MARKERS = listOf(
-    "接下来", "下一步", "我将", "我会", "稍后", "先", "然后", "再",
+    "接下来", "下一步", "我将", "我会", "稍后", "先", "然后", "再次", "再试",
     "i will", "i'll", "next", "let me", "first",
 )
 
@@ -385,6 +430,16 @@ private val PLAN_COMPLETION_MARKERS = listOf(
     "已完成", "已经完成", "完成如下", "总结如下", "无法继续", "没有权限", "无权限", "抱歉",
     "无法", "不能", "已处理", "已为你", "以下是",
     "done", "unable", "cannot", "no permission", "summary",
+)
+
+/**
+ * 0.5.4 Task 1 (design §6.1.2): wording that makes the sentence a report, a promise to check something later, or a
+ * question — never a plan this turn should execute. These are checked after [PLAN_COMPLETION_MARKERS] and suppress the
+ * nudge even when a plan marker is also present ("下单前再跟你确认" is a promise to check later, "我先看一眼是否…" is a
+ * question).
+ */
+private val NON_PLAN_MARKERS = listOf(
+    "不再", "再见", "然后再", "已经", "完成", "请确认", "是否", "吗", "？",
 )
 
 /** The audit summary is read from the model's own arguments string, which is kotlinx-lenient by construction. */
@@ -690,7 +745,7 @@ class AgentLoop(
         while (true) {
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
             if (clock.nowNanos() >= turnDeadlineNanos) {
-                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps)
             }
 
             // Assemble the RequestFrame through TurnRunner; the gateway still receives a plain instructions string.
@@ -715,6 +770,14 @@ class AgentLoop(
             openingTurn = false
             metricCalls++
             val modelStartedNanos = clock.nowNanos()
+            // Review I-1 (0.5.4 Task 7): keep this call's effective request deadline local. It is the turn deadline
+            // whenever the caller supplies no per-request cap, or when that cap reaches past what is left of the
+            // budget - and a reply that expired on it is then this run spending its whole budget, not a request cap.
+            val requestDeadlineNanos = if (request.requestTimeoutNanos > 0L) {
+                minOf(turnDeadlineNanos, clock.nowNanos() + request.requestTimeoutNanos)
+            } else {
+                turnDeadlineNanos
+            }
             val reply = gateway.turn(
                 GatewayTurn(
                     request.turnId,
@@ -724,11 +787,7 @@ class AgentLoop(
                     tools,
                     // D49: the turn's budget and one request's cap are different numbers. A caller that supplies no cap
                     // keeps the old shape exactly.
-                    if (request.requestTimeoutNanos > 0L) {
-                        minOf(turnDeadlineNanos, clock.nowNanos() + request.requestTimeoutNanos)
-                    } else {
-                        turnDeadlineNanos
-                    },
+                    requestDeadlineNanos,
                     frame = frameForTurn,
                     // 0.24 S4: one observer for every request of the run; it owns no request state itself.
                     onTextDelta = request.onTextDelta,
@@ -750,7 +809,9 @@ class AgentLoop(
             metricOverflows += reply.overflowRecoveries
             if (reply.terminal == ModelEnd.FAILED && reply.safeCode == CONTEXT_OVERFLOW) metricOverflows++
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
-            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+            if (cancelled) {
+                return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+            }
 
             // Only an INCOMPLETE turn with no call is an unproductive turn: a cut-off turn that still carries calls
             // produced real steps, so they run below instead of being retried away.
@@ -766,19 +827,33 @@ class AgentLoop(
                             history,
                             reply.text,
                             spentSteps,
+                            reply.reasoning,
                         )
                     }
-                    appendRetry(history, reply.text)
+                    appendRetry(history, reply.text, reply.reasoning)
                     continue
                 }
                 ModelEnd.FAILED -> return finish(
                     AgentOutcome.FAILED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
                 )
-                ModelEnd.DEADLINE -> return finish(
-                    AgentOutcome.DEADLINE, reply.safeCode, null, steps, history, reply.text, spentSteps,
-                )
+                ModelEnd.DEADLINE -> {
+                    // Review I-1 (0.5.4 Task 7): the transport reports its own `DEADLINE` / `REQUEST_DEADLINE` for any
+                    // request deadline it hits, and it cannot tell the turn budget from a per-request cap. When this
+                    // call's effective deadline was the turn deadline and the clock has reached it, the run really
+                    // spent its whole budget and gets the loop's own code; a smaller request cap (and the stage
+                    // timeouts it produces) keeps the provider's code untouched.
+                    val turnBound =
+                        requestDeadlineNanos == turnDeadlineNanos && clock.nowNanos() >= turnDeadlineNanos
+                    return finish(
+                        AgentOutcome.DEADLINE,
+                        if (turnBound) TURN_BUDGET else reply.safeCode,
+                        null, steps, history, reply.text, spentSteps, reply.reasoning,
+                    )
+                }
                 ModelEnd.CANCELLED -> return finish(
                     AgentOutcome.CANCELLED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
                 )
                 ModelEnd.COMPLETED, null -> Unit
             }
@@ -787,9 +862,12 @@ class AgentLoop(
                 if (reply.text.isBlank()) {
                     unproductiveTurns++
                     if (unproductiveTurns >= maxEmptyTurns) {
-                        return finish(AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text, spentSteps)
+                        return finish(
+                            AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text, spentSteps,
+                            reply.reasoning,
+                        )
                     }
-                    appendRetry(history, reply.text)
+                    appendRetry(history, reply.text, reply.reasoning)
                     continue
                 }
                 // R58: a text-only plan while the run has already acted is not an answer. Nudge it back into action
@@ -798,19 +876,29 @@ class AgentLoop(
                     if (nudges < MAX_PLAN_NUDGES && reply.text != lastNudgedText) {
                         lastNudgedText = reply.text
                         nudges++
-                        appendPlanNudge(history, reply.text)
+                        appendPlanNudge(history, reply.text, reply.reasoning)
                         continue
                     }
                     if (nudges >= MAX_PLAN_NUDGES) planNudgeCap = 1
-                    return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
+                    return finish(
+                        AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps,
+                        reply.reasoning,
+                    )
                 }
-                return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
+                return finish(
+                    AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps,
+                    reply.reasoning,
+                )
             }
 
             unproductiveTurns = 0
             // The assistant's text opens the round, then its calls are echoed before any output, so a call never
             // arrives orphaned and a tool run never starts a history group on its own.
-            history += ModelHistoryItem.Text(MessageRole.ASSISTANT, reply.text.ifBlank { TOOL_CALL_TEXT })
+            history += ModelHistoryItem.Text(
+                MessageRole.ASSISTANT,
+                reply.text.ifBlank { TOOL_CALL_TEXT },
+                reply.reasoning,
+            )
             reply.toolCalls.forEach { call ->
                 history += ModelHistoryItem.ToolCall(
                     callId = call.id,
@@ -820,11 +908,15 @@ class AgentLoop(
                 )
             }
             for (call in reply.toolCalls) {
-                if (spentSteps >= maxSteps) return finish(AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps)
+                if (spentSteps >= maxSteps) {
+                    return finish(
+                        AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps, reply.reasoning,
+                    )
+                }
                 // R60: the per-call cap is min(descriptor timeout, deadline - now); an already-expired deadline must not
                 // start another tool at all.
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 val registered = registry.resolve(call.name)
                 // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
@@ -856,14 +948,17 @@ class AgentLoop(
                             // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
                             // fingerprint, no guard feed, no global no-progress count, no error streak. It is also the
                             // "not attempted" null: the call never executed, so no failure observation is taken here.
-                            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                            if (cancelled) {
+                                return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+                            }
                             if (spentObservations >= maxObservations) {
                                 return finish(
                                     AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps,
+                                    reply.reasoning,
                                 )
                             }
                             if (clock.nowNanos() >= turnDeadlineNanos) {
-                                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                                return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                             }
                             continue
                         }
@@ -871,7 +966,7 @@ class AgentLoop(
                             val code = decision.pattern.safeCode
                             steps += AgentStep(steps.size + 1, call.name, code, executed = false)
                             appendToolOutput(history, call.id, code)
-                            return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps)
+                            return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps, reply.reasoning)
                         }
                         LoopDecision.Allow -> Unit
                     }
@@ -1027,7 +1122,7 @@ class AgentLoop(
                 // A cancel that arrived while the tool was running is not a tool failure: no output is appended for the
                 // unfinished call (R61), so the model never sees a half-finished step as if it had completed.
                 if (execution.cancelled) {
-                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 // edith-0.3 Phase 2.2 Task 3: every non-Done screen-tool result gets the same best-effort observation
                 // treatment, whether it came back from the executor (a throw or a tool's own failure), from a
@@ -1059,7 +1154,10 @@ class AgentLoop(
                         result.images,
                         nonPersistent = mustRedact(result),
                     )
-                    return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
                 }
                 // R97: the re-arm above is exactly-once per confirmed timeout, and only a confirmed stop gets it: a STOP,
                 // a cancel and a teardown stay cancelled, so those paths never reach it.
@@ -1107,26 +1205,49 @@ class AgentLoop(
                     result.images,
                     nonPersistent = mustRedact(result),
                 )
+                // 0.5.4 Task 2: a tool that says it is waiting for the wearer ends the run right here. The assistant
+                // text and the tool output are already in history (above), so the turn can be settled from the
+                // transcript; no second model request is made, because the answer is the person's to give. This is not
+                // a failure: no safe code and no failure hint. It sits before the terminal-scope check because the
+                // awaiting declaration is the stronger verdict of the two. `finalText` is `null`: there is no model
+                // answer, and the awaiting tool's own text is its notification emit, not this run's answer. The flag is
+                // already success-filtered at the projection seam ([ToolRegistry] carries it only for a `Done`
+                // execution), so a failed result can never take this branch and skip the failure/guard paths below.
+                if (result.awaitingUser) {
+                    return finish(
+                        AgentOutcome.AWAITING_USER, null, null, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
+                }
                 if (execution.executed && result.ok) successfulToolExecutions++
-                if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
+                if (guard.tripped) {
+                    return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps, reply.reasoning)
+                }
                 if (errorsSeen.repeatTerminated) {
-                    return finish(AgentOutcome.FAILED, REPEATED_ERROR, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.FAILED, REPEATED_ERROR, null, steps, history, "", spentSteps, reply.reasoning)
                 }
                 if (after.critical) {
                     return finish(
                         AgentOutcome.NO_PROGRESS, LoopPattern.GLOBAL_CIRCUIT_BREAKER.safeCode,
-                        null, steps, history, "", spentSteps,
+                        null, steps, history, "", spentSteps, reply.reasoning,
                     )
                 }
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
-                    return finish(AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps, reply.reasoning,
+                    )
                 }
-                if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                if (cancelled) {
+                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps, reply.reasoning)
+                }
                 if (spentObservations >= maxObservations) {
-                    return finish(AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps)
+                    return finish(
+                        AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps,
+                        reply.reasoning,
+                    )
                 }
                 if (clock.nowNanos() >= turnDeadlineNanos) {
-                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.DEADLINE, TURN_BUDGET, null, steps, history, "", spentSteps, reply.reasoning)
                 }
             }
         }
@@ -1461,9 +1582,10 @@ class AgentLoop(
      * Whether [text] is a **plan** that should be nudged into execution instead of accepted as the answer.
      *
      * Every condition of R58 must hold: the route allows nudging, this run has already executed a tool successfully,
-     * the text is short enough, it carries a plan marker and no completion marker, and the run is not at its deadline /
-     * step / observation budget. A pure Q&A turn (no successful tool) is never nudged; neither is a text that reports
-     * an outcome. The "identical text after a nudge" rule lives at the call site, where the nudge count is known.
+     * the text is short enough, it carries a plan marker, no completion marker and no [NON_PLAN_MARKERS] wording, and
+     * the run is not at its deadline / step / observation budget. A pure Q&A turn (no successful tool) is never nudged;
+     * neither is a text that reports an outcome or asks the wearer a question. The "identical text after a nudge" rule
+     * lives at the call site, where the nudge count is known.
      */
     private fun shouldPlanNudge(
         text: String,
@@ -1479,6 +1601,8 @@ class AgentLoop(
         if (spentObservations >= maxObservations) return false
         val lower = text.lowercase()
         if (PLAN_COMPLETION_MARKERS.any { text.contains(it) || lower.contains(it) }) return false
+        // 0.5.4 Task 1 (design §6.1.2): a report/question/promise-to-check-later is not this turn's plan.
+        if (NON_PLAN_MARKERS.any { text.contains(it) }) return false
         return planMarkers.any { marker -> text.contains(marker) || lower.contains(marker) }
     }
 
@@ -1487,8 +1611,8 @@ class AgentLoop(
      * stateless and a lone user instruction would be an unpaired turn); the user half is loop scaffolding and
      * [withoutRetryScaffolding] strips the pair before a caller stores the transcript.
      */
-    private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String) {
-        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
+    private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String, reasoning: String? = null) {
+        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT }, reasoning)
         history += ModelHistoryItem.Text(MessageRole.USER, planNudgeInstruction)
     }
 
@@ -1577,10 +1701,19 @@ class AgentLoop(
         history: MutableList<ModelHistoryItem>,
         closingText: String,
         spentSteps: Int,
+        /**
+         * 0.53: the current model turn's reasoning. A closing assistant text added here is the same turn's assistant
+         * half, so it carries that turn's reasoning; a path with no reply passes `null` and nothing is fabricated.
+         */
+        closingReasoning: String? = null,
     ): AgentRun {
         val last = history.lastOrNull()
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
-            history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
+            history += ModelHistoryItem.Text(
+                MessageRole.ASSISTANT,
+                closingText.ifBlank { CLOSED_TURN_TEXT },
+                closingReasoning,
+            )
         }
         lastTranscript = transcriptForStorage(history, runHistoryStart)
         val metrics = AgentMetrics(
@@ -1600,7 +1733,7 @@ class AgentLoop(
         runCatching { metricLine(renderMetric(metrics)) }
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
-            spentObservations, planNudgeCap, metrics,
+            spentObservations, planNudgeCap, metrics, closingReasoning,
         )
     }
 
@@ -1763,8 +1896,8 @@ class AgentLoop(
      * stateless and the transcript alternates, so a lone user instruction would be an unpaired turn. An empty turn
      * gets a placeholder because `ModelHistoryItem.Text` refuses blank text.
      */
-    private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String) {
-        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
+    private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String, reasoning: String? = null) {
+        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT }, reasoning)
         history += ModelHistoryItem.Text(MessageRole.USER, retryInstruction)
     }
 

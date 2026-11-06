@@ -22,7 +22,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.session.WakeAckGate
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
@@ -64,7 +65,6 @@ import com.sheen.rokid.plugin.SystemOneResult
 import com.sheen.rokid.plugin.SystemOneService
 import com.sheen.rokid.plugin.SystemOneStatus
 import com.sheen.rokid.plugin.TaskScope
-import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.storage.ProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
@@ -320,10 +320,11 @@ class DetachedStartTest {
             )
             wiring = SmartWiring(
                 SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                    profileId = profile.id, cooldownMillis = 3000L),
+                    cooldownMillis = 3000L),
                 FixedProfiles(profile), clock, scheduler,
                 isPanelVisible = panelVisible,
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
+                activeProfile = { profile },
             )
             environment = CxrHostEnvironment(
                 clock = clock,
@@ -353,7 +354,7 @@ class DetachedStartTest {
             )
             host = HostRuntime(1, environment)
             root = HostCompositionRoot(
-                host, MemoryProfileRepository(), InertModel(), environment,
+                host, FixedProfiles(profile), InertModel(), environment,
                 hintLink = link,
                 smartWiring = wiring,
                 rokidConnectionFactory = { factoryCalls.incrementAndGet(); connection.also { holder[0] = it } },
@@ -498,6 +499,56 @@ class DetachedStartTest {
             assertTrue("the round stays open", rig.display.closes.isEmpty())
             assertTrue("no panel/show command may leave the phone", rig.connection.sent.isEmpty())
             assertEquals("and no glasses scene may be started", 0, rig.appStarts.get())
+        }
+    }
+
+    /**
+     * A KWS false hit from the acknowledgement's own tail arrives a few hundred ms after the player reports the end
+     * (K70 2026-11-06: 145 ms), so the duplicate is dropped whole while the ack is audible and through its tail -
+     * no second "我在" and no second WakeDetected/turn.
+     */
+    @Test
+    fun aWakeWhileTheAcknowledgementIsAudibleIsDroppedWhole() {
+        Rig(detached = true).use { rig ->
+            rig.attach()
+            rig.start()
+            val acks = mutableListOf<String>()
+            val speak: (String) -> Boolean = { text -> acks += text; true }
+
+            val lines = withP3Sink { captured ->
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                rig.root.wakeAckGate.started(rig.clock.nowNanos())
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                rig.root.wakeAckGate.finished(rig.clock.nowNanos())
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+                captured.toList()
+            }
+
+            assertEquals("the ack must be spoken once", listOf("我在"), acks)
+            assertEquals("the duplicate must not deliver a wake event",
+                1, lines.count { it.startsWith("P3_WAKE word=") })
+            assertEquals("both duplicates are named, count-only",
+                2, lines.count { it == "P3_WAKE suppressed reason=ack_echo" })
+
+            rig.clock.advance(WakeAckGate.DEFAULT_TAIL_NANOS)
+            rig.root.emitWake(rig.host, "伊迪丝", 1.0, ack = speak)
+            assertEquals("after the real end + tail a real second wake is acknowledged",
+                listOf("我在", "我在"), acks)
+        }
+    }
+
+    @Test
+    fun stoppingTheSessionDropsTheAcknowledgementTail() {
+        Rig(detached = true).use { rig ->
+            rig.attach()
+            rig.start()
+            rig.root.wakeAckGate.started(rig.clock.nowNanos())
+            assertTrue("the ack is audible before the stop", rig.root.wakeAckGate.shouldSuppress(rig.clock.nowNanos()))
+
+            rig.root.stop()
+
+            assertFalse("the next session must not inherit the ack tail",
+                rig.root.wakeAckGate.shouldSuppress(rig.clock.nowNanos()))
         }
     }
 

@@ -25,7 +25,7 @@ import java.util.Base64
  * are `image_url` parts on `user` messages, the only role that may carry them.
  */
 class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
-    val support = ProtocolSupport("OPENAI_CHAT_COMPLETIONS",
+    val support = ProtocolSupport(ProtocolIds.OPENAI_CHAT_COMPLETIONS,
         setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO), setOf(OutputModality.TEXT))
 
     /**
@@ -37,7 +37,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
      * followed by tool role messages.
      */
     fun encode(profile: ModelProfile, frame: RequestFrame, audioParts: List<InputPart.Audio> = emptyList()): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
 
         val resolvedAudios = audioParts.map { part ->
             media.resolveAudio(part.localRef)
@@ -49,7 +49,22 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            put("max_tokens", profile.maxOutputTokens)
+            // 0.53 design (revised) §T3/§T5: the user switch is the only behaviour switch (no family guess). With it
+            // on, the official DeepSeek fields go out on every request — tools included — and `max_tokens` is
+            // **omitted** so the provider's documented 64K/128K default applies. With it off, no thinking field is
+            // sent at all: the general OpenAI body, exactly the pre-0.5.2 shape, keeps the existing cap.
+            if (!profile.thinkingEnabled) {
+                put("max_tokens", profile.maxOutputTokens)
+                // 0.5.4: an explicit off is required where the provider's default is thinking on; omitting the field
+                // left DeepSeek reasoning, so the off switch was a no-op there.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("thinking", buildJsonObject { put("type", "disabled") })
+                    put("reasoning_effort", "none")
+                }
+            } else {
+                put("thinking", buildJsonObject { put("type", "enabled") })
+                put("reasoning_effort", reasoningEffort(profile))
+            }
             if (frame.tools.isNotEmpty()) {
                 put("tools", buildJsonArray { frame.tools.forEach { add(toolDescriptor(it)) } })
                 put("tool_choice", "auto")
@@ -146,6 +161,16 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
         result
     } catch (_: Exception) { null }
 
+    /**
+     * 0.53 design (revised) §T5: the official effort names for the three catalog levels. Only called when the user
+     * switch is on; the switched-off request carries no field at all.
+     */
+    private fun reasoningEffort(profile: ModelProfile): String = when (profile.thinkingEffort) {
+        ThinkingEffort.LOW -> "low"
+        ThinkingEffort.HIGH -> "high"
+        ThinkingEffort.MAX -> "max"
+    }
+
     private fun toolDescriptor(spec: ToolSpec) = buildJsonObject {
         put("type", "function")
         put("function", buildJsonObject {
@@ -160,7 +185,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
     }
 
     fun encode(profile: ModelProfile, budgeted: BudgetedRequest): ByteArray {
-        require(profile.protocolId == support.id)
+        require(ProtocolIds.canonical(profile.protocolId) == support.id)
         val textParts = budgeted.request.input.filterIsInstance<InputPart.Text>()
         val imageParts = budgeted.request.input.filterIsInstance<InputPart.Image>()
         val audioParts = budgeted.request.input.filterIsInstance<InputPart.Audio>()
@@ -181,12 +206,36 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
-            // when the request declares no cap of its own (every pre-0.3 caller).
-            put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            // 0.3 design §5.2: with the switch off the turn policy's cap wins, and the profile's value is only the
+            // window reservation used when the request declares no cap of its own. 0.53 (revised) §T5: with the
+            // switch on no `max_tokens` is sent at all, so the provider's official 64K/128K default applies.
+            if (!profile.thinkingEnabled) {
+                put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+                // The same mapping as the legacy overload — the live path must not drift; an explicit off is required
+                // where the provider defaults to thinking on.
+                if (profile.needsExplicitThinkingDisable()) {
+                    put("thinking", buildJsonObject { put("type", "disabled") })
+                    put("reasoning_effort", "none")
+                }
+            } else {
+                put("thinking", buildJsonObject { put("type", "enabled") })
+                put("reasoning_effort", reasoningEffort(profile))
+            }
+            if (budgeted.request.tools.isNotEmpty()) {
+                // 0.52 live-path repair: the budgeted overload dropped the tool table that the legacy frame overload
+                // always sent, so a live Chat tool turn reached the endpoint unable to call anything.
+                put("tools", buildJsonArray { budgeted.request.tools.forEach { add(toolDescriptor(it)) } })
+                put("tool_choice", "auto")
+            }
             put("messages", buildJsonArray {
+                // 0.52 live-path repair: the system slot was missing from the budgeted overload, so the live Chat
+                // request sent no instructions at all. Message order stays system -> history -> current turn.
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", budgeted.request.instructions)
+                })
                 // History, including the tool round-trip the stateless endpoint needs echoed back.
-                historyToMessages(budgeted.request.history).forEach { add(it) }
+                historyToMessages(budgeted.request.history, budgeted.request.tools.isNotEmpty()).forEach { add(it) }
                 // Current turn: text + optional image + optional audio. An empty input is a history-only continuation
                 // (the request that follows a tool round): the tool output stays last and no empty user message is
                 // appended after it.
@@ -220,13 +269,22 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
      * message between assistant(`tool_calls`) and one of its `tool` replies is the pairing Qwen documents as invalid
      * and D9 warns against, so a batch renders as `assistant(tool_calls)` → all `tool` replies → the image messages.
      * A one-output tool round (the common case) is therefore exactly `tool` → user image.
+     *
+     * 0.53 design (revised) §T4: when the request carries `tools`, each assistant item's captured `reasoning` is
+     * replayed as `reasoning_content` on the very message that carries its text and calls. DeepSeek requires every past
+     * assistant turn's reasoning in a tool-bearing request, and the capture is not gated on a capability guess — a turn
+     * whose switch was off may still have been given reasoning by the server. Without `tools` the field is omitted (the
+     * provider ignores it, and the history with no returned reasoning stays byte-identical to 0.5.2). Because the field
+     * rides the assistant message, a message the caller dropped takes its reasoning with it.
      */
-    private fun historyToMessages(history: List<ModelHistoryItem>): JsonArray {
+    private fun historyToMessages(history: List<ModelHistoryItem>, replayReasoning: Boolean): JsonArray {
         val messages = mutableListOf<JsonObject>()
         // User messages carrying a finished tool run's images; emitted once that run of replies is complete.
         val pendingImages = mutableListOf<JsonObject>()
         // An assistant text waits for the calls directly after it; it becomes that message's content.
         var assistantText: String? = null
+        // 0.53: the reasoning of the waiting assistant turn, replayed beside that message only.
+        var assistantReasoning: String? = null
         val calls = mutableListOf<ModelHistoryItem.ToolCall>()
 
         fun flushImages() {
@@ -235,24 +293,33 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             pendingImages.clear()
         }
 
+        fun reasoningContent(): JsonElement? =
+            if (replayReasoning) assistantReasoning?.let { JsonPrimitive(it) } else null
+
         fun flushCalls() {
             if (calls.isEmpty()) return
+            val reasoning = reasoningContent()
             messages += buildJsonObject {
                 put("role", "assistant")
                 put("content", assistantText?.let { JsonPrimitive(it) } ?: JsonNull)
+                if (reasoning != null) put("reasoning_content", reasoning)
                 put("tool_calls", JsonArray(calls.map(::assistantToolCall)))
             }
             calls.clear()
             assistantText = null
+            assistantReasoning = null
         }
 
         fun flushText() {
             val text = assistantText ?: return
+            val reasoning = reasoningContent()
             messages += buildJsonObject {
                 put("role", "assistant")
                 put("content", text)
+                if (reasoning != null) put("reasoning_content", reasoning)
             }
             assistantText = null
+            assistantReasoning = null
         }
 
         fun queueImages(output: ModelHistoryItem.ToolOutput) {
@@ -281,6 +348,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                         // Two assistant texts in a row: the earlier one is its own turn and goes out now.
                         flushText()
                         assistantText = item.text
+                        assistantReasoning = item.reasoning
                     } else {
                         flushText()
                         messages += buildJsonObject {

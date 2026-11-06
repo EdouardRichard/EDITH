@@ -13,6 +13,10 @@ object ModelEndpoint {
     fun chatCompletions(baseUrl: String, allowLocalHttp: Boolean = false): HttpUrl =
         resolve(baseUrl, "chat/completions", allowLocalHttp)
 
+    /** 0.52 design §5.4: the catalog lists models through `GET {base}/models`, with the same URL rules. */
+    fun models(baseUrl: String, allowLocalHttp: Boolean = false): HttpUrl =
+        resolve(baseUrl, "models", allowLocalHttp)
+
     private fun resolve(baseUrl: String, terminalSegment: String, allowLocalHttp: Boolean): HttpUrl {
         fun reject(): Nothing = throw ContractError.ConfigurationRejected("Model endpoint invalid")
         val uri = try { URI(baseUrl) } catch (_: Exception) { reject() }

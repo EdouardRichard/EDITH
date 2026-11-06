@@ -6,6 +6,12 @@ enum class InputModality { TEXT, IMAGE, AUDIO }
 enum class OutputModality { TEXT, AUDIO }
 enum class VerificationState { Unverified, Verified, Failed }
 
+/**
+ * 0.52 design §5.7: the three reasoning levels the DeepSeek protocol exposes. The profile carries the user's choice so
+ * the adapters can map it without the catalog types (which are app-only) leaking into the contract.
+ */
+enum class ThinkingEffort { LOW, HIGH, MAX }
+
 data class CapabilityVerification(
     val profileRevision: Long,
     val operation: String,
@@ -36,6 +42,15 @@ data class ModelProfile(
     val inputs: Set<InputModality>,
     val outputs: Set<OutputModality>,
     val verifications: List<CapabilityVerification>,
+    /** 0.52 design §5.7: reasoning is off by default so a catalog projection leaves existing latency unchanged. */
+    val thinkingEnabled: Boolean = false,
+    val thinkingEffort: ThinkingEffort = ThinkingEffort.LOW,
+    /**
+     * Storage-only compatibility field, kept so a catalog stored by 0.52 still round-trips its old value. **0.5.3
+     * ignores it**: whether thinking is requested is decided by [thinkingEnabled] alone, and the adapters gate on that
+     * switch (no adapter reads this bit). Any family or protocol rule lives in the catalog projection, not here.
+     */
+    val thinkingSupported: Boolean = false,
 ) {
     init {
         require(listOf(id, name, service, baseUrl, protocolId, model, secret.id).all { it.isNotBlank() })
@@ -100,8 +115,25 @@ data class ImageRef(
  * be echoed back beside its result.
  */
 sealed interface ModelHistoryItem {
-    data class Text(val role: MessageRole, val text: String) : ModelHistoryItem {
-        init { require(text.isNotBlank()) }
+    /**
+     * 0.53: DeepSeek thinking mode returns a chain of thought beside the answer. The reasoning belongs to the
+     * assistant message that produced it, so it rides on this item instead of a sibling variant: a trimmer or a store
+     * that drops the message drops its reasoning with it, which is the only pairing DeepSeek's replay rule accepts.
+     * It is provider-native, never translated across protocols, kept in session memory only, and never rendered in
+     * `toString()` or any log line.
+     */
+    data class Text(
+        val role: MessageRole,
+        val text: String,
+        val reasoning: String? = null,
+    ) : ModelHistoryItem {
+        init {
+            require(text.isNotBlank())
+            require(reasoning == null || reasoning.isNotBlank())
+            require(reasoning == null || role == MessageRole.ASSISTANT) {
+                "only an assistant turn can carry reasoning"
+            }
+        }
         override fun toString() = "Text(role=$role, redacted)"
     }
     data class ToolCall(val callId: String, val name: String, val argsJson: String,
@@ -183,12 +215,52 @@ data class ModelUsage(
     }
 }
 
+/**
+ * 0.5.4 Task 8 (§6.2.2): the count-only latency of **one** model request, measured by the client that owns the
+ * request's three stages.
+ *
+ * All three are milliseconds from the moment the request was actually sent, and `null` means the stage was never
+ * reached — a request that a watchdog killed before the provider answered has no first byte and must not report a
+ * fabricated `0`. [streamMillis] is the whole request from send to its terminal, so it covers [ttfbMillis] and
+ * [firstTokenMillis]. No text, URL, profile id or provider body ever rides on this type.
+ */
+data class ModelRequestTiming(
+    val ttfbMillis: Long? = null,
+    val firstTokenMillis: Long? = null,
+    val streamMillis: Long? = null,
+) {
+    init {
+        require(ttfbMillis == null || ttfbMillis >= 0)
+        require(firstTokenMillis == null || firstTokenMillis >= 0)
+        require(streamMillis == null || streamMillis >= 0)
+    }
+}
+
 sealed interface ModelStreamEvent {
     data class TextDelta(val requestId: String, val text: String) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
         override fun toString() = "TextDelta(redacted)"
     }
-    data class Terminal(val requestId: String, val end: ModelEnd, val usage: ModelUsage?, val safeCode: String?) : ModelStreamEvent {
+    /**
+     * 0.53: one chunk of DeepSeek's chain of thought. It is internal state, not answer text: the display never renders
+     * it, the agent loop stores it beside the assistant turn and the adapter replays it with the next request that
+     * carries tools. Redacted in diagnostics like every other event.
+     */
+    data class ReasoningDelta(val requestId: String, val text: String) : ModelStreamEvent {
+        init { require(requestId.isNotBlank() && text.isNotBlank()) }
+        override fun toString() = "ReasoningDelta(redacted)"
+    }
+    /**
+     * The request's last word. [timing] is the client's own count-only latency (0.5.4 Task 8), or `null` for a
+     * composition that does not measure it — the default keeps every pre-Task-8 producer and test unchanged.
+     */
+    data class Terminal(
+        val requestId: String,
+        val end: ModelEnd,
+        val usage: ModelUsage?,
+        val safeCode: String?,
+        val timing: ModelRequestTiming? = null,
+    ) : ModelStreamEvent {
         init { require(requestId.isNotBlank()) }
     }
     /** A fragment of the arguments document of the call the model is currently emitting. */

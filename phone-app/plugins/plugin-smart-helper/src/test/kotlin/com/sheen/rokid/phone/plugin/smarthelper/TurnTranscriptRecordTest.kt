@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.SegmentOrigin
+import com.sheen.rokid.agent.SegmentRole
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
@@ -31,6 +32,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -139,6 +141,30 @@ class TurnTranscriptRecordTest {
         assertFalse(entry.containsKey("images"), "a plain output must not invent an images member: ${segment.text}")
         assertEquals("call-1", entry["callId"]?.jsonPrimitive?.content)
         assertEquals("done", entry["output"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `an assistant text carries its reasoning through toSegment`() {
+        // M10 review gap: `toSegment()` is the one channel that puts the store's reasoning back into a request frame.
+        // The renderer already did this; nothing pinned it, so a later simplification could silently drop the chain of
+        // thought and the DeepSeek replay rule would break without a failing test.
+        val item = ModelHistoryItem.Text(MessageRole.ASSISTANT, "答", reasoning = "旧想")
+
+        val segment = item.toSegment()
+
+        assertEquals(SegmentOrigin.TRANSCRIPT, segment.origin)
+        assertEquals(SegmentRole.ASSISTANT, segment.role)
+        assertTrue(segment.trusted)
+        assertEquals("答", segment.text)
+        assertEquals("旧想", segment.reasoning, "the assistant reasoning must survive the frame renderer")
+    }
+
+    @Test
+    fun `a user text never gains reasoning through toSegment`() {
+        val segment = ModelHistoryItem.Text(MessageRole.USER, "问").toSegment()
+
+        assertEquals(SegmentRole.USER, segment.role)
+        assertNull(segment.reasoning)
     }
 
     // ------------------------------------------------------------ store → frame → gateway
@@ -396,6 +422,53 @@ class TurnTranscriptRecordTest {
             history.count { it is ModelHistoryItem.ToolCall },
             "the reused call id must not drop this run's call from the store: $history",
         )
+    }
+
+    // ------------------------------------------------------------ 0.53: reasoning rides the assistant turn
+
+    @Test
+    fun `an assistant reply keeps its reasoning in the store`() {
+        val stores = stores()
+        val rig = rig(stores)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.ReasoningDelta(request.requestId, "想"))
+            streamText(request, listener, "现在九点。")
+        }
+
+        rig.wakeAndFinal("现在几点了")
+
+        val closing = stores.getValue(ContextRoute.WAKE).history().last()
+        val text = assertIs<ModelHistoryItem.Text>(closing, "the turn must close on assistant text")
+        assertEquals("现在九点。", text.text)
+        assertEquals("想", text.reasoning, "the store's closing replacement must keep the run's final reasoning")
+    }
+
+    @Test
+    fun `a tool round and its closing reply keep their own reasoning`() {
+        val stores = stores()
+        val rig = rig(stores)
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(ModelStreamEvent.ReasoningDelta(modelRequest.requestId, "想1"))
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                listener(ModelStreamEvent.ReasoningDelta(modelRequest.requestId, "想2"))
+                streamText(modelRequest, listener, "看到了。")
+            }
+        }
+
+        rig.wakeAndFinal("看一下屏幕")
+
+        val assistantTexts = stores.getValue(ContextRoute.WAKE).history()
+            .filterIsInstance<ModelHistoryItem.Text>()
+            .filter { it.role == MessageRole.ASSISTANT }
+        assertEquals(listOf("想1", "想2"), assistantTexts.map { it.reasoning }, assistantTexts.toString())
+        assertEquals("看到了。", assistantTexts.last().text)
     }
 
     // ------------------------------------------------------------ the fallback path

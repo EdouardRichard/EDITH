@@ -85,6 +85,33 @@ class UnlockGatedActionsTest {
     }
 
     @Test
+    fun aDeepLinkIsGatedWithoutWaitingForAccessibility() {
+        val calls = mutableListOf<Boolean>()
+        val (surface, inner) = gated(listOf("deep_link"), calls = calls)
+
+        surface.execute("deep_link", """{"uri":"https://example.com","package":"com.example.app"}""")
+
+        assertEquals("deep_link dispatches behind the keyguard just like open_app/open_url", listOf(false), calls)
+        assertEquals(listOf("deep_link"), inner.executed)
+    }
+
+    @Test
+    fun aLockedPhoneRefusesADeepLinkBeforeTheIntentIsDispatched() {
+        val (surface, inner) = gated(listOf("deep_link"), outcome = UnlockOutcome.STILL_LOCKED)
+
+        val result = surface.execute("deep_link", """{"uri":"https://example.com"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("{}", result.detail)
+        assertEquals("LOCKED_UNLOCK_FAILED:STILL_LOCKED", result.execution?.code)
+        assertEquals(ToolOutcome.Refused, result.execution?.outcome)
+        assertEquals(true, result.execution?.recoverable)
+        assertEquals(false, result.execution?.accepted)
+        assertEquals(false, result.execution?.applied)
+        assertTrue("a locked phone must never dispatch the ACTION_VIEW", inner.executed.isEmpty())
+    }
+
+    @Test
     fun aRefusedUnlockKeepsTheCatalogRefusalShapeAndNeverReachesTheTool() {
         val (surface, inner) = gated(listOf("open_app"), outcome = UnlockOutcome.STILL_LOCKED)
 

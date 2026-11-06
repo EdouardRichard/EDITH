@@ -8,3 +8,9 @@ phone-app/assistant/model-runtime/src/test/resources/responses/*.sse text eol=lf
 # Gradle wrapper: the shell script must stay LF, the Windows launcher must stay CRLF.
 gradlew text eol=lf
 gradlew.bat text eol=crlf
+
+# Binary build inputs and README media: never apply EOL conversion.
+*.aar binary
+*.png binary
+*.gif binary
+*.mp4 binary

@@ -19,6 +19,11 @@ fun estimateTokens(text: String): Int = TokenMeter.estimate(text)
  *
  * A tool call contributes its arguments and a tool output its payload; the identities are bookkeeping the model does
  * not read, so counting them would inflate an estimate without bounding anything real.
+ *
+ * 0.53: an assistant text's `reasoning` is **deliberately excluded** here. This string is also the text a compression
+ * summary and a memory write are composed from ([ContextCompressor]), and a chain of thought must never become either
+ * — the summary stores what was said, not what the model thought. The reasoning is priced into the reported size by
+ * [estimatedLength] instead, so `P3_CONTEXT historyChars` still reflects the real request payload.
  */
 internal fun ModelHistoryItem.estimatedText(): String = when (this) {
     is ModelHistoryItem.Text -> text
@@ -29,5 +34,9 @@ internal fun ModelHistoryItem.estimatedText(): String = when (this) {
 /**
  * The same contribution, as a **size**. `P3_CONTEXT` reports how much of a prompt a turn carried, and a size is what a
  * device log may hold: the text itself is the user's words and never appears in one.
+ *
+ * 0.53: an assistant text's `reasoning` is sent beside it, so it is counted here even though [estimatedText] leaves it
+ * out of the summary/memory rendering.
  */
-internal fun ModelHistoryItem.estimatedLength(): Int = estimatedText().length
+internal fun ModelHistoryItem.estimatedLength(): Int =
+    estimatedText().length + ((this as? ModelHistoryItem.Text)?.reasoning?.length ?: 0)

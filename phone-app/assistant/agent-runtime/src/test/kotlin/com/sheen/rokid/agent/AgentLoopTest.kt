@@ -1140,6 +1140,7 @@ class AgentLoopTest {
         val run = newLoop(gateway, clock = FakeClock(nowNanos = 100)).run(request(deadlineNanos = 100))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "the loop's own budget must not read as a request deadline")
         assertTrue(gateway.requests.isEmpty())
     }
 
@@ -1156,8 +1157,68 @@ class AgentLoopTest {
             .run(request(deadlineNanos = 5))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "a step over the turn budget is TURN_BUDGET, not REQUEST_DEADLINE")
         assertEquals(1, run.steps.size)
         assertEquals(1, gateway.requests.size)
+    }
+
+    /**
+     * A gateway that burns the request deadline it was given and reports it the way the transport does: `DEADLINE`
+     * from `ModelClientGateway` or `REQUEST_DEADLINE` from `ControlledModelClient`. Only the loop knows whether that
+     * deadline was the turn budget or a smaller per-request cap, so the mapping is decided there, not here.
+     */
+    private class DeadlineExhaustingGateway(
+        private val clock: FakeClock,
+        private val safeCode: String,
+    ) : ModelGateway {
+        val requests = mutableListOf<GatewayTurn>()
+
+        override fun turn(request: GatewayTurn): GatewayReply {
+            requests += request
+            clock.nowNanos = request.deadlineNanos + 1
+            return reply(terminal = ModelEnd.DEADLINE, safeCode = safeCode)
+        }
+    }
+
+    @Test fun `a request that runs out the whole turn budget is TURN_BUDGET, not REQUEST_DEADLINE`() {
+        // Review I-1 (Task 7): the per-request cap is larger than what is left of the budget, so the deadline handed to
+        // the gateway IS the turn deadline. The transport can only report its own REQUEST_DEADLINE; the loop must name
+        // the run's own budget so the main exhaustion path is not read as a request timeout.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "REQUEST_DEADLINE")
+
+        val run = newLoop(gateway, clock = clock)
+            .run(request(deadlineNanos = 300_000_000_000L, requestTimeoutNanos = 600_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "回合预算耗尽必须与单次请求超时区分")
+        assertEquals(1, gateway.requests.size)
+    }
+
+    @Test fun `a request that runs out its own smaller cap keeps REQUEST_DEADLINE`() {
+        // The companion guard: a request cap below the remaining budget is a genuine request timeout and must not be
+        // relabelled. The gateway stops one nanosecond past that cap, still well inside the turn budget.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "REQUEST_DEADLINE")
+
+        val run = newLoop(gateway, clock = clock)
+            .run(request(deadlineNanos = 300_000_000_000L, requestTimeoutNanos = 100_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("REQUEST_DEADLINE", run.safeCode, "单次请求上限先到，不能改写成回合预算")
+        assertTrue(clock.nowNanos < 300_000_000_000L, "the turn budget itself was not reached")
+    }
+
+    @Test fun `the gateway's own DEADLINE on a turn-bound request is TURN_BUDGET`() {
+        // requestTimeoutNanos = 0 keeps the old shape: the turn deadline is also the request cap. `ModelClientGateway`
+        // reports that expiry as DEADLINE; it is still this run's budget running out.
+        val clock = FakeClock(0)
+        val gateway = DeadlineExhaustingGateway(clock, safeCode = "DEADLINE")
+
+        val run = newLoop(gateway, clock = clock).run(request(deadlineNanos = 300_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome)
+        assertEquals("TURN_BUDGET", run.safeCode, "零上限时请求期限就是回合期限，超时即回合预算")
     }
 
     @Test fun `cancel during a step ends the run as cancelled at the next check`() {
@@ -1531,6 +1592,66 @@ class AgentLoopTest {
         )
     }
 
+    // ------------------------------------------------------------ 0.53: reasoning stays with its assistant turn
+
+    @Test fun `a tool round keeps the reply reasoning in history`() {
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(text = "先查", calls = listOf(call("c1", "lookup")), reasoning = "想"),
+                reply(text = "答案"),
+            ),
+        )
+        val executor = executorOf("lookup").apply { outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") } }
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        val second = gateway.requests[1].history
+        val opener = second.filterIsInstance<ModelHistoryItem.Text>().single { it.role == MessageRole.ASSISTANT }
+        assertEquals("想", opener.reasoning, "the tool-round assistant text must keep its reasoning: $second")
+        assertEquals("先查", opener.text)
+    }
+
+    @Test fun `the final answer reasoning reaches the run`() {
+        val gateway = ScriptedGateway(listOf(reply(text = "答案", reasoning = "想")))
+
+        val run = newLoop(gateway).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("答案", run.finalText)
+        assertEquals("想", run.finalReasoning, "the closing answer's reasoning must ride the run")
+    }
+
+    @Test fun `a retry scaffold keeps the reasoning of the empty turn`() {
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(text = "半句", terminal = ModelEnd.INCOMPLETE, reasoning = "想"),
+                reply(text = "答案"),
+            ),
+        )
+
+        newLoop(gateway).run(request())
+
+        val retried = gateway.requests[1].history
+        val assistant = retried.filterIsInstance<ModelHistoryItem.Text>()
+            .filter { it.role == MessageRole.ASSISTANT }
+        assertEquals("想", assistant.single().reasoning, "the retried assistant half must keep its reasoning: $retried")
+    }
+
+    @Test fun `the closing text added by finish carries the reasoning of the failed turn`() {
+        // The failed turn produced reasoning but no text, so the loop's own closing placeholder is the assistant half
+        // that reaches the transcript; it must keep the reasoning the model did stream.
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "", terminal = ModelEnd.FAILED, safeCode = "provider_error", reasoning = "想")),
+        )
+
+        val run = newLoop(gateway).run(request())
+
+        val closing = run.transcript.last()
+        assertIs<ModelHistoryItem.Text>(closing, "the run must close on assistant text: ${run.transcript}")
+        assertEquals("想", closing.reasoning)
+        assertEquals("想", run.finalReasoning)
+    }
+
     // ------------------------------------------------- the confirmation wait is not the turn's budget (D49)
 
     /** A confirmation channel that spends the **user's** time: the clock moves while it waits. */
@@ -1761,6 +1882,7 @@ class AgentLoopTest {
             .run(request(deadlineNanos = 1_000_000_000L))
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome, "只有等人的时间被排除，机器的时间仍要计入预算")
+        assertEquals("TURN_BUDGET", run.safeCode, "机器时间耗尽的是回合预算，不是某一次请求的期限")
         assertEquals(1, gateway.requests.size)
     }
 
@@ -2033,5 +2155,93 @@ class AgentLoopTest {
         newLoop(gateway, metricLine = { lines += it }).run(request())
 
         assertTrue(p4PolicyLines(lines).isEmpty(), "an unknown name is not a policy decision: $lines")
+    }
+
+    // ---------------------------------------------------------------- awaiting user (0.5.4 Task 2)
+
+    @Test fun `an awaiting-user tool result ends the run as AWAITING_USER`() {
+        // 0.5.4 Task 2: a successful tool that declares it is waiting for the wearer terminalizes the run without
+        // another model turn. The assistant text and the tool output stay in history, exactly as for a TERMINAL scope.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "已问用户", awaitingUser = true) }
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "想继续吗？", calls = listOf(call("c1", "notify_user")))),
+        )
+
+        val loop = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.AWAITING_USER, run.outcome)
+        assertNull(run.finalText, "waiting for the wearer has no model answer; the tool's text is its own notification")
+        assertEquals(1, gateway.requests.size, "an awaiting-user result must not ask the model again")
+        assertTrue(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "想继续吗？") in run.transcript,
+            "the assistant text that opened the round stays in history: ${run.transcript}",
+        )
+        assertTrue(
+            ModelHistoryItem.ToolOutput("c1", doneEnvelope("已问用户")) in run.transcript,
+            "the tool output stays in history: ${run.transcript}",
+        )
+    }
+
+    @Test fun `an ordinary successful tool result still completes normally`() {
+        // The regression guard for the default: a tool that does not set the flag keeps the pre-0.5.4 behaviour.
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "answer")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("answer", run.finalText)
+        assertEquals(2, gateway.requests.size)
+    }
+
+    @Test fun `a failed tool result carrying awaitingUser does not end the run as AWAITING_USER`() {
+        // 0.5.4 Task 2 review fix: the flag means "set on a **successful** result". A failed execution that carries it
+        // anyway must not skip the no-progress guard, the repeated-error terminalization or the global circuit breaker:
+        // it falls through the ordinary failure path and the model gets its next turn.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "已问用户", awaitingUser = true) }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "没问出去")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(
+            AgentOutcome.COMPLETED, run.outcome,
+            "a failed execution never awaits the wearer: ${run.outcome}",
+        )
+        assertEquals("没问出去", run.finalText)
+        assertNull(run.safeCode)
+        assertEquals(2, gateway.requests.size, "a failed tool must not suppress the next model turn")
+        assertEquals(AgentStep(1, "notify_user", "Failed"), run.steps.single(), "the failed tool step stays visible")
+    }
+
+    @Test fun `awaiting user is not a failure and keeps the tool output in history`() {
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, """{"awaiting_user":true}""", awaitingUser = true)
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(text = "等你回复", calls = listOf(call("c1", "notify_user")))),
+        )
+
+        val loop = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.AWAITING_USER, run.outcome)
+        assertNull(run.safeCode, "waiting for the wearer is not a failure")
+        assertEquals(listOf(AgentStep(1, "notify_user", "ok")), run.steps)
+        assertTrue(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "等你回复") in run.transcript,
+            "the assistant text stays in history: ${run.transcript}",
+        )
+        val toolOutput = assertIs<ModelHistoryItem.ToolOutput>(run.transcript.last())
+        assertEquals("c1", toolOutput.callId)
+        assertEquals(doneEnvelope("""{"awaiting_user":true}"""), toolOutput.output)
     }
 }
