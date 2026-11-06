@@ -137,9 +137,11 @@ class ProductionBudgetCompressionTest {
             rig.plugin.historyBudgetTokensForTest(),
             "the profile-derived policy did not reach the session's compressor",
         )
-        assertTrue(
-            rig.plugin.historyBudgetTokensForTest() in 1..100,
-            "the tuning seam must produce a small, exact allowance",
+        // Exact, not a 1..100 range: floor(hardInputLimit * 0.01) for the profile built above.
+        assertEquals(
+            profile.inputBudgetTokens / 100,
+            rig.plugin.historyBudgetTokensForTest(),
+            "the 0.01 threshold must floor the hard input, not produce a lookalike allowance",
         )
     }
 

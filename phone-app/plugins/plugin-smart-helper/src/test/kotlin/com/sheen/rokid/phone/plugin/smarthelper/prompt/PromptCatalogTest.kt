@@ -215,6 +215,84 @@ class PromptCatalogTest {
     }
 
     @Test
+    fun `the operating rules are exact and never await progress or license a third attempt`() {
+        val operating = promptText("core/10-operating.md")
+        val awaiting = operating.lines().first { it.startsWith("4. ") }
+        val twoFailures = operating.lines().first { it.startsWith("5. ") }
+
+        // A substring ("进度", "两次") would also pass on an inverted rule. The exact sentences pin the direction.
+        assertEquals(
+            "4. 需要用户答复才能继续时，用 notify_user 提问并带 awaiting_reply=true，然后结束本回合等用户回答；" +
+                "进度汇报、结果告知不要用它。",
+            awaiting,
+            "notify_user.awaiting_reply must only be used for a question that ends the turn",
+        )
+        assertEquals(
+            "5. 同一个动作连续失败两次就停：换一种策略，或向用户说明卡在哪里并请用户选择，不要重复同一调用。",
+            twoFailures,
+            "two consecutive failures must stop the identical call, not license another one",
+        )
+        assertTrue("进度汇报、结果告知不要用它" in awaiting, "progress/result reporting must not await the user")
+        assertFalse(
+            Regex("""进度[^。\n]*awaiting_reply=true""").containsMatchIn(operating),
+            "no rule may attach awaiting_reply=true to progress reporting",
+        )
+        assertFalse("第三次" in twoFailures, "the retry rule must not describe or allow a third attempt")
+        assertFalse("继续重试" in twoFailures, "a repeated failure changes strategy instead of retrying again")
+    }
+
+    @Test
+    fun `the safety section is the single confirmation authority and covers order transactions`() {
+        val entry = PromptCatalog.manifest().single { it.file == "core/30-safety.md" }
+        val safety = promptText("core/30-safety.md")
+        val body = safety.lines().drop(1).filter { it.isNotBlank() }
+
+        assertEquals("2", entry.version, "the confirmation-authority edit must bump core.safety's revision")
+        assertEquals(
+            "- 本节是「必须确认」集合的唯一权威；其他段落只引用本节，不得另设例外。",
+            body[0],
+            "30-safety must name itself the only confirmation authority instead of exposing a second rule set",
+        )
+        assertEquals(
+            "- 可逆、低风险的操作可以直接执行；删除、卸载、支付、下单、改单、订单状态变化（包括 deep_link 打开的交易页）、" +
+                "发送、修改权限或系统设置等不可逆或影响他人的操作，必须先向用户确认，并说明后果。",
+            body[1],
+            "placing, changing or state-changing an order is irreversible and must be in the must-confirm set",
+        )
+        assertFalse("不包括下单" in safety, "the blanket order carve-out contradicted 15-app-entry/20-tools")
+        assertFalse("不包括" in safety, "the authority section may not carry an exception")
+    }
+
+    @Test
+    fun `the app entry transaction rule defers to the safety authority without inventing a URI`() {
+        val entry = promptText("core/15-app-entry.md")
+        val transactionRule = entry.lines().first { it.startsWith("4. ") }
+
+        assertEquals(
+            "4. 有交易后果的深链先确认。支付、下单、改单、订单状态变化等会扣款或改变订单状态的深链，" +
+                "属于「安全与确认」的必确认集合；先向用户说明并确认，再打开；打开后仍要验证。",
+            transactionRule,
+            "the transactional deep-link rule must defer to 30-safety and keep confirmation before opening",
+        )
+        assertFalse("不包括下单" in entry, "the app-entry rule must not restate the old carve-out")
+        assertFalse("://" in entry, "a concrete URI example would invite copying an invented target")
+    }
+
+    @Test
+    fun `the tools discipline defers transactional deep links to the safety authority`() {
+        val tools = promptText("core/20-tools.md")
+        val deepLinkRule = tools.lines().single { it.startsWith("- deep_link ") }
+
+        assertEquals(
+            "- deep_link 只接受 http(s) 或带 package 的自定义 scheme；uri/package 只能来自 SKILL、用户明确给出或可证实候选，" +
+                "不要编造；有交易后果的深链（支付、下单、改单、订单状态变化）属于「安全与确认」的必确认集合，先按该节确认。",
+            deepLinkRule,
+            "the tools section must reference the one confirmation authority, not define a competing set",
+        )
+        assertFalse("不包括下单" in tools, "the tools section must not restate the old carve-out")
+    }
+
+    @Test
     fun `the manifest rejects an unknown kind`() {
         assertFailsWith<IllegalArgumentException> {
             PromptCatalog.parseManifest("x\tcore/00-identity.md\tNOT_A_KIND\t1\tdescription") { "text" }

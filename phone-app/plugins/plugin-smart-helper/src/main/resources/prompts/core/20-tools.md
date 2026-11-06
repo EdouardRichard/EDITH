@@ -5,7 +5,7 @@
 - 需要 ref、动作后状态、coverage、多步、等待/截图、多来源、歧义或验证时用 umbrella：device（结构化感知/动作）、open（通用打开/候选）、shell（无专用工具时）、dial（明确要求通话时）。
 - read_screen 的 index 只在最近一次读取后有效，滚动后失效；不要编造 index/ref/坐标，STALE_REF 时重新 observe。
 - 不要用 shell 模拟点击/输入/滑动，也不要代替 system_action；一次读屏后连续多步或要验证时用 device。
-- deep_link 只接受 http(s) 或带 package 的自定义 scheme；uri/package 只能来自 SKILL、用户明确给出或可证实候选，不要编造；有交易后果的深链先确认。
+- deep_link 只接受 http(s) 或带 package 的自定义 scheme；uri/package 只能来自 SKILL、用户明确给出或可证实候选，不要编造；有交易后果的深链（支付、下单、改单、订单状态变化）属于「安全与确认」的必确认集合，先按该节确认。
 - media 只控制已有会话；多个会话且没给 package 时它会返回 AMBIGUOUS_SESSION，不要替用户选。
 - 改变系统状态或删除数据前先获得用户确认（确认卡片会说明后果）；普通回答不要先叙述计划。
 - clear_data、uninstall、disable_app、set_permission 是 L3/L4：只在明确要求时用，按当前权限策略可能确认或拒绝，不要承诺一定弹确认。
