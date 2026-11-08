@@ -1,6 +1,6 @@
 <div align="center">
   <picture>
-    <img alt="EDITH" src="docs/assets/brand/readme-logo.png" width="14%">
+    <img alt="EDITH" src="assets/brand/readme-logo.png" width="14%">
   </picture>
 </div>
 
@@ -56,24 +56,24 @@ appearance, permissions and security, local capabilities, the audit log and abou
 **Wake-word route** — say “EDITH” or “伊迪丝”; the panel opens and EDITH executes the request.
 
 <div align="center">
-  <a href="docs/assets/videos/wake-up.mp4">
-    <img src="docs/assets/videos/wake-up-preview.gif" width="65%" alt="Wake-word demo — click to play the full video">
+  <a href="assets/videos/wake-up.mp4">
+    <img src="assets/videos/wake-up-preview.gif" width="65%" alt="Wake-word demo — click to play the full video">
   </a>
 </div>
 
 **Proactive route** — EDITH notices the context, offers help without a wake word, and continues after the reply.
 
 <div align="center">
-  <a href="docs/assets/videos/proactive.mp4">
-    <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="Proactive demo — click to play the full video">
+  <a href="assets/videos/proactive.mp4">
+    <img src="assets/videos/proactive-preview.gif" width="65%" alt="Proactive demo — click to play the full video">
   </a>
 </div>
 
 **Phone-only mode** — no glasses link; wake-word wake and floating-ball dictation.
 
 <div align="center">
-  <a href="docs/assets/videos/detached-wake.mp4">
-    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Phone-only wake demo — click to play the full video">
+  <a href="assets/videos/detached-wake.mp4">
+    <img src="assets/videos/detached-wake-preview.gif" width="65%" alt="Phone-only wake demo — click to play the full video">
   </a>
 </div>
 

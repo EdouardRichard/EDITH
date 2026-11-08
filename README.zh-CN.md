@@ -1,6 +1,6 @@
 <div align="center">
   <picture>
-    <img alt="EDITH" src="docs/assets/brand/readme-logo.png" width="14%">
+    <img alt="EDITH" src="assets/brand/readme-logo.png" width="14%">
   </picture>
 </div>
 
@@ -47,24 +47,24 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
 **唤醒词唤醒**——说“EDITH”或“伊迪丝”，面板打开并由 EDITH 执行请求。
 
 <div align="center">
-  <a href="docs/assets/videos/wake-up.mp4">
-    <img src="docs/assets/videos/wake-up-preview.gif" width="65%" alt="唤醒词唤醒演示——点击播放完整视频">
+  <a href="assets/videos/wake-up.mp4">
+    <img src="assets/videos/wake-up-preview.gif" width="65%" alt="唤醒词唤醒演示——点击播放完整视频">
   </a>
 </div>
 
 **主动辅助**——EDITH 感知上下文后主动给出提示，接话后继续执行。
 
 <div align="center">
-  <a href="docs/assets/videos/proactive.mp4">
-    <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="主动辅助演示——点击播放完整视频">
+  <a href="assets/videos/proactive.mp4">
+    <img src="assets/videos/proactive-preview.gif" width="65%" alt="主动辅助演示——点击播放完整视频">
   </a>
 </div>
 
 **纯手机模式**——不依赖眼镜链路，支持唤醒词唤醒与悬浮球长按说话。
 
 <div align="center">
-  <a href="docs/assets/videos/detached-wake.mp4">
-    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="纯手机模式唤醒演示——点击播放完整视频">
+  <a href="assets/videos/detached-wake.mp4">
+    <img src="assets/videos/detached-wake-preview.gif" width="65%" alt="纯手机模式唤醒演示——点击播放完整视频">
   </a>
 </div>
 

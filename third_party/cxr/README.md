@@ -1,15 +1,16 @@
-# EDITH P0 Throwaway Probe Assets
+# Vendored CXR-Link SDK artifacts
 
-These assets belong to the approved P0-PROBE-r1 feasibility spike. They are not EDITH production modules.
+The CXR-Link SDK AARs that `:phone-app:link:transport-rokid` and `:glasses-app:app` compile against are
+tracked in this directory because the build pins their exact bytes:
 
-- `vendor/CxrlSample-1.1.2.zip`: official downloaded sample archive.
-- `vendor/cxrl-1.1.2/CxrlSample`: extracted official source, unchanged from the archive; generated Gradle/build files are local outputs.
-- `vendor/client-l-1.1.2.aar`: public CXR-L artifact checked against its published module SHA-256.
-- `vendor/cxr-service-bridge-1.0-20260715.121510-107.aar`: the timestamped bridge version required by CXR-L 1.1.2.
-- `vendor/*-classes.jar`: extracted public API signatures for local inspection.
+| File | SHA-256 |
+| --- | --- |
+| `vendor/client-l-1.1.2.aar` | `4E79963FF5AD84E018783C74A17C6BEDBEBD3C6076BAD3C00BCE15250A4DAF25` |
+| `vendor/cxr-service-bridge-1.0-20260715.121510-107.aar` | `0A76387E106A51578F82169AEB2DA904372A9569B26AF1E6C87CEBE7A76B94FC` |
 
-The source sample builds with Gradle 9.4.1, AGP 9.2.1, Java 21 for the daemon and JVM target 17. Its existing 48 JVM tests passed. No APK has been installed or run in this checkpoint.
+`settings.gradle.kts` declares the `edith.vendor.cxr` flatDir repository over this directory, and
+`phone-app/link/transport-rokid/build.gradle.kts` re-checks the same digests at configuration time, so a
+tampered or truncated artifact fails the build instead of reaching an APK.
 
-The sample authorizes through Rokid AI App and keeps the returned token in memory. Do not add AK/SK, tokens, raw audio, biometric data or personal resumes to this directory.
-
-Build logs are in `D:\Project_new\EDITH\probes\logs`. The authoritative approval, exact commands, hashes, limitations and next device step are in `D:\Project_new\EDITH\docs\project\P0_PROGRESS.md` and `D:\Project_new\EDITH\docs\project\evidence\2026-10-05-p0-sdk-sample-audit.md`.
+The SDK is supplied by Rokid for the CXR-Link integration and remains under Rokid's own terms; the
+project's Apache-2.0 license covers EDITH's source only.
