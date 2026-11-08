@@ -28,6 +28,7 @@ import kotlin.test.assertTrue
  *
  * Gradle runs tests with the **module** directory as the working directory, and this module now sits several levels
  * below the repository root, so the corpus is located by walking up until the tracked `settings.gradle.kts` is found.
+ * The corpus lives in this module's `testdata/` (not under `docs/`, which the public release tree does not carry).
  * A missing file is an `error`, never a silent skip: a gate that quietly passes when the corpus moves is not a gate.
  */
 class ProactiveAdmissionCorpusTest {
@@ -39,7 +40,7 @@ class ProactiveAdmissionCorpusTest {
 
     private val corpus = File(
         repositoryRoot(),
-        "docs/project/evidence/2026-10-11-p3-4-eval-corpus.md",
+        "phone-app/plugins/plugin-smart-helper/testdata/2026-10-11-p3-4-eval-corpus.md",
     )
 
     private fun rows(): List<CorpusRow> {

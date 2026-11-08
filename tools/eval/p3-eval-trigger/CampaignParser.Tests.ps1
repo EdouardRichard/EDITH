@@ -46,7 +46,7 @@ $rows = ConvertTo-EdithCorpusRow -Markdown $decoy
 Assert-Equal 0 $rows.Count 'decoy lines parsed'
 
 # --- real corpus: counts must match the frozen table --------------------------------------
-$corpusPath = Join-Path $repoRoot 'docs\project\evidence\2026-10-11-p3-4-eval-corpus.md'
+$corpusPath = Join-Path $repoRoot 'phone-app\plugins\plugin-smart-helper\testdata\2026-10-11-p3-4-eval-corpus.md'
 $markdown = [System.IO.File]::ReadAllText($corpusPath, [System.Text.UTF8Encoding]::new($false))
 $rows = ConvertTo-EdithCorpusRow -Markdown $markdown
 Assert-Equal 210 $rows.Count 'frozen corpus rows'

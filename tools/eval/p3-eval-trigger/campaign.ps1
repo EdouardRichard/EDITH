@@ -16,7 +16,7 @@
 # observations/evidence files, the audio directory and the device's own /data/local/tmp.
 # =====================================================================================
 param(
-    [string]$CorpusPath = 'docs/project/evidence/2026-10-11-p3-4-eval-corpus.md',
+    [string]$CorpusPath = 'phone-app/plugins/plugin-smart-helper/testdata/2026-10-11-p3-4-eval-corpus.md',
     [string]$ObservationsPath = '.superpowers/sdd/2026-10-11-p3-4-memory-and-evaluation/trigger-observations.txt',
     [string]$AudioDir = '.local/p3-4/audio/corpus',
     [string]$DeviceDir = '/data/local/tmp/edith-audio',

@@ -6,7 +6,8 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
- * Spec §3.2/§3.3: the SKILL files this repository ships in `docs/project/skills/` must actually **parse**.
+ * Spec §3.2/§3.3: the SKILL files this repository ships in `phone-app/plugins/plugin-smart-helper/skills/`
+ * must actually **parse**.
  *
  * A SKILL is a data artifact the user drops on the SD card, and the parser refuses a document whose front matter is
  * not exactly the declared subset. Writing one by hand and reading it back with the eye is how a file reaches a device
@@ -16,19 +17,21 @@ import kotlin.test.assertTrue
 class SkillLibraryTest {
 
     /**
-     * The repository root, from the module's working directory (`plugins-smart`).
+     * The repository root, from the module's working directory (`plugin-smart-helper`).
      *
-     * The SKILL lives in `docs/project/skills/` rather than in test resources on purpose: it is a **deliverable** the
-     * user copies to `/sdcard/EDITH/skills/`, and a second copy under `src/test/resources` would be a second place to
-     * drift from. The test skips loudly rather than passing quietly when it cannot find the root.
+     * The SKILL lives in this module's `skills/` directory rather than in test resources on purpose: it is a
+     * **deliverable** the user copies to `/sdcard/EDITH/skills/`, and a second copy under `src/test/resources` would be
+     * a second place to drift from. It is deliberately **outside `docs/`**: the public release tree carries no `docs/`
+     * at all, yet a clean clone must still be able to run this gate. The test skips loudly rather than passing quietly
+     * when it cannot find the root.
      */
     private fun repositoryRoot(): File =
         generateSequence(File("").absoluteFile) { it.parentFile }
-            .firstOrNull { File(it, "docs/project/skills").isDirectory }
+            .firstOrNull { File(it, "settings.gradle.kts").isFile }
             ?: error("repository root not found from ${File("").absolutePath}")
 
     private fun skillFiles(): List<File> {
-        val directory = File(repositoryRoot(), "docs/project/skills")
+        val directory = File(repositoryRoot(), "phone-app/plugins/plugin-smart-helper/skills")
         return directory.listFiles { file -> file.isFile && file.name.endsWith(".md") }
             ?.sortedBy { it.name }
             .orEmpty()
@@ -37,7 +40,7 @@ class SkillLibraryTest {
     @Test
     fun `every shipped SKILL parses into the declared subset`() {
         val files = skillFiles()
-        assertTrue(files.isNotEmpty(), "no SKILL files found under docs/project/skills")
+        assertTrue(files.isNotEmpty(), "no SKILL files found under phone-app/plugins/plugin-smart-helper/skills")
         files.forEach { file ->
             val outcome = SkillParser.parse(file.name, file.readText(Charsets.UTF_8))
             assertIs<SkillParse.Ok>(
